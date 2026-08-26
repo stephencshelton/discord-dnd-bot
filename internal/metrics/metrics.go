@@ -45,4 +45,58 @@ var (
 		Name: "discord_dnd_bot_ai_requests_total",
 		Help: "LiteLLM requests, by kind (chat|transcribe|image) and status.",
 	}, []string{"kind", "status"})
+
+	// AIRequestDuration observes LiteLLM request latency by kind, so AI latency
+	// is not conflated with overall command latency.
+	AIRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "discord_dnd_bot_ai_request_duration_seconds",
+		Help:    "LiteLLM request latency in seconds, by kind.",
+		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
+	}, []string{"kind"})
+
+	// AITokens counts tokens reported by LiteLLM by kind and token role
+	// (prompt|completion), for cost/usage monitoring.
+	AITokens = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "discord_dnd_bot_ai_tokens_total",
+		Help: "Tokens reported by LiteLLM, by kind and role (prompt|completion).",
+	}, []string{"kind", "role"})
+
+	// QueueDepth reports the current number of jobs waiting in the queue. Set
+	// periodically by the worker so HPA / dashboards can see backlog directly.
+	QueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "discord_dnd_bot_queue_depth",
+		Help: "Number of jobs currently waiting in the Redis queue.",
+	})
+
+	// ComponentErrors counts errors from infrastructure components by component
+	// (db|redis|storage|litellm|discord) and a coarse operation label, so
+	// dependency failures are visible in Prometheus rather than only in logs.
+	ComponentErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "discord_dnd_bot_component_errors_total",
+		Help: "Errors from infrastructure components, by component and operation.",
+	}, []string{"component", "operation"})
+
+	// PanicsRecovered counts panics caught by recovery middleware/wrappers,
+	// labelled by where they were recovered (interaction|job|http|goroutine).
+	PanicsRecovered = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "discord_dnd_bot_panics_recovered_total",
+		Help: "Panics recovered, by site (interaction|job|http|goroutine).",
+	}, []string{"site"})
+
+	// HTTPRequests counts health/metrics server requests by path and status.
+	HTTPRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "discord_dnd_bot_http_requests_total",
+		Help: "Health/metrics HTTP requests, by path and status code.",
+	}, []string{"path", "status"})
+
+	// DBPoolConns reports pgx pool connection counts by state (total|acquired|idle).
+	DBPoolConns = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "discord_dnd_bot_db_pool_connections",
+		Help: "pgx pool connection counts, by state (total|acquired|idle).",
+	}, []string{"state"})
 )
+
+// ComponentError is a small convenience wrapper that increments ComponentErrors.
+func ComponentError(component, operation string) {
+	ComponentErrors.WithLabelValues(component, operation).Inc()
+}

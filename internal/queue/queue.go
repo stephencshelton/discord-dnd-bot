@@ -13,6 +13,8 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/config"
+	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
+	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
 
 // JobType enumerates the kinds of asynchronous work the worker performs.
@@ -32,6 +34,9 @@ const (
 type Job struct {
 	Type    JobType         `json:"type"`
 	Payload json.RawMessage `json:"payload"`
+	// CorrelationID ties this job back to the gateway interaction that enqueued
+	// it, so logs across gateway -> queue -> worker can be joined. Optional.
+	CorrelationID string `json:"correlation_id,omitempty"`
 }
 
 // TranscribeSessionPayload carries the session to process.
@@ -78,17 +83,34 @@ func (q *Queue) Ping(ctx context.Context) error { return q.rdb.Ping(ctx).Err() }
 // Close releases the client.
 func (q *Queue) Close() error { return q.rdb.Close() }
 
+// Depth returns the number of jobs currently waiting in the queue. Used to
+// export a backlog gauge for dashboards and HPA.
+func (q *Queue) Depth(ctx context.Context) (int64, error) {
+	return q.rdb.LLen(ctx, queueKey).Result()
+}
+
 // Enqueue pushes a typed job. The gateway calls this; it returns immediately.
+// A correlation ID (from ctx, if present) is stamped onto the job so the
+// resulting worker processing can be traced back to the originating request.
 func (q *Queue) Enqueue(ctx context.Context, jobType JobType, payload any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(Job{Type: jobType, Payload: raw})
+	body, err := json.Marshal(Job{
+		Type:          jobType,
+		Payload:       raw,
+		CorrelationID: logging.CorrelationIDFromContext(ctx),
+	})
 	if err != nil {
 		return err
 	}
-	return q.rdb.LPush(ctx, queueKey, body).Err()
+	if err := q.rdb.LPush(ctx, queueKey, body).Err(); err != nil {
+		metrics.ComponentError("redis", "enqueue")
+		return err
+	}
+	metrics.JobsEnqueued.WithLabelValues(string(jobType)).Inc()
+	return nil
 }
 
 // Dequeue blocks up to timeout for the next job. Returns (nil, nil) on timeout.
@@ -98,13 +120,20 @@ func (q *Queue) Dequeue(ctx context.Context, timeout time.Duration) (*Job, error
 		return nil, nil // timed out, no job
 	}
 	if err != nil {
+		// A cancelled context during shutdown is expected, not an error worth
+		// counting as a component failure.
+		if ctx.Err() == nil {
+			metrics.ComponentError("redis", "dequeue")
+		}
 		return nil, err
 	}
 	if len(res) != 2 {
+		metrics.ComponentError("redis", "dequeue_decode")
 		return nil, fmt.Errorf("unexpected BRPOP result length %d", len(res))
 	}
 	var job Job
 	if err := json.Unmarshal([]byte(res[1]), &job); err != nil {
+		metrics.ComponentError("redis", "dequeue_decode")
 		return nil, err
 	}
 	return &job, nil

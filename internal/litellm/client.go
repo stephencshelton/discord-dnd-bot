@@ -12,9 +12,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"time"
+
+	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
+	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
 
 // Client talks to a LiteLLM (OpenAI-compatible) endpoint.
@@ -22,15 +26,49 @@ type Client struct {
 	baseURL string
 	apiKey  string
 	http    *http.Client
+	log     *slog.Logger
+	// maxRetries is the number of additional attempts on transient failures
+	// (network errors, HTTP 429/5xx). 0 means a single attempt.
+	maxRetries int
 }
 
-// New constructs a Client. timeout bounds each request.
-func New(baseURL, apiKey string, timeout time.Duration) *Client {
-	return &Client{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		http:    &http.Client{Timeout: timeout},
+// Option configures a Client.
+type Option func(*Client)
+
+// WithLogger attaches a logger used for request/latency/error logging.
+func WithLogger(log *slog.Logger) Option {
+	return func(c *Client) { c.log = log }
+}
+
+// WithMaxRetries sets how many times a transient failure is retried.
+func WithMaxRetries(n int) Option {
+	return func(c *Client) {
+		if n >= 0 {
+			c.maxRetries = n
+		}
 	}
+}
+
+// New constructs a Client. timeout bounds each request attempt.
+func New(baseURL, apiKey string, timeout time.Duration, opts ...Option) *Client {
+	c := &Client{
+		baseURL:    baseURL,
+		apiKey:     apiKey,
+		http:       &http.Client{Timeout: timeout},
+		log:        slog.Default(),
+		maxRetries: 2,
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+// usage mirrors the OpenAI usage block so token accounting is available.
+type usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 // Message is a single chat message.
@@ -50,6 +88,7 @@ type chatResponse struct {
 	Choices []struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
+	Usage *usage    `json:"usage,omitempty"`
 	Error *apiError `json:"error,omitempty"`
 }
 
@@ -71,7 +110,7 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, maxToke
 		return "", err
 	}
 	var out chatResponse
-	if err := c.do(ctx, http.MethodPost, "/v1/chat/completions", "application/json", bytes.NewReader(body), &out); err != nil {
+	if err := c.do(ctx, "chat", http.MethodPost, "/v1/chat/completions", "application/json", bytes.NewReader(body), &out); err != nil {
 		return "", err
 	}
 	if out.Error != nil {
@@ -80,6 +119,7 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, maxToke
 	if len(out.Choices) == 0 {
 		return "", fmt.Errorf("litellm chat: empty response")
 	}
+	recordTokens("chat", out.Usage)
 	return out.Choices[0].Message.Content, nil
 }
 
@@ -112,7 +152,7 @@ func (c *Client) Embed(ctx context.Context, model string, inputs []string) ([][]
 		return nil, err
 	}
 	var out embeddingResponse
-	if err := c.do(ctx, http.MethodPost, "/v1/embeddings", "application/json", bytes.NewReader(body), &out); err != nil {
+	if err := c.do(ctx, "embed", http.MethodPost, "/v1/embeddings", "application/json", bytes.NewReader(body), &out); err != nil {
 		return nil, err
 	}
 	if out.Error != nil {
@@ -147,7 +187,7 @@ func (c *Client) Transcribe(ctx context.Context, model, audioName string, audio 
 		return "", err
 	}
 	var out transcriptionResponse
-	if err := c.do(ctx, http.MethodPost, "/v1/audio/transcriptions", w.FormDataContentType(), &buf, &out); err != nil {
+	if err := c.do(ctx, "transcribe", http.MethodPost, "/v1/audio/transcriptions", w.FormDataContentType(), &buf, &out); err != nil {
 		return "", err
 	}
 	if out.Error != nil {
@@ -179,7 +219,7 @@ func (c *Client) GenerateImage(ctx context.Context, model, prompt, size string) 
 		return "", "", err
 	}
 	var out imageResponse
-	if err := c.do(ctx, http.MethodPost, "/v1/images/generations", "application/json", bytes.NewReader(body), &out); err != nil {
+	if err := c.do(ctx, "image", http.MethodPost, "/v1/images/generations", "application/json", bytes.NewReader(body), &out); err != nil {
 		return "", "", err
 	}
 	if out.Error != nil {
@@ -191,11 +231,66 @@ func (c *Client) GenerateImage(ctx context.Context, model, prompt, size string) 
 	return out.Data[0].URL, out.Data[0].B64JSON, nil
 }
 
-// do performs the HTTP request and decodes JSON into out.
-func (c *Client) do(ctx context.Context, method, path, contentType string, body io.Reader, out any) error {
+// do performs the HTTP request and decodes JSON into out. kind labels the call
+// (chat|embed|transcribe|image) for logging and metrics. Transient failures
+// (network errors, HTTP 429/5xx) are retried with exponential backoff up to
+// c.maxRetries; the request body is buffered so it can be replayed per attempt.
+func (c *Client) do(ctx context.Context, kind, method, path, contentType string, body io.Reader, out any) error {
+	var buf []byte
+	if body != nil {
+		b, err := io.ReadAll(body)
+		if err != nil {
+			return fmt.Errorf("litellm read body: %w", err)
+		}
+		buf = b
+	}
+
+	start := time.Now()
+	log := logging.FromContext(ctx, c.log).With("ai_kind", kind, "path", path)
+
+	var lastErr error
+	attempts := c.maxRetries + 1
+	for attempt := 1; attempt <= attempts; attempt++ {
+		var reader io.Reader
+		if buf != nil {
+			reader = bytes.NewReader(buf)
+		}
+		status, retryable, err := c.attempt(ctx, method, path, contentType, reader, out)
+		if err == nil {
+			dur := time.Since(start)
+			metrics.AIRequests.WithLabelValues(kind, "ok").Inc()
+			metrics.AIRequestDuration.WithLabelValues(kind).Observe(dur.Seconds())
+			log.Debug("litellm request ok",
+				"status", status, "attempt", attempt, "duration_ms", dur.Milliseconds())
+			return nil
+		}
+		lastErr = err
+		if !retryable || attempt == attempts || ctx.Err() != nil {
+			break
+		}
+		backoff := time.Duration(attempt) * 250 * time.Millisecond
+		log.Warn("litellm request failed; retrying",
+			"status", status, "attempt", attempt, "err", err, "backoff_ms", backoff.Milliseconds())
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			lastErr = ctx.Err()
+		}
+	}
+
+	metrics.AIRequests.WithLabelValues(kind, "error").Inc()
+	metrics.AIRequestDuration.WithLabelValues(kind).Observe(time.Since(start).Seconds())
+	metrics.ComponentError("litellm", kind)
+	log.Error("litellm request failed", "err", lastErr)
+	return lastErr
+}
+
+// attempt performs a single HTTP attempt. It returns the HTTP status (0 on a
+// transport error), whether the failure is retryable, and any error.
+func (c *Client) attempt(ctx context.Context, method, path, contentType string, body io.Reader, out any) (int, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	req.Header.Set("Content-Type", contentType)
 	if c.apiKey != "" {
@@ -203,22 +298,38 @@ func (c *Client) do(ctx context.Context, method, path, contentType string, body 
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("litellm request %s %s: %w", method, path, err)
+		// Transport-level errors (timeouts, connection resets) are retryable.
+		return 0, true, fmt.Errorf("litellm request %s %s: %w", method, path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return resp.StatusCode, true, err
 	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("litellm %s %s: status %d: %s", method, path, resp.StatusCode, string(data))
+		// 429 and 5xx are transient; 4xx (except 429) are permanent.
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		return resp.StatusCode, retryable, fmt.Errorf("litellm %s %s: status %d: %s", method, path, resp.StatusCode, string(data))
 	}
 	if out == nil {
-		return nil
+		return resp.StatusCode, false, nil
 	}
 	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("litellm decode %s: %w", path, err)
+		return resp.StatusCode, false, fmt.Errorf("litellm decode %s: %w", path, err)
 	}
-	return nil
+	return resp.StatusCode, false, nil
+}
+
+// recordTokens publishes token-usage metrics for a chat response, if present.
+func recordTokens(kind string, u *usage) {
+	if u == nil {
+		return
+	}
+	if u.PromptTokens > 0 {
+		metrics.AITokens.WithLabelValues(kind, "prompt").Add(float64(u.PromptTokens))
+	}
+	if u.CompletionTokens > 0 {
+		metrics.AITokens.WithLabelValues(kind, "completion").Add(float64(u.CompletionTokens))
+	}
 }

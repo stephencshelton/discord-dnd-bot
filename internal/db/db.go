@@ -6,13 +6,16 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/config"
+	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
 
 //go:embed migrations/*.sql
@@ -50,6 +53,45 @@ func Connect(ctx context.Context, cfg config.DatabaseConfig) (*DB, error) {
 func (d *DB) Close() {
 	if d.Pool != nil {
 		d.Pool.Close()
+	}
+}
+
+// ReportPoolStats periodically publishes pgx pool statistics as gauges (and a
+// debug log line) until the context is cancelled. Gives visibility into pool
+// exhaustion / acquire contention. Best effort and panic-safe.
+func (d *DB) ReportPoolStats(ctx context.Context, log *slog.Logger, every time.Duration) {
+	if d.Pool == nil {
+		return
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
+			log.Error("db pool-stats reporter panicked; recovered", "panic", r)
+		}
+	}()
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s := d.Pool.Stat()
+			metrics.DBPoolConns.WithLabelValues("total").Set(float64(s.TotalConns()))
+			metrics.DBPoolConns.WithLabelValues("acquired").Set(float64(s.AcquiredConns()))
+			metrics.DBPoolConns.WithLabelValues("idle").Set(float64(s.IdleConns()))
+			log.Debug("db pool stats",
+				"total", s.TotalConns(),
+				"acquired", s.AcquiredConns(),
+				"idle", s.IdleConns(),
+				"max", s.MaxConns(),
+				"acquire_count", s.AcquireCount(),
+				"empty_acquire_count", s.EmptyAcquireCount(),
+			)
+		}
 	}
 }
 

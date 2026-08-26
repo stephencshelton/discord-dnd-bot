@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
+	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
 
 // RunReminderLoop polls for due reminders, posts them to Discord, and
@@ -31,7 +33,17 @@ func RunReminderLoop(ctx context.Context, log *slog.Logger, store *db.Store, ses
 			log.Info("reminder loop stopped")
 			return
 		case <-ticker.C:
-			tickReminders(ctx, log, store, sess)
+			// Recover per tick so a panic in one cycle doesn't kill the loop.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
+						log.Error("reminder tick panicked; recovered",
+							"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
+					}
+				}()
+				tickReminders(ctx, log, store, sess)
+			}()
 		}
 	}
 }

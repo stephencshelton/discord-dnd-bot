@@ -3,10 +3,12 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 
+	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
 
@@ -32,8 +34,41 @@ func (g *Gateway) routeCommand(s *discordgo.Session, i *discordgo.InteractionCre
 
 	name := i.ApplicationCommandData().Name
 	start := time.Now()
+
+	// Build a per-interaction correlation ID + child logger so every log line
+	// for this command (and any job it enqueues) can be correlated, and stash
+	// them on the context threaded into handlers.
+	corrID := logging.NewCorrelationID()
+	userID := interactionUserID(i)
+	log := g.log.With(
+		logging.CorrelationIDField, corrID,
+		"command", name,
+		"guild", i.GuildID,
+		"user", userID,
+	)
 	ctx, cancel := context.WithTimeout(context.Background(), interactionTimeout)
 	defer cancel()
+	ctx = logging.WithLogger(logging.WithCorrelationID(ctx, g.log, corrID), log)
+
+	log.Info("command received")
+
+	status := "ok"
+	// Recover from panics in any handler so a single bad command can never
+	// crash the gateway (discordgo dispatches handlers in their own goroutines,
+	// where an unrecovered panic would take down the whole process).
+	defer func() {
+		if r := recover(); r != nil {
+			status = "panic"
+			metrics.PanicsRecovered.WithLabelValues("interaction").Inc()
+			log.Error("command panicked; recovered",
+				"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
+			g.replyError(s, i, fmt.Errorf("internal error"))
+		}
+		metrics.CommandsTotal.WithLabelValues(name, status).Inc()
+		dur := time.Since(start)
+		metrics.CommandDuration.WithLabelValues(name).Observe(dur.Seconds())
+		log.Info("command handled", "status", status, "duration_ms", dur.Milliseconds())
+	}()
 
 	var err error
 	switch name {
@@ -71,14 +106,23 @@ func (g *Gateway) routeCommand(s *discordgo.Session, i *discordgo.InteractionCre
 		err = fmt.Errorf("unknown command %q", name)
 	}
 
-	status := "ok"
 	if err != nil {
 		status = "error"
-		g.log.Error("command failed", "command", name, "err", err)
+		log.Error("command failed", "err", err)
 		g.replyError(s, i, err)
 	}
-	metrics.CommandsTotal.WithLabelValues(name, status).Inc()
-	metrics.CommandDuration.WithLabelValues(name).Observe(time.Since(start).Seconds())
+}
+
+// interactionUserID extracts the invoking user's ID from an interaction,
+// handling both guild (Member) and DM (User) contexts.
+func interactionUserID(i *discordgo.InteractionCreate) string {
+	if i.Member != nil && i.Member.User != nil {
+		return i.Member.User.ID
+	}
+	if i.User != nil {
+		return i.User.ID
+	}
+	return ""
 }
 
 // --- interaction reply helpers ---

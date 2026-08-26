@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/stephencshelton/discord-dnd-bot/internal/config"
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
 	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
+	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 	"github.com/stephencshelton/discord-dnd-bot/internal/queue"
 	"github.com/stephencshelton/discord-dnd-bot/internal/storage"
@@ -61,6 +63,9 @@ func (w *Worker) Run(ctx context.Context) {
 		concurrency = 1
 	}
 	w.log.Info("worker started", "concurrency", concurrency)
+
+	// Periodically export queue depth so dashboards/HPA see backlog directly.
+	go w.reportQueueDepth(ctx, 15*time.Second)
 
 	// sem bounds how many jobs run in parallel within this pod.
 	sem := make(chan struct{}, concurrency)
@@ -108,11 +113,44 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
-// process dispatches a single job and records metrics.
+// process dispatches a single job and records metrics. It recovers from panics
+// in job handlers so a single bad job can never crash the worker process (and
+// take all other in-flight jobs down with it).
 func (w *Worker) process(ctx context.Context, job *queue.Job) {
 	start := time.Now()
+
+	// Derive a correlation ID for this job (reuse one carried on the payload if
+	// present) and a child logger tagged with job context, so every log line
+	// for this job — and the originating gateway interaction — can be joined.
+	corrID := job.CorrelationID
+	if corrID == "" {
+		corrID = logging.NewCorrelationID()
+	}
+	log := w.log.With(
+		logging.CorrelationIDField, corrID,
+		"job_type", string(job.Type),
+	)
+	ctx = logging.WithLogger(logging.WithCorrelationID(ctx, w.log, corrID), log)
+
 	jobCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
+
+	status := "ok"
+	defer func() {
+		if r := recover(); r != nil {
+			status = "panic"
+			metrics.PanicsRecovered.WithLabelValues("job").Inc()
+			log.Error("job panicked; recovered",
+				"panic", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()))
+		}
+		metrics.JobsProcessed.WithLabelValues(string(job.Type), status).Inc()
+		dur := time.Since(start)
+		metrics.JobDuration.WithLabelValues(string(job.Type)).Observe(dur.Seconds())
+		log.Info("job finished", "status", status, "duration_ms", dur.Milliseconds())
+	}()
+
+	log.Info("job started")
 
 	var err error
 	switch job.Type {
@@ -126,13 +164,10 @@ func (w *Worker) process(ctx context.Context, job *queue.Job) {
 		err = fmt.Errorf("unknown job type %q", job.Type)
 	}
 
-	status := "ok"
 	if err != nil {
 		status = "error"
-		w.log.Error("job failed", "type", job.Type, "err", err)
+		log.Error("job failed", "err", err)
 	}
-	metrics.JobsProcessed.WithLabelValues(string(job.Type), status).Inc()
-	metrics.JobDuration.WithLabelValues(string(job.Type)).Observe(time.Since(start).Seconds())
 }
 
 // unmarshal is a tiny helper to decode a job payload.
@@ -140,4 +175,34 @@ func unmarshal[T any](raw json.RawMessage) (T, error) {
 	var v T
 	err := json.Unmarshal(raw, &v)
 	return v, err
+}
+
+// reportQueueDepth polls the queue length on an interval and publishes it as a
+// gauge until the context is cancelled. Best effort: a transient error is logged
+// at debug and retried on the next tick.
+func (w *Worker) reportQueueDepth(ctx context.Context, every time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
+			w.log.Error("queue-depth reporter panicked; recovered",
+				"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
+		}
+	}()
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			depth, err := w.queue.Depth(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					w.log.Debug("queue depth poll failed", "err", err)
+				}
+				continue
+			}
+			metrics.QueueDepth.Set(float64(depth))
+		}
+	}
 }

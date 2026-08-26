@@ -50,6 +50,7 @@ func main() {
 		os.Exit(1)
 	}
 	store := db.NewStore(database)
+	go database.ReportPoolStats(ctx, log, 30*time.Second)
 
 	q := queue.New(cfg.Redis)
 	defer func() { _ = q.Close() }()
@@ -60,7 +61,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ai := litellm.New(cfg.LiteLLM.BaseURL, cfg.LiteLLM.APIKey, cfg.LiteLLM.RequestTimeout)
+	ai := litellm.New(cfg.LiteLLM.BaseURL, cfg.LiteLLM.APIKey, cfg.LiteLLM.RequestTimeout, litellm.WithLogger(log))
 
 	gw, err := gateway.New(cfg, log, store, q, ai, st)
 	if err != nil {
@@ -69,7 +70,7 @@ func main() {
 	}
 
 	// --- health/metrics server ---
-	health := httpserver.New(cfg.HTTPAddr, func(hctx context.Context) error {
+	health := httpserver.New(cfg.HTTPAddr, log, func(hctx context.Context) error {
 		if err := q.Ping(hctx); err != nil {
 			return err
 		}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"layeh.com/gopus"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/audio"
+	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
 
 // voiceManager owns active voice recordings, one per guild. Opus packets are
@@ -126,6 +128,14 @@ func (r *recording) onSpeakingUpdate(_ *discordgo.VoiceConnection, vs *discordgo
 // persistParticipant resolves a display name (guild nick > global name > ID) and
 // upserts the participant row. Errors are logged but never fatal.
 func (r *recording) persistParticipant(sessionID, guildID, userID string) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
+			r.g.log.Error("persistParticipant panicked; recovered",
+				"panic", fmt.Sprintf("%v", rec), "stack", string(debug.Stack()),
+				"session", sessionID, "user", userID)
+		}
+	}()
 	sid, err := uuid.Parse(sessionID)
 	if err != nil {
 		return
@@ -151,6 +161,14 @@ func (r *recording) persistParticipant(sessionID, guildID, userID string) {
 // capture consumes Opus packets until the connection's receive channel closes.
 func (r *recording) capture() {
 	defer close(r.done)
+	defer func() {
+		if rec := recover(); rec != nil {
+			metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
+			r.g.log.Error("voice capture panicked; recovered",
+				"panic", fmt.Sprintf("%v", rec), "stack", string(debug.Stack()),
+				"guild", r.guildID, "session", r.sessionID)
+		}
+	}()
 	// Cap retained frames to bound memory (20ms/frame -> minutes*60*50). 0 disables.
 	maxFrames := 0
 	if m := r.g.cfg.Audio.MaxSessionMinutes; m > 0 {

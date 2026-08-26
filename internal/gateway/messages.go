@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -19,6 +21,16 @@ func (g *Gateway) onMessageCreate(s *discordgo.Session, mc *discordgo.MessageCre
 	if mc.Author == nil || mc.Author.Bot {
 		return
 	}
+	// discordgo dispatches this handler in its own goroutine; recover so a panic
+	// while handling one message can't crash the gateway.
+	defer func() {
+		if r := recover(); r != nil {
+			metrics.PanicsRecovered.WithLabelValues("message").Inc()
+			g.log.Error("message handler panicked; recovered",
+				"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()),
+				"user", mc.Author.ID, "channel", mc.ChannelID)
+		}
+	}()
 
 	isDM := mc.GuildID == ""
 	var guildID string
@@ -74,14 +86,14 @@ func (g *Gateway) onMessageCreate(s *discordgo.Session, mc *discordgo.MessageCre
 		{Role: "system", Content: sys},
 		{Role: "user", Content: userMsg},
 	}, 500)
+	// AI request count/latency are recorded inside the litellm client; here we
+	// only track the end-to-end mention-handling latency and outcome.
 	metrics.CommandDuration.WithLabelValues("chat").Observe(time.Since(start).Seconds())
 	if err != nil {
-		metrics.AIRequests.WithLabelValues("chat", "error").Inc()
-		g.log.Error("chat failed", "err", err)
+		g.log.Error("chat failed", "err", err, "user", mc.Author.ID, "channel", mc.ChannelID)
 		g.sendReply(s, mc, "Sorry, I couldn't answer that right now.")
 		return
 	}
-	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
 	g.sendReply(s, mc, truncateForDiscord(answer))
 }
 

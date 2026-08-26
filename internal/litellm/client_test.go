@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -180,5 +181,70 @@ func TestDoNoAuthHeaderWhenKeyEmpty(t *testing.T) {
 
 	if _, err := c.Chat(context.Background(), "m", nil, 1); err != nil {
 		t.Fatalf("Chat error: %v", err)
+	}
+}
+
+func TestRetriesOnTransient5xxThenSucceeds(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&attempts, 1)
+		if n < 3 {
+			// First two attempts fail transiently.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("upstream unavailable"))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"eventually ok"}}]}`))
+	}))
+	defer srv.Close()
+
+	// maxRetries=2 => up to 3 attempts total.
+	c := New(srv.URL, "k", 2*time.Second, WithMaxRetries(2))
+	got, err := c.Chat(context.Background(), "m", nil, 1)
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if got != "eventually ok" {
+		t.Errorf("Chat = %q", got)
+	}
+	if n := atomic.LoadInt32(&attempts); n != 3 {
+		t.Errorf("expected 3 attempts, got %d", n)
+	}
+}
+
+func TestDoesNotRetryOn4xx(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("bad request"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "k", 2*time.Second, WithMaxRetries(3))
+	_, err := c.Chat(context.Background(), "m", nil, 1)
+	if err == nil {
+		t.Fatal("expected an error on 400")
+	}
+	if n := atomic.LoadInt32(&attempts); n != 1 {
+		t.Errorf("400 must not be retried; got %d attempts", n)
+	}
+}
+
+func TestRetriesExhaustedReturnsError(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "k", 2*time.Second, WithMaxRetries(1)) // 2 attempts
+	_, err := c.Chat(context.Background(), "m", nil, 1)
+	if err == nil {
+		t.Fatal("expected an error after exhausting retries")
+	}
+	if n := atomic.LoadInt32(&attempts); n != 2 {
+		t.Errorf("expected 2 attempts (1 retry), got %d", n)
 	}
 }

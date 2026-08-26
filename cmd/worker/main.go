@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/config"
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
@@ -43,6 +44,7 @@ func main() {
 	}
 	defer database.Close()
 	store := db.NewStore(database)
+	go database.ReportPoolStats(ctx, log, 30*time.Second)
 
 	q := queue.New(cfg.Redis)
 	defer func() { _ = q.Close() }()
@@ -53,7 +55,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ai := litellm.New(cfg.LiteLLM.BaseURL, cfg.LiteLLM.APIKey, cfg.LiteLLM.RequestTimeout)
+	ai := litellm.New(cfg.LiteLLM.BaseURL, cfg.LiteLLM.APIKey, cfg.LiteLLM.RequestTimeout, litellm.WithLogger(log))
 
 	w, err := worker.New(cfg, log, q, store, ai, st)
 	if err != nil {
@@ -62,7 +64,7 @@ func main() {
 	}
 
 	// Health/metrics endpoint. Readiness = Redis reachable.
-	health := httpserver.New(cfg.HTTPAddr, func(hctx context.Context) error {
+	health := httpserver.New(cfg.HTTPAddr, log, func(hctx context.Context) error {
 		return q.Ping(hctx)
 	})
 	go func() {
