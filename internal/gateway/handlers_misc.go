@@ -126,15 +126,15 @@ func (g *Gateway) handleDMServer(ctx context.Context, ic *ictx) error {
 		current, _ := g.store.GetDMGuildID(ctx, userID)
 		var b strings.Builder
 		if current != "" && g.isMemberOfAllowlisted(current, userID) {
-			b.WriteString(fmt.Sprintf("Your DMs currently use **%s**.\n\n", g.guildName(current)))
+			fmt.Fprintf(&b, "Your DMs currently use **%s**.\n\n", g.guildName(current))
 		} else if len(shared) == 1 {
-			b.WriteString(fmt.Sprintf("Your DMs use **%s** (the only server we share).\n\n", g.guildName(shared[0])))
+			fmt.Fprintf(&b, "Your DMs use **%s** (the only server we share).\n\n", g.guildName(shared[0]))
 		} else {
 			b.WriteString("You haven't picked a server for DMs yet.\n\n")
 		}
 		b.WriteString("Available servers:\n")
 		for _, gid := range shared {
-			b.WriteString(fmt.Sprintf("• %s\n", g.guildName(gid)))
+			fmt.Fprintf(&b, "• %s\n", g.guildName(gid))
 		}
 		b.WriteString("\nRun `/dm-server server:<name>` to choose or switch.")
 		return ic.reply(b.String(), true)

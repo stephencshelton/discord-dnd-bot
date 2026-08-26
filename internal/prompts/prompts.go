@@ -71,7 +71,7 @@ func RecapUser(campaignName string, priorNotes []string) string {
 	b.WriteString(nonEmpty(campaignName, "our campaign"))
 	b.WriteString("...\" recap (max 150 words) from these prior session notes, newest last:\n\n")
 	for i, n := range priorNotes {
-		b.WriteString(fmt.Sprintf("--- Session %d ---\n%s\n\n", i+1, n))
+		fmt.Fprintf(&b, "--- Session %d ---\n%s\n\n", i+1, n)
 	}
 	return b.String()
 }

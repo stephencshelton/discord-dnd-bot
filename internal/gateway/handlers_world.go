@@ -147,9 +147,9 @@ func (g *Gateway) handleCharacter(ctx context.Context, ic *ictx) error {
 			return ic.reply("No characters yet. Add one with `/character add`.", true)
 		}
 		var b strings.Builder
-		b.WriteString(fmt.Sprintf("**Characters in %s:**\n", camp.Name))
+		fmt.Fprintf(&b, "**Characters in %s:**\n", camp.Name)
 		for _, pc := range pcs {
-			b.WriteString(fmt.Sprintf("• **%s** — Lv %d %s %s (<@%s>)\n", pc.Name, pc.Level, pc.Race, pc.Class, pc.DiscordUserID))
+			fmt.Fprintf(&b, "• **%s** — Lv %d %s %s (<@%s>)\n", pc.Name, pc.Level, pc.Race, pc.Class, pc.DiscordUserID)
 		}
 		return ic.reply(b.String(), true)
 
@@ -203,7 +203,7 @@ func (g *Gateway) handleWorld(ctx context.Context, ic *ictx) error {
 			return ic.reply("No world entries yet. Add one with `/world add`.", true)
 		}
 		var b strings.Builder
-		b.WriteString(fmt.Sprintf("**World of %s:**\n", camp.Name))
+		fmt.Fprintf(&b, "**World of %s:**\n", camp.Name)
 		for _, e := range entries {
 			line := fmt.Sprintf("• _[%s]_ **%s**", e.Kind, e.Name)
 			if e.Description != "" {
