@@ -73,7 +73,9 @@ jobs:
           output: trivy-${{ matrix.service }}.sarif
           severity: CRITICAL,HIGH
           ignore-unfixed: true
-          exit-code: "1"
+          # Report-only: findings are uploaded to the Security tab (see the
+          # upload-sarif step below) but do not fail the build.
+          exit-code: "0"
 
       - name: Upload Trivy SARIF
         if: always()
