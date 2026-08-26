@@ -1,3 +1,5 @@
+version: "2"
+
 run:
   timeout: 5m
   build-tags: []
@@ -5,32 +7,36 @@ run:
 linters:
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
-    - staticcheck
+    - staticcheck # gosimple is merged into staticcheck in v2
     - unused
     - bodyclose
     - misspell
     - unconvert
     - revive
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+  exclusions:
+    rules:
+      # Test files may skip some checks.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+
+formatters:
+  enable:
     - gofmt
     - goimports
-
-linters-settings:
-  goimports:
-    local-prefixes: github.com/stephencshelton/discord-dnd-bot
-  revive:
-    rules:
-      - name: exported
-        disabled: true
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/stephencshelton/discord-dnd-bot
 
 issues:
-  exclude-rules:
-    # Test files may skip some checks.
-    - path: _test\.go
-      linters:
-        - errcheck
-        - bodyclose
   max-issues-per-linter: 0
   max-same-issues: 0

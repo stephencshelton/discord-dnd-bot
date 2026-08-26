@@ -76,7 +76,7 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("get object %s: %w", key, err)
 	}
-	defer out.Body.Close()
+	defer func() { _ = out.Body.Close() }()
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, out.Body); err != nil {
 		return nil, err

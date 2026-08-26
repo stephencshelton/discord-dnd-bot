@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 )
@@ -24,10 +25,10 @@ func TestNewLevels(t *testing.T) {
 			if l == nil {
 				t.Fatal("New returned nil logger")
 			}
-			if !l.Enabled(nil, c.enabled) {
+			if !l.Enabled(context.Background(), c.enabled) {
 				t.Errorf("level %q: expected %v to be enabled", c.level, c.enabled)
 			}
-			if c.blocked != -100 && l.Enabled(nil, c.blocked) {
+			if c.blocked != -100 && l.Enabled(context.Background(), c.blocked) {
 				t.Errorf("level %q: expected %v to be filtered out", c.level, c.blocked)
 			}
 		})

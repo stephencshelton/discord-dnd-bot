@@ -1,0 +1,72 @@
+# Dependabot configuration.
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+
+updates:
+  # GitHub Actions used in .github/workflows/*.yml (SHA-pinned; Dependabot
+  # keeps the pins current and annotates the version in the trailing comment).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+      - github-actions
+    groups:
+      # Batch low-risk action bumps into a single PR to cut review noise.
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # Go modules (go.mod / go.sum).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies
+      - go
+    groups:
+      # Keep golang.org/x/* together; they release in lockstep.
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+      # All other minor/patch dependency bumps in one PR.
+      go-minor-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "golang.org/x/*"
+        update-types:
+          - minor
+          - patch
+
+  # Base images referenced in the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: docker
+    labels:
+      - dependencies
+      - docker

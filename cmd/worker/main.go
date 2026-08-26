@@ -45,7 +45,7 @@ func main() {
 	store := db.NewStore(database)
 
 	q := queue.New(cfg.Redis)
-	defer q.Close()
+	defer func() { _ = q.Close() }()
 
 	st, err := storage.New(ctx, cfg.Storage)
 	if err != nil {

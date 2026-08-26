@@ -205,7 +205,7 @@ func (c *Client) do(ctx context.Context, method, path, contentType string, body 
 	if err != nil {
 		return fmt.Errorf("litellm request %s %s: %w", method, path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
