@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -235,30 +236,62 @@ func weekdayChoices() []*discordgo.ApplicationCommandOptionChoice {
 	return out
 }
 
+// commandRegistrar is the slice of the Discord session that registerCommands
+// needs. Abstracting it lets the registration logic be unit-tested without a
+// live *discordgo.Session.
+type commandRegistrar interface {
+	ApplicationCommandBulkOverwrite(appID, guildID string, commands []*discordgo.ApplicationCommand, options ...discordgo.RequestOption) ([]*discordgo.ApplicationCommand, error)
+}
+
 // registerCommands removes global commands and installs commands in each
 // allowlisted guild, where Discord makes them available immediately.
 func (g *Gateway) registerCommands() error {
-	defs := commandDefs()
-	guildIDs := g.cfg.Discord.AllowedGuildIDs()
-	if _, err := g.sess.ApplicationCommandBulkOverwrite(g.appID, "", []*discordgo.ApplicationCommand{}); err != nil {
-		return fmt.Errorf("remove global commands: %w", err)
+	ids, err := registerGuildCommands(g.sess, g.log, g.appID, g.cfg.Discord.AllowedGuildIDs(), commandDefs())
+	g.regIDs = ids
+	return err
+}
+
+// registerGuildCommands clears global commands and installs the given command
+// defs into each guild. It is resilient: one bad guild does not abort the rest.
+//
+// A single guild can legitimately fail (e.g. the bot was invited there without
+// the applications.commands scope -> HTTP 403 "Missing Access"), and that must
+// not prevent commands from registering in the other guilds. Failures are
+// logged and skipped; an error is returned only if EVERY guild fails (which
+// usually points at a systemic problem like a bad app ID/token rather than a
+// per-guild access issue). Returns the IDs of all successfully created commands.
+func registerGuildCommands(r commandRegistrar, log *slog.Logger, appID string, guildIDs []string, defs []*discordgo.ApplicationCommand) ([]string, error) {
+	if _, err := r.ApplicationCommandBulkOverwrite(appID, "", []*discordgo.ApplicationCommand{}); err != nil {
+		return nil, fmt.Errorf("remove global commands: %w", err)
 	}
 
-	g.regIDs = g.regIDs[:0]
 	if len(guildIDs) == 0 {
-		g.log.Warn("no Discord guilds configured; guild commands disabled")
-		return nil
+		log.Warn("no Discord guilds configured; guild commands disabled")
+		return nil, nil
 	}
 
+	var (
+		regIDs    []string
+		succeeded int
+		lastErr   error
+	)
 	for _, guildID := range guildIDs {
-		created, err := g.sess.ApplicationCommandBulkOverwrite(g.appID, guildID, defs)
+		created, err := r.ApplicationCommandBulkOverwrite(appID, guildID, defs)
 		if err != nil {
-			return fmt.Errorf("register commands for guild %s: %w", guildID, err)
+			lastErr = err
+			log.Error("failed to register guild commands; skipping guild",
+				"guild", guildID, "err", err)
+			continue
 		}
+		succeeded++
 		for _, c := range created {
-			g.regIDs = append(g.regIDs, c.ID)
+			regIDs = append(regIDs, c.ID)
 		}
-		g.log.Info("registered guild commands", "count", len(created), "guild", guildID)
+		log.Info("registered guild commands", "count", len(created), "guild", guildID)
 	}
-	return nil
+
+	if succeeded == 0 {
+		return regIDs, fmt.Errorf("register commands: all %d guild(s) failed; last error: %w", len(guildIDs), lastErr)
+	}
+	return regIDs, nil
 }
