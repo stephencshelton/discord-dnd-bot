@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/discord"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 	"github.com/stephencshelton/discord-dnd-bot/internal/prompts"
@@ -58,15 +58,10 @@ func (w *Worker) handleGenerateArt(ctx context.Context, raw json.RawMessage) err
 	}
 
 	caption := fmt.Sprintf("🎨 Art for <@%s>: %s", p.UserID, truncate(p.Prompt, 180))
-	_, err = w.discord.ChannelMessageSendComplex(p.ChannelID, &discordgo.MessageSend{
+	if err := w.sendMessage(p.ChannelID, discord.MessageCreate{
 		Content: caption,
-		Files: []*discordgo.File{{
-			Name:        "scene.png",
-			ContentType: "image/png",
-			Reader:      bytes.NewReader(imgBytes),
-		}},
-	})
-	if err != nil {
+		Files:   []*discord.File{discord.NewFile("scene.png", "", bytes.NewReader(imgBytes))},
+	}); err != nil {
 		return fmt.Errorf("post art: %w", err)
 	}
 	return nil

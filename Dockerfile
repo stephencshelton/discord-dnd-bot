@@ -1,15 +1,18 @@
 # Multi-stage build for the discord-dnd-bot services.
 #
 # Both `gateway` and `worker` are built from the same module. The gateway needs
-# CGO (libopus, via layeh.com/gopus) to decode Discord voice; we therefore build
-# with CGO enabled and copy the shared libopus runtime into the final image.
+# CGO (libopus, via layeh.com/gopus) to decode received Discord voice; we
+# therefore build with CGO enabled and copy the shared libopus runtime into the
+# final image. Discord's mandatory DAVE (end-to-end voice encryption) is handled
+# by the pure-Go github.com/thomas-vilte/dave-go backend, so NO libdave/C++
+# toolchain is required.
 #
 # Build a specific service with:
 #   docker build --build-arg SERVICE=gateway -t discord-dnd-bot-gateway .
 #   docker build --build-arg SERVICE=worker  -t discord-dnd-bot-worker  .
 
 # ---- build stage ----
-FROM golang:1.25-bookworm AS build
+FROM golang:1.26-bookworm AS build
 
 # libopus is required to compile/link gopus.
 RUN apt-get update \

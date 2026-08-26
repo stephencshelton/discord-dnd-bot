@@ -89,7 +89,7 @@ func main() {
 	log.Info("gateway running", "http", cfg.HTTPAddr)
 
 	// --- reminder scheduler (runs in the gateway since it has the Discord session) ---
-	go gateway.RunReminderLoop(ctx, log, store, gw.Session(), 60*time.Second)
+	go gateway.RunReminderLoop(ctx, log, store, gw.Client(), 60*time.Second)
 
 	<-ctx.Done()
 	log.Info("shutting down")

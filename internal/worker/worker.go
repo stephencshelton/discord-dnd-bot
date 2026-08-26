@@ -13,7 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/disgo/rest"
+	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/config"
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
@@ -32,16 +34,12 @@ type Worker struct {
 	store   *db.Store
 	ai      *litellm.Client
 	storage *storage.Store
-	discord *discordgo.Session // REST-only client for posting results
+	discord rest.Rest // REST-only client for posting results (never a gateway)
 }
 
-// New builds a worker. The discord session is used only for REST calls
+// New builds a worker. The discord client is used only for REST calls
 // (posting messages / uploading files); it is never opened as a gateway.
 func New(cfg *config.Config, log *slog.Logger, q *queue.Queue, store *db.Store, ai *litellm.Client, st *storage.Store) (*Worker, error) {
-	dg, err := discordgo.New("Bot " + cfg.Discord.Token)
-	if err != nil {
-		return nil, fmt.Errorf("create discord rest client: %w", err)
-	}
 	return &Worker{
 		cfg:     cfg,
 		log:     log,
@@ -49,8 +47,19 @@ func New(cfg *config.Config, log *slog.Logger, q *queue.Queue, store *db.Store, 
 		store:   store,
 		ai:      ai,
 		storage: st,
-		discord: dg,
+		discord: rest.New(rest.NewClient(cfg.Discord.Token)),
 	}, nil
+}
+
+// sendMessage posts a message (optionally with files) to a channel, converting
+// the string channel ID to a snowflake at the disgo boundary.
+func (w *Worker) sendMessage(channelID string, m discord.MessageCreate) error {
+	cid, err := snowflake.Parse(channelID)
+	if err != nil {
+		return fmt.Errorf("invalid channel id %q: %w", channelID, err)
+	}
+	_, err = w.discord.CreateMessage(cid, m)
+	return err
 }
 
 // Run loops until the context is cancelled, dispatching jobs to a bounded pool

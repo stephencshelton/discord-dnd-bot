@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
@@ -23,7 +25,7 @@ import (
 // conditional UPDATE (ClaimReminder) before posting, so only the winning
 // replica posts, and a crash mid-claim drops one reminder rather than
 // double-posting.
-func RunReminderLoop(ctx context.Context, log *slog.Logger, store *db.Store, sess *discordgo.Session, interval time.Duration) {
+func RunReminderLoop(ctx context.Context, log *slog.Logger, store *db.Store, client *bot.Client, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	log.Info("reminder loop started", "interval", interval.String())
@@ -42,13 +44,13 @@ func RunReminderLoop(ctx context.Context, log *slog.Logger, store *db.Store, ses
 							"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
 					}
 				}()
-				tickReminders(ctx, log, store, sess)
+				tickReminders(ctx, log, store, client)
 			}()
 		}
 	}
 }
 
-func tickReminders(ctx context.Context, log *slog.Logger, store *db.Store, sess *discordgo.Session) {
+func tickReminders(ctx context.Context, log *slog.Logger, store *db.Store, client *bot.Client) {
 	due, err := store.DueReminders(ctx, time.Now().UTC())
 	if err != nil {
 		log.Error("query due reminders", "err", err)
@@ -81,7 +83,12 @@ func tickReminders(ctx context.Context, log *slog.Logger, store *db.Store, sess 
 		if camp, cerr := store.GetCampaign(ctx, r.CampaignID); cerr == nil {
 			msg = fmt.Sprintf("🎲 **%s** — session reminder! Your next game is coming up. See you at the table!", camp.Name)
 		}
-		if _, err := sess.ChannelMessageSend(channelID, msg); err != nil {
+		cid, perr := snowflake.Parse(channelID)
+		if perr != nil {
+			log.Error("parse reminder channel", "channel", channelID, "err", perr)
+			continue
+		}
+		if _, err := client.Rest.CreateMessage(cid, discord.MessageCreate{Content: msg}); err != nil {
 			log.Error("post reminder", "channel", channelID, "err", err)
 		}
 	}

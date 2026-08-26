@@ -5,53 +5,100 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/discord"
 )
 
 // handleHelp renders usage help generated directly from the registered command
 // definitions, so it always reflects the real command surface (no drift). With
 // no argument it lists every command; with `command:<name>` it details one.
-func (g *Gateway) handleHelp(_ context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	want := strings.TrimSpace(strings.ToLower(optString(i.ApplicationCommandData().Options, "command")))
-	var e *discordgo.MessageEmbed
+func (g *Gateway) handleHelp(_ context.Context, ic *ictx) error {
+	want := strings.TrimSpace(strings.ToLower(ic.optString("command")))
+	var e discord.Embed
 	if want != "" {
 		e = commandDetailEmbed(want)
 	} else {
 		e = commandListEmbed()
 	}
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Embeds: []*discordgo.MessageEmbed{e},
-			Flags:  discordgo.MessageFlagsEphemeral,
-		},
-	})
+	return ic.replyEmbedEphemeral(e)
 }
 
 const helpColor = 0x8b5cf6
 
 // isSubcommand reports whether an option is a subcommand (or subcommand group).
-func isSubcommand(o *discordgo.ApplicationCommandOption) bool {
-	return o.Type == discordgo.ApplicationCommandOptionSubCommand ||
-		o.Type == discordgo.ApplicationCommandOptionSubCommandGroup
+func isSubcommand(o discord.ApplicationCommandOption) bool {
+	return o.Type() == discord.ApplicationCommandOptionTypeSubCommand ||
+		o.Type() == discord.ApplicationCommandOptionTypeSubCommandGroup
+}
+
+// subOptions returns the child options of a subcommand option, or nil.
+func subOptions(o discord.ApplicationCommandOption) []discord.ApplicationCommandOption {
+	switch s := o.(type) {
+	case discord.ApplicationCommandOptionSubCommand:
+		return s.Options
+	case discord.ApplicationCommandOptionSubCommandGroup:
+		out := make([]discord.ApplicationCommandOption, 0, len(s.Options))
+		for _, sub := range s.Options {
+			out = append(out, sub)
+		}
+		return out
+	}
+	return nil
+}
+
+// optionRequired reports whether a (non-subcommand) option is required.
+func optionRequired(o discord.ApplicationCommandOption) bool {
+	switch v := o.(type) {
+	case discord.ApplicationCommandOptionString:
+		return v.Required
+	case discord.ApplicationCommandOptionInt:
+		return v.Required
+	case discord.ApplicationCommandOptionBool:
+		return v.Required
+	case discord.ApplicationCommandOptionChannel:
+		return v.Required
+	case discord.ApplicationCommandOptionUser:
+		return v.Required
+	case discord.ApplicationCommandOptionRole:
+		return v.Required
+	}
+	return false
+}
+
+// optionChoiceNames returns the fixed choice labels for an option, if any.
+func optionChoiceNames(o discord.ApplicationCommandOption) []string {
+	switch v := o.(type) {
+	case discord.ApplicationCommandOptionString:
+		names := make([]string, 0, len(v.Choices))
+		for _, c := range v.Choices {
+			names = append(names, c.Name)
+		}
+		return names
+	case discord.ApplicationCommandOptionInt:
+		names := make([]string, 0, len(v.Choices))
+		for _, c := range v.Choices {
+			names = append(names, c.Name)
+		}
+		return names
+	}
+	return nil
 }
 
 // commandListEmbed builds the overview: one field per command, each listing its
 // subcommands (if any) or a one-line option summary.
-func commandListEmbed() *discordgo.MessageEmbed {
-	e := &discordgo.MessageEmbed{
+func commandListEmbed() discord.Embed {
+	e := discord.Embed{
 		Title:       "📖 DnD Bot — Commands",
 		Color:       helpColor,
 		Description: "Type `/help command:<name>` for a command's full options. Discord's slash-command picker also shows each option as you type.",
 	}
 	for _, c := range allCommandDefs() {
-		e.Fields = append(e.Fields, &discordgo.MessageEmbedField{
+		e.Fields = append(e.Fields, discord.EmbedField{
 			Name:   "/" + c.Name,
 			Value:  clampField(commandSummary(c)),
-			Inline: false,
+			Inline: boolPtr(false),
 		})
 	}
-	e.Fields = append(e.Fields, &discordgo.MessageEmbedField{
+	e.Fields = append(e.Fields, discord.EmbedField{
 		Name:  "Chat",
 		Value: "**@mention** me in a channel or **DM** me to chat about your campaign. If you're in more than one of my servers, use `/dm-server` to pick which one your DMs use.",
 	})
@@ -59,7 +106,7 @@ func commandListEmbed() *discordgo.MessageEmbed {
 }
 
 // commandSummary is the one-field body for a command in the overview.
-func commandSummary(c *discordgo.ApplicationCommand) string {
+func commandSummary(c discord.SlashCommandCreate) string {
 	var b strings.Builder
 	if c.Description != "" {
 		b.WriteString(c.Description)
@@ -68,7 +115,7 @@ func commandSummary(c *discordgo.ApplicationCommand) string {
 	opts := make([]string, 0)
 	for _, o := range c.Options {
 		if isSubcommand(o) {
-			subs = append(subs, fmt.Sprintf("`%s` — %s", o.Name, o.Description))
+			subs = append(subs, fmt.Sprintf("`%s` — %s", o.OptionName(), o.OptionDescription()))
 		} else {
 			opts = append(opts, formatOptionInline(o))
 		}
@@ -85,23 +132,24 @@ func commandSummary(c *discordgo.ApplicationCommand) string {
 }
 
 // commandDetailEmbed builds the full breakdown for a single command.
-func commandDetailEmbed(name string) *discordgo.MessageEmbed {
-	var cmd *discordgo.ApplicationCommand
+func commandDetailEmbed(name string) discord.Embed {
+	var cmd *discord.SlashCommandCreate
 	for _, c := range allCommandDefs() {
 		if c.Name == name {
-			cmd = c
+			cc := c
+			cmd = &cc
 			break
 		}
 	}
 	if cmd == nil {
-		return &discordgo.MessageEmbed{
+		return discord.Embed{
 			Title:       "Unknown command",
 			Color:       helpColor,
 			Description: fmt.Sprintf("No command named `%s`. Run `/help` to see them all.", name),
 		}
 	}
 
-	e := &discordgo.MessageEmbed{
+	e := discord.Embed{
 		Title:       "/" + cmd.Name,
 		Color:       helpColor,
 		Description: cmd.Description,
@@ -113,15 +161,15 @@ func commandDetailEmbed(name string) *discordgo.MessageEmbed {
 	for _, o := range cmd.Options {
 		if isSubcommand(o) {
 			hasSub = true
-			e.Fields = append(e.Fields, &discordgo.MessageEmbedField{
-				Name:  fmt.Sprintf("/%s %s", cmd.Name, o.Name),
+			e.Fields = append(e.Fields, discord.EmbedField{
+				Name:  fmt.Sprintf("/%s %s", cmd.Name, o.OptionName()),
 				Value: clampField(subcommandDetail(o)),
 			})
 		}
 	}
 	if !hasSub {
 		if body := optionsDetail(cmd.Options); body != "" {
-			e.Fields = append(e.Fields, &discordgo.MessageEmbedField{Name: "Options", Value: clampField(body)})
+			e.Fields = append(e.Fields, discord.EmbedField{Name: "Options", Value: clampField(body)})
 		} else {
 			e.Description += "\n\n_No options._"
 		}
@@ -130,13 +178,13 @@ func commandDetailEmbed(name string) *discordgo.MessageEmbed {
 }
 
 // subcommandDetail renders a subcommand's description and its options.
-func subcommandDetail(sub *discordgo.ApplicationCommandOption) string {
+func subcommandDetail(sub discord.ApplicationCommandOption) string {
 	var b strings.Builder
-	if sub.Description != "" {
-		b.WriteString(sub.Description)
+	if sub.OptionDescription() != "" {
+		b.WriteString(sub.OptionDescription())
 		b.WriteString("\n")
 	}
-	if body := optionsDetail(sub.Options); body != "" {
+	if body := optionsDetail(subOptions(sub)); body != "" {
 		b.WriteString(body)
 	} else {
 		b.WriteString("_No options._")
@@ -146,22 +194,18 @@ func subcommandDetail(sub *discordgo.ApplicationCommandOption) string {
 
 // optionsDetail renders one bullet per (non-subcommand) option with its type,
 // required marker, description, and any fixed choices.
-func optionsDetail(opts []*discordgo.ApplicationCommandOption) string {
+func optionsDetail(opts []discord.ApplicationCommandOption) string {
 	var lines []string
 	for _, o := range opts {
 		if isSubcommand(o) {
 			continue
 		}
 		req := "optional"
-		if o.Required {
+		if optionRequired(o) {
 			req = "**required**"
 		}
-		line := fmt.Sprintf("• `%s` (%s, %s) — %s", o.Name, optionTypeName(o.Type), req, o.Description)
-		if len(o.Choices) > 0 {
-			names := make([]string, 0, len(o.Choices))
-			for _, ch := range o.Choices {
-				names = append(names, ch.Name)
-			}
+		line := fmt.Sprintf("• `%s` (%s, %s) — %s", o.OptionName(), optionTypeName(o.Type()), req, o.OptionDescription())
+		if names := optionChoiceNames(o); len(names) > 0 {
 			line += " [" + strings.Join(names, ", ") + "]"
 		}
 		lines = append(lines, line)
@@ -170,27 +214,27 @@ func optionsDetail(opts []*discordgo.ApplicationCommandOption) string {
 }
 
 // formatOptionInline is a compact "name(required?)" for the overview.
-func formatOptionInline(o *discordgo.ApplicationCommandOption) string {
-	if o.Required {
-		return fmt.Sprintf("`%s`*", o.Name)
+func formatOptionInline(o discord.ApplicationCommandOption) string {
+	if optionRequired(o) {
+		return fmt.Sprintf("`%s`*", o.OptionName())
 	}
-	return fmt.Sprintf("`%s`", o.Name)
+	return fmt.Sprintf("`%s`", o.OptionName())
 }
 
 // optionTypeName maps a Discord option type to a friendly label.
-func optionTypeName(t discordgo.ApplicationCommandOptionType) string {
+func optionTypeName(t discord.ApplicationCommandOptionType) string {
 	switch t {
-	case discordgo.ApplicationCommandOptionString:
+	case discord.ApplicationCommandOptionTypeString:
 		return "text"
-	case discordgo.ApplicationCommandOptionInteger:
+	case discord.ApplicationCommandOptionTypeInt:
 		return "number"
-	case discordgo.ApplicationCommandOptionBoolean:
+	case discord.ApplicationCommandOptionTypeBool:
 		return "yes/no"
-	case discordgo.ApplicationCommandOptionChannel:
+	case discord.ApplicationCommandOptionTypeChannel:
 		return "channel"
-	case discordgo.ApplicationCommandOptionUser:
+	case discord.ApplicationCommandOptionTypeUser:
 		return "user"
-	case discordgo.ApplicationCommandOptionRole:
+	case discord.ApplicationCommandOptionTypeRole:
 		return "role"
 	default:
 		return "value"
@@ -209,6 +253,9 @@ func clampField(s string) string {
 	}
 	return string(r[:max-1]) + "…"
 }
+
+// boolPtr returns a pointer to b (for discord.EmbedField.Inline).
+func boolPtr(b bool) *bool { return &b }
 
 // helpCommandNames returns the top-level command names, for /help autocomplete.
 func helpCommandNames() []string {

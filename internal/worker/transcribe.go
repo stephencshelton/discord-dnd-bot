@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/disgoorg/disgo/discord"
 	"github.com/google/uuid"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
@@ -125,17 +126,19 @@ func (w *Worker) postNotes(channelID, campaign, notes string) {
 	if campaign != "" {
 		header = fmt.Sprintf("📜 **%s — session notes are ready!**", campaign)
 	}
-	if _, err := w.discord.ChannelMessageSend(channelID, header); err != nil {
+	if err := w.sendMessage(channelID, discord.MessageCreate{Content: header}); err != nil {
 		w.log.Error("post notes header", "err", err)
 	}
 	// Attach full notes as a file (avoids message-length juggling and is nicer
 	// to copy into a campaign wiki).
-	_, err := w.discord.ChannelFileSend(channelID, "session-notes.md", bytes.NewReader([]byte(notes)))
+	err := w.sendMessage(channelID, discord.MessageCreate{
+		Files: []*discord.File{discord.NewFile("session-notes.md", "", bytes.NewReader([]byte(notes)))},
+	})
 	if err != nil {
 		w.log.Error("attach notes file", "err", err)
 		// Fall back to chunked inline messages.
 		for _, chunk := range chunkString(notes, 1900) {
-			if _, e := w.discord.ChannelMessageSend(channelID, chunk); e != nil {
+			if e := w.sendMessage(channelID, discord.MessageCreate{Content: chunk}); e != nil {
 				w.log.Error("post notes chunk", "err", e)
 			}
 		}
@@ -156,7 +159,7 @@ func (w *Worker) notify(_ string, channelID, msg string) {
 	if channelID == "" {
 		return
 	}
-	if _, err := w.discord.ChannelMessageSend(channelID, msg); err != nil {
+	if err := w.sendMessage(channelID, discord.MessageCreate{Content: msg}); err != nil {
 		w.log.Error("notify", "err", err)
 	}
 }

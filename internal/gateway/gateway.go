@@ -2,14 +2,28 @@
 // connection, registers slash commands, handles interactions/mentions/DMs, and
 // records voice. Slow AI work is pushed to the worker queue, keeping the
 // gateway responsive (Discord requires an ack within 3 seconds).
+//
+// Uses disgo (github.com/disgoorg/disgo) which implements Discord's DAVE
+// end-to-end voice encryption (required by Discord as of 2026), via the pure-Go
+// dave-go backend. IDs are Discord snowflakes; disgo models them as
+// snowflake.ID while the rest of the app (config, db, queue) uses strings, so we
+// convert at the disgo boundary.
 package gateway
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo"
+	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/cache"
+	"github.com/disgoorg/disgo/events"
+	"github.com/disgoorg/disgo/gateway"
+	"github.com/disgoorg/disgo/voice"
+	"github.com/disgoorg/snowflake/v2"
+	davesession "github.com/thomas-vilte/dave-go/session"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/config"
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
@@ -22,31 +36,19 @@ import (
 type Gateway struct {
 	cfg           *config.Config
 	log           *slog.Logger
-	sess          *discordgo.Session
+	client        *bot.Client
 	store         *db.Store
 	queue         *queue.Queue
 	ai            *litellm.Client
 	storage       *storage.Store
 	voice         *voiceManager
-	appID         string
-	regIDs        []string // registered command IDs, for cleanup
+	appID         snowflake.ID
 	allowedGuilds map[string]struct{}
 	isGuildMember func(guildID, userID string) bool
 }
 
 // New wires up the gateway. It does not open the connection yet.
 func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, ai *litellm.Client, st *storage.Store) (*Gateway, error) {
-	sess, err := discordgo.New("Bot " + cfg.Discord.Token)
-	if err != nil {
-		return nil, fmt.Errorf("create discord session: %w", err)
-	}
-	// Guild + voice-state intents for recording; message content for mention/DM.
-	sess.Identify.Intents = discordgo.IntentsGuilds |
-		discordgo.IntentsGuildVoiceStates |
-		discordgo.IntentsGuildMessages |
-		discordgo.IntentsDirectMessages |
-		discordgo.IntentsMessageContent
-
 	allowedGuilds := make(map[string]struct{})
 	for _, guildID := range cfg.Discord.AllowedGuildIDs() {
 		allowedGuilds[guildID] = struct{}{}
@@ -55,33 +57,76 @@ func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, 
 	g := &Gateway{
 		cfg:           cfg,
 		log:           log,
-		sess:          sess,
 		store:         store,
 		queue:         q,
 		ai:            ai,
 		storage:       st,
-		appID:         cfg.Discord.AppID,
 		allowedGuilds: allowedGuilds,
-		isGuildMember: func(guildID, userID string) bool {
-			_, err := sess.GuildMember(guildID, userID)
-			return err == nil
-		},
 	}
 	g.voice = newVoiceManager(g)
 
-	sess.AddHandler(g.onReady)
-	sess.AddHandler(g.onInteraction)
-	sess.AddHandler(g.onMessageCreate)
+	client, err := disgo.New(cfg.Discord.Token,
+		// Guild + voice-state intents for recording; message content for mention/DM.
+		bot.WithGatewayConfigOpts(gateway.WithIntents(
+			gateway.IntentGuilds,
+			gateway.IntentGuildVoiceStates,
+			gateway.IntentGuildMessages,
+			gateway.IntentDirectMessages,
+			gateway.IntentMessageContent,
+		)),
+		// Cache guilds, members and voice states so /session can resolve the
+		// caller's voice channel and voice recording can resolve display names.
+		bot.WithCacheConfigOpts(cache.WithCaches(
+			cache.FlagGuilds,
+			cache.FlagMembers,
+			cache.FlagVoiceStates,
+			cache.FlagChannels,
+		)),
+		// DAVE (E2EE voice) via the pure-Go dave-go backend. Required by Discord
+		// for all voice connections; without it voice fails with close 4017.
+		bot.WithVoiceManagerConfigOpts(
+			voice.WithDaveSessionCreateFunc(davesession.CreateFunc()),
+		),
+		bot.WithEventListenerFunc(g.onReady),
+		bot.WithEventListenerFunc(g.onInteraction),
+		bot.WithEventListenerFunc(g.onAutocomplete),
+		bot.WithEventListenerFunc(g.onMessageCreate),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create discord client: %w", err)
+	}
+	g.client = client
+	g.isGuildMember = func(guildID, userID string) bool {
+		gid, err1 := snowflake.Parse(guildID)
+		uid, err2 := snowflake.Parse(userID)
+		if err1 != nil || err2 != nil {
+			return false
+		}
+		_, ok := client.Caches.Member(gid, uid)
+		if ok {
+			return true
+		}
+		// Fall back to REST if not cached.
+		if _, rerr := client.Rest.GetMember(gid, uid); rerr == nil {
+			return true
+		}
+		return false
+	}
+	if cfg.Discord.AppID != "" {
+		if id, perr := snowflake.Parse(cfg.Discord.AppID); perr == nil {
+			g.appID = id
+		}
+	}
 	return g, nil
 }
 
 // Open connects to Discord and registers commands.
 func (g *Gateway) Open(ctx context.Context) error {
-	if err := g.sess.Open(); err != nil {
+	if err := g.client.OpenGateway(ctx); err != nil {
 		return fmt.Errorf("open gateway: %w", err)
 	}
-	if g.appID == "" {
-		g.appID = g.sess.State.User.ID
+	if g.appID == 0 {
+		g.appID = g.client.ApplicationID
 	}
 	if err := g.registerCommands(); err != nil {
 		return fmt.Errorf("register commands: %w", err)
@@ -92,18 +137,21 @@ func (g *Gateway) Open(ctx context.Context) error {
 // Close disconnects cleanly.
 func (g *Gateway) Close() error {
 	g.voice.stopAll()
-	return g.sess.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	g.client.Close(ctx)
+	return nil
 }
 
-// Session exposes the underlying discordgo session for auxiliary loops (e.g. the
+// Client exposes the underlying disgo client for auxiliary loops (e.g. the
 // reminder scheduler) that need to post messages.
-func (g *Gateway) Session() *discordgo.Session { return g.sess }
+func (g *Gateway) Client() *bot.Client { return g.client }
 
 // Ready reports readiness for the k8s probe: the gateway is ready once the
-// session has an authenticated user.
+// client has an application ID (assigned after the gateway opens).
 func (g *Gateway) Ready(context.Context) error {
-	if g.sess == nil || g.sess.State == nil || g.sess.State.User == nil {
-		return fmt.Errorf("discord session not ready")
+	if g.client == nil || g.client.ApplicationID == 0 {
+		return fmt.Errorf("discord client not ready")
 	}
 	return nil
 }
@@ -117,16 +165,16 @@ func (g *Gateway) allowsGuild(guildID string) bool {
 }
 
 // resolveGuild determines which guild a command should operate against. In a
-// guild it's simply i.GuildID. In a DM there is no guild, so it resolves the
-// user's selected/sole shared guild via directMessageGuildID. Returns
-// ("", false) when a DM can't be mapped to a single guild (unset selection with
-// multiple shared servers, or no shared servers) — the caller should tell the
-// user to run /dm-server.
-func (g *Gateway) resolveGuild(ctx context.Context, i *discordgo.InteractionCreate) (string, bool) {
-	if i.GuildID != "" {
-		return i.GuildID, true
+// guild it's simply the interaction's guild. In a DM there is no guild, so it
+// resolves the user's selected/sole shared guild via directMessageGuildID.
+// Returns ("", false) when a DM can't be mapped to a single guild (unset
+// selection with multiple shared servers, or no shared servers) — the caller
+// should tell the user to run /dm-server.
+func (g *Gateway) resolveGuild(ctx context.Context, guildID, userID string) (string, bool) {
+	if guildID != "" {
+		return guildID, true
 	}
-	return g.directMessageGuildID(ctx, interactionUserID(i))
+	return g.directMessageGuildID(ctx, userID)
 }
 
 // dmGuildHelp is the message shown when a DM command can't resolve a guild.
@@ -199,6 +247,28 @@ func (g *Gateway) dmRejectReason(userID string) string {
 	}
 }
 
-func (g *Gateway) onReady(s *discordgo.Session, r *discordgo.Ready) {
-	g.log.Info("discord ready", "user", r.User.Username, "guilds", len(r.Guilds))
+func (g *Gateway) onReady(_ *events.Ready) {
+	g.log.Info("discord ready")
+}
+
+// displayName resolves a member's best display name (guild nick > global name >
+// username), falling back to the raw user ID. It checks the cache first, then
+// REST. Never returns an empty string.
+func (g *Gateway) displayName(guildID, userID string) string {
+	gid, err1 := snowflake.Parse(guildID)
+	uid, err2 := snowflake.Parse(userID)
+	if err1 != nil || err2 != nil {
+		return userID
+	}
+	if m, ok := g.client.Caches.Member(gid, uid); ok {
+		if name := m.EffectiveName(); name != "" {
+			return name
+		}
+	}
+	if m, err := g.client.Rest.GetMember(gid, uid); err == nil && m != nil {
+		if name := m.EffectiveName(); name != "" {
+			return name
+		}
+	}
+	return userID
 }

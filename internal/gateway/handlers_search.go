@@ -5,42 +5,42 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/discord"
 )
 
 // handleSearch searches the active campaign's completed session memory without
 // consuming an AI quota. Results are snippets so the command stays useful in a
 // live session and does not dump private transcripts into a channel.
-func (g *Gateway) handleSearch(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID, ok := g.resolveGuild(ctx, i)
+func (g *Gateway) handleSearch(ctx context.Context, ic *ictx) error {
+	guildID, ok := g.resolveGuild(ctx, ic.guildID(), ic.userID())
 	if !ok {
-		return g.reply(s, i, dmGuildHelp, true)
+		return ic.reply(dmGuildHelp, true)
 	}
-	query := strings.TrimSpace(optString(i.ApplicationCommandData().Options, "query"))
+	query := strings.TrimSpace(ic.optString("query"))
 	if query == "" {
-		return g.reply(s, i, "Give me a word or phrase to search for.", true)
+		return ic.reply("Give me a word or phrase to search for.", true)
 	}
 	campaign, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
-		return g.reply(s, i, err.Error(), true)
+		return ic.reply(err.Error(), true)
 	}
 	results, err := g.store.SearchSessions(ctx, campaign.ID, query, 8)
 	if err != nil {
 		return err
 	}
 	if len(results) == 0 {
-		return g.reply(s, i, fmt.Sprintf("I couldn't find `%s` in this campaign's completed sessions.", query), true)
+		return ic.reply(fmt.Sprintf("I couldn't find `%s` in this campaign's completed sessions.", query), true)
 	}
 
-	fields := make([]*discordgo.MessageEmbedField, 0, len(results))
+	fields := make([]discord.EmbedField, 0, len(results))
 	for _, result := range results {
-		fields = append(fields, &discordgo.MessageEmbedField{
+		fields = append(fields, discord.EmbedField{
 			Name:   fmt.Sprintf("Session · <t:%d:d>", result.StartedAt.Unix()),
 			Value:  truncateForEmbed(result.Snippet),
-			Inline: false,
+			Inline: boolPtr(false),
 		})
 	}
-	return g.replyEmbed(s, i, &discordgo.MessageEmbed{
+	return ic.replyEmbed(discord.Embed{
 		Title:  "Campaign memory",
 		Color:  0x0ea5e9,
 		Fields: fields,

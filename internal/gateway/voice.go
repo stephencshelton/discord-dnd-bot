@@ -8,7 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/voice"
+	"github.com/disgoorg/snowflake/v2"
 	"github.com/google/uuid"
 	"layeh.com/gopus"
 
@@ -19,6 +20,9 @@ import (
 // voiceManager owns active voice recordings, one per guild. Opus packets are
 // tagged by SSRC (per speaker); each stream is decoded and time-aligned into
 // one mixed PCM buffer so transcription gets a single file.
+//
+// With disgo the SSRC->user resolution is handled inside the voice connection,
+// so each received frame already carries the speaking user's ID.
 type voiceManager struct {
 	g   *Gateway
 	mu  sync.Mutex
@@ -30,11 +34,10 @@ func newVoiceManager(g *Gateway) *voiceManager {
 }
 
 type recording struct {
-	vc        *discordgo.VoiceConnection
+	conn      voice.Conn
 	sessionID string
 	guildID   string
 	started   time.Time
-	done      chan struct{}
 
 	// g lets capture goroutines persist participants as speakers are identified;
 	// read-only from the recording's perspective.
@@ -42,11 +45,8 @@ type recording struct {
 
 	mu       sync.Mutex
 	decoders map[uint32]*gopus.Decoder // per-SSRC Opus decoder
-	// ssrcUser maps an SSRC to the Discord user speaking on it, learned from
-	// VoiceSpeakingUpdate events, so participants are known factually rather
-	// than guessed from the transcript.
-	ssrcUser map[uint32]string
-	seen     map[string]bool // userIDs already persisted this session
+	seen     map[string]bool           // userIDs already persisted this session
+	capped   bool
 	// frames holds mixed stereo PCM, one 20ms slot per shared timeline index.
 	// Packets are placed by RTP timestamp (see anchor) so concurrent speakers
 	// stay aligned and silence gaps leave empty slots instead of collapsing,
@@ -73,57 +73,129 @@ func (m *voiceManager) start(guildID, channelID, sessionID string) error {
 	}
 	m.mu.Unlock()
 
-	vc, err := m.g.sess.ChannelVoiceJoin(guildID, channelID, true /*mute*/, false /*deaf: we must hear*/)
+	gid, err := snowflake.Parse(guildID)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid guild id %q: %w", guildID, err)
 	}
+	cid, err := snowflake.Parse(channelID)
+	if err != nil {
+		return fmt.Errorf("invalid channel id %q: %w", channelID, err)
+	}
+
+	conn := m.g.client.VoiceManager.CreateConn(gid)
+
 	r := &recording{
-		vc:        vc,
+		conn:      conn,
 		sessionID: sessionID,
 		guildID:   guildID,
 		started:   time.Now(),
-		done:      make(chan struct{}),
 		g:         m.g,
 		decoders:  make(map[uint32]*gopus.Decoder),
-		ssrcUser:  make(map[uint32]string),
 		seen:      make(map[string]bool),
 		anchor:    make(map[uint32]streamAnchor),
 	}
+
+	// Inject our receiver before opening so no early frames are missed.
+	conn.SetOpusFrameReceiver(r)
+
+	// Open the connection: self-mute (we never speak) but NOT self-deaf (we must
+	// hear). disgo negotiates the DAVE/E2EE handshake as part of Open.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := conn.Open(ctx, cid, true /*selfMute*/, false /*selfDeaf*/); err != nil {
+		// Tear down the half-open connection so it doesn't linger/retry.
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		conn.Close(closeCtx)
+		closeCancel()
+		return err
+	}
+
 	m.mu.Lock()
 	m.rec[guildID] = r
 	m.mu.Unlock()
-
-	// Learn SSRC -> user mappings via discordgo's voice-speaking events.
-	vc.AddHandler(r.onSpeakingUpdate)
-
-	go r.capture()
 	return nil
 }
 
-// onSpeakingUpdate records the SSRC->user mapping Discord provides when a
-// member starts speaking, persisting the participant immediately (best effort)
-// so an abruptly-ended session still knows who was present.
-func (r *recording) onSpeakingUpdate(_ *discordgo.VoiceConnection, vs *discordgo.VoiceSpeakingUpdate) {
-	if vs == nil || vs.UserID == "" {
-		return
+// ReceiveOpusFrame is called by disgo for every received Opus frame with the
+// resolved speaking user. It decodes and mixes the frame into the session
+// timeline, and persists the participant the first time a user is seen.
+// It satisfies voice.OpusFrameReceiver.
+func (r *recording) ReceiveOpusFrame(userID snowflake.ID, pkt *voice.Packet) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
+			r.g.log.Error("voice frame handler panicked; recovered",
+				"panic", fmt.Sprintf("%v", rec), "stack", string(debug.Stack()),
+				"guild", r.guildID, "session", r.sessionID)
+		}
+	}()
+	if pkt == nil || len(pkt.Opus) == 0 {
+		return nil
 	}
-	// SSRC is a 32-bit RTP identifier that discordgo surfaces as int; mask to
-	// the low 32 bits so the conversion can never overflow.
-	ssrc := uint32(vs.SSRC & 0xFFFFFFFF) //#nosec G115 -- masked to low 32 bits
-	r.mu.Lock()
-	r.ssrcUser[ssrc] = vs.UserID
-	alreadySeen := r.seen[vs.UserID]
-	r.seen[vs.UserID] = true
-	sessionID := r.sessionID
-	guildID := r.guildID
-	r.mu.Unlock()
 
-	if alreadySeen {
-		return
+	// Persist the speaker the first time we see them (best effort, off-thread).
+	if userID != 0 {
+		uid := userID.String()
+		r.mu.Lock()
+		firstSeen := !r.seen[uid]
+		if firstSeen {
+			r.seen[uid] = true
+		}
+		sessionID, guildID := r.sessionID, r.guildID
+		r.mu.Unlock()
+		if firstSeen {
+			go r.persistParticipant(sessionID, guildID, uid)
+		}
 	}
-	// Resolve a display name and persist without blocking the voice event loop.
-	go r.persistParticipant(sessionID, guildID, vs.UserID)
+
+	// Cap retained frames to bound memory (20ms/frame -> minutes*60*50).
+	maxFrames := 0
+	if m := r.g.cfg.Audio.MaxSessionMinutes; m > 0 {
+		maxFrames = m * 60 * 50
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if maxFrames > 0 && len(r.frames) >= maxFrames {
+		if !r.capped {
+			r.capped = true
+			r.g.log.Warn("recording hit max length; further audio dropped",
+				"guild", r.guildID, "session", r.sessionID, "maxMinutes", r.g.cfg.Audio.MaxSessionMinutes)
+		}
+		return nil
+	}
+
+	dec, ok := r.decoders[pkt.SSRC]
+	if !ok {
+		d, derr := gopus.NewDecoder(audio.SampleRate, audio.Channels)
+		if derr != nil {
+			return nil
+		}
+		dec = d
+		r.decoders[pkt.SSRC] = dec
+		// Anchor this speaker's RTP clock to the timeline via wall-clock arrival,
+		// so later frames are placed by RTP-delta and pauses leave empty slots
+		// instead of collapsing and drifting.
+		r.anchor[pkt.SSRC] = streamAnchor{
+			baseTS:    pkt.Timestamp,
+			baseFrame: r.wallClockFrame(),
+		}
+	}
+	pcm, derr := dec.Decode(pkt.Opus, audio.FrameSize, false)
+	if derr != nil {
+		return nil
+	}
+	r.mixFrame(r.frameIndexFor(pkt.SSRC, pkt.Timestamp), pcm)
+	return nil
 }
+
+// CleanupUser is called by disgo when a user disconnects. We keep any audio
+// already captured; nothing to release per-user. Satisfies OpusFrameReceiver.
+func (r *recording) CleanupUser(_ snowflake.ID) {}
+
+// Close is called by disgo when the receiver is torn down. The mixed buffer is
+// owned by stop(); nothing to do here. Satisfies OpusFrameReceiver.
+func (r *recording) Close() {}
 
 // persistParticipant resolves a display name (guild nick > global name > ID) and
 // upserts the participant row. Errors are logged but never fatal.
@@ -140,76 +212,11 @@ func (r *recording) persistParticipant(sessionID, guildID, userID string) {
 	if err != nil {
 		return
 	}
-	name := userID
-	if m, err := r.g.sess.State.Member(guildID, userID); err == nil && m != nil {
-		switch {
-		case m.Nick != "":
-			name = m.Nick
-		case m.User != nil && m.User.GlobalName != "":
-			name = m.User.GlobalName
-		case m.User != nil && m.User.Username != "":
-			name = m.User.Username
-		}
-	}
+	name := r.g.displayName(guildID, userID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := r.g.store.RecordParticipant(ctx, sid, userID, name); err != nil {
 		r.g.log.Warn("record participant", "err", err, "session", sessionID, "user", userID)
-	}
-}
-
-// capture consumes Opus packets until the connection's receive channel closes.
-func (r *recording) capture() {
-	defer close(r.done)
-	defer func() {
-		if rec := recover(); rec != nil {
-			metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
-			r.g.log.Error("voice capture panicked; recovered",
-				"panic", fmt.Sprintf("%v", rec), "stack", string(debug.Stack()),
-				"guild", r.guildID, "session", r.sessionID)
-		}
-	}()
-	// Cap retained frames to bound memory (20ms/frame -> minutes*60*50). 0 disables.
-	maxFrames := 0
-	if m := r.g.cfg.Audio.MaxSessionMinutes; m > 0 {
-		maxFrames = m * 60 * 50
-	}
-	capped := false
-	for pkt := range r.vc.OpusRecv {
-		r.mu.Lock()
-		if maxFrames > 0 && len(r.frames) >= maxFrames {
-			r.mu.Unlock()
-			if !capped {
-				capped = true
-				r.g.log.Warn("recording hit max length; further audio dropped",
-					"guild", r.guildID, "session", r.sessionID, "maxMinutes", r.g.cfg.Audio.MaxSessionMinutes)
-			}
-			continue
-		}
-		dec, ok := r.decoders[pkt.SSRC]
-		if !ok {
-			d, err := gopus.NewDecoder(audio.SampleRate, audio.Channels)
-			if err != nil {
-				r.mu.Unlock()
-				continue
-			}
-			dec = d
-			r.decoders[pkt.SSRC] = dec
-			// Anchor this speaker's RTP clock to the timeline via wall-clock
-			// arrival, so later frames are placed by RTP-delta and pauses leave
-			// empty slots instead of collapsing and drifting.
-			r.anchor[pkt.SSRC] = streamAnchor{
-				baseTS:    pkt.Timestamp,
-				baseFrame: r.wallClockFrame(),
-			}
-		}
-		pcm, err := dec.Decode(pkt.Opus, audio.FrameSize, false)
-		if err != nil {
-			r.mu.Unlock()
-			continue
-		}
-		r.mixFrame(r.frameIndexFor(pkt.SSRC, pkt.Timestamp), pcm)
-		r.mu.Unlock()
 	}
 }
 
@@ -291,12 +298,11 @@ func (m *voiceManager) stop(ctx context.Context, guildID string) (string, time.D
 	}
 
 	duration := time.Since(r.started)
-	// Disconnect; this closes OpusRecv and lets capture() drain + exit.
-	_ = r.vc.Disconnect()
-	select {
-	case <-r.done:
-	case <-time.After(5 * time.Second):
-	}
+	// Close the connection; disgo stops the receiver (Close/CleanupUser) and
+	// tears down the DAVE session and UDP socket.
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	r.conn.Close(closeCtx)
+	closeCancel()
 
 	// Flatten frames into one interleaved PCM slice, in timeline order.
 	r.mu.Lock()
@@ -337,11 +343,9 @@ func (m *voiceManager) stopAll() {
 	m.mu.Unlock()
 
 	for _, r := range recs {
-		_ = r.vc.Disconnect()
-		select {
-		case <-r.done:
-		case <-time.After(2 * time.Second):
-		}
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		r.conn.Close(closeCtx)
+		closeCancel()
 		if sid, err := uuid.Parse(r.sessionID); err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			if err := m.g.store.SetSessionResult(ctx, sid, "", "", "failed"); err != nil {

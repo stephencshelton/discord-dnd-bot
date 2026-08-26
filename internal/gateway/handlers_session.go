@@ -7,50 +7,50 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
+	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 	"github.com/stephencshelton/discord-dnd-bot/internal/queue"
 )
 
 // handleSession starts/stops/reports voice recording sessions.
-func (g *Gateway) handleSession(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID := i.GuildID
+func (g *Gateway) handleSession(ctx context.Context, ic *ictx) error {
+	guildID := ic.guildID()
 	if guildID == "" {
-		return g.reply(s, i, "Sessions must be run inside a server.", true)
+		return ic.reply("Sessions must be run inside a server.", true)
 	}
-	sub := i.ApplicationCommandData().Options[0]
 
-	switch sub.Name {
+	switch ic.subcommand() {
 	case "start":
-		return g.sessionStart(ctx, s, i, guildID)
+		return g.sessionStart(ctx, ic, guildID)
 	case "stop":
-		return g.sessionStop(ctx, s, i, guildID)
+		return g.sessionStop(ctx, ic, guildID)
 	case "status":
-		return g.sessionStatus(ctx, s, i, guildID)
+		return g.sessionStatus(ctx, ic, guildID)
 	}
 	return fmt.Errorf("unknown session subcommand")
 }
 
-func (g *Gateway) sessionStart(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, guildID string) error {
+func (g *Gateway) sessionStart(ctx context.Context, ic *ictx, guildID string) error {
 	// Reject if already recording. A non-not-found error means the DB is
 	// unreachable — surface it rather than silently starting a second session.
 	switch _, err := g.store.GetActiveSession(ctx, guildID); {
 	case err == nil:
-		return g.reply(s, i, "A session is already recording. Use `/session stop` first.", true)
+		return ic.reply("A session is already recording. Use `/session stop` first.", true)
 	case !errors.Is(err, db.ErrNotFound):
 		return err
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
-		return g.reply(s, i, err.Error(), true)
+		return ic.reply(err.Error(), true)
 	}
 
 	// Find the invoking user's voice channel.
-	vs, err := g.userVoiceChannel(guildID, interactionUser(i))
+	vs, err := g.userVoiceChannel(guildID, ic.userID())
 	if err != nil {
-		return g.reply(s, i, "Join a voice channel first, then run `/session start`.", true)
+		return ic.reply("Join a voice channel first, then run `/session start`.", true)
 	}
 
 	sess, err := g.store.CreateSession(ctx, camp.ID, guildID, vs)
@@ -60,20 +60,29 @@ func (g *Gateway) sessionStart(ctx context.Context, s *discordgo.Session, i *dis
 	if err := g.voice.start(guildID, vs, sess.ID.String()); err != nil {
 		// Roll back the DB row so state stays consistent.
 		_ = g.store.SetSessionResult(ctx, sess.ID, "", "", "failed")
-		return fmt.Errorf("join voice: %w", err)
+		// disgo negotiates Discord's mandatory DAVE (end-to-end voice
+		// encryption) as part of the voice handshake, so a failure here is
+		// usually a transient connect issue rather than a protocol rejection.
+		logging.FromContext(ctx, g.log).Error("voice join failed",
+			"guild", guildID, "channel", vs, "err", err)
+		metrics.ComponentError("discord", "voice_join")
+		return ic.reply(
+			"⚠️ I couldn't join the voice channel to start recording. Please try again in a "+
+				"moment. Text commands (chat, `/ask`, `/recap`, etc.) still work.",
+			true)
 	}
-	return g.reply(s, i, "🔴 Recording started. Play on! Use `/session stop` when you're done.", false)
+	return ic.reply("🔴 Recording started. Play on! Use `/session stop` when you're done.", false)
 }
 
-func (g *Gateway) sessionStop(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, guildID string) error {
+func (g *Gateway) sessionStop(ctx context.Context, ic *ictx, guildID string) error {
 	sess, err := g.store.GetActiveSession(ctx, guildID)
 	if errors.Is(err, db.ErrNotFound) {
-		return g.reply(s, i, "No active session to stop.", true)
+		return ic.reply("No active session to stop.", true)
 	}
 	if err != nil {
 		return err
 	}
-	if err := g.ack(s, i, false); err != nil {
+	if err := ic.ack(false); err != nil {
 		return err
 	}
 
@@ -96,13 +105,13 @@ func (g *Gateway) sessionStop(ctx context.Context, s *discordgo.Session, i *disc
 		return err
 	}
 	metrics.JobsEnqueued.WithLabelValues(string(queue.JobTranscribeSession)).Inc()
-	return g.followup(s, i, fmt.Sprintf("⏹️ Recorded %s. Transcribing and writing your session notes now — I'll post them when ready.", duration.Round(time.Second)))
+	return ic.followup(fmt.Sprintf("⏹️ Recorded %s. Transcribing and writing your session notes now — I'll post them when ready.", duration.Round(time.Second)))
 }
 
-func (g *Gateway) sessionStatus(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, guildID string) error {
+func (g *Gateway) sessionStatus(ctx context.Context, ic *ictx, guildID string) error {
 	sess, err := g.store.GetActiveSession(ctx, guildID)
 	if errors.Is(err, db.ErrNotFound) {
-		return g.reply(s, i, "No session is currently recording. Start one with `/session start`.", true)
+		return ic.reply("No session is currently recording. Start one with `/session start`.", true)
 	}
 	if err != nil {
 		return err
@@ -115,19 +124,22 @@ func (g *Gateway) sessionStatus(ctx context.Context, s *discordgo.Session, i *di
 		}
 		msg += "\n**Heard so far:** " + strings.Join(names, ", ")
 	}
-	return g.reply(s, i, msg, true)
+	return ic.reply(msg, true)
 }
 
 // userVoiceChannel returns the voice channel ID the user is currently in.
 func (g *Gateway) userVoiceChannel(guildID, userID string) (string, error) {
-	guild, err := g.sess.State.Guild(guildID)
-	if err != nil {
-		return "", err
+	gid, err1 := snowflake.Parse(guildID)
+	uid, err2 := snowflake.Parse(userID)
+	if err1 != nil {
+		return "", err1
 	}
-	for _, vs := range guild.VoiceStates {
-		if vs.UserID == userID {
-			return vs.ChannelID, nil
-		}
+	if err2 != nil {
+		return "", err2
 	}
-	return "", errors.New("user not in a voice channel")
+	vs, ok := g.client.Caches.VoiceState(gid, uid)
+	if !ok || vs.ChannelID == nil {
+		return "", errors.New("user not in a voice channel")
+	}
+	return vs.ChannelID.String(), nil
 }

@@ -7,7 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/disgo/events"
+	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
@@ -15,56 +17,56 @@ import (
 )
 
 // onMessageCreate powers conversational chat: @mentions in a guild, and DMs to
-// the bot (opt-in via DISCORD_ALLOW_DIRECT_MESSAGES). Both route through the
-// chat model with the active campaign as context.
-func (g *Gateway) onMessageCreate(s *discordgo.Session, mc *discordgo.MessageCreate) {
-	if mc.Author == nil || mc.Author.Bot {
+// the bot. Both route through the chat model with the active campaign as context.
+func (g *Gateway) onMessageCreate(e *events.MessageCreate) {
+	msg := e.Message
+	if msg.Author.Bot {
 		return
 	}
-	// discordgo dispatches this handler in its own goroutine; recover so a panic
-	// while handling one message can't crash the gateway.
+	authorID := msg.Author.ID.String()
+	channelID := msg.ChannelID
+
+	// Recover so a panic while handling one message can't crash the gateway.
 	defer func() {
 		if r := recover(); r != nil {
 			metrics.PanicsRecovered.WithLabelValues("message").Inc()
 			g.log.Error("message handler panicked; recovered",
 				"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()),
-				"user", mc.Author.ID, "channel", mc.ChannelID)
+				"user", authorID, "channel", channelID.String())
 		}
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), interactionTimeout)
 	defer cancel()
 
-	isDM := mc.GuildID == ""
+	isDM := e.GuildID == nil
 	var guildID string
 	if isDM {
 		var allowed bool
-		guildID, allowed = g.directMessageGuildID(ctx, mc.Author.ID)
+		guildID, allowed = g.directMessageGuildID(ctx, authorID)
 		if !allowed {
-			// A DM was received but not actioned. Log the reason, and — when the
-			// user is in multiple servers with no selection — reply with guidance
-			// instead of staying silent, so they know to run /dm-server.
-			reason := g.dmRejectReason(mc.Author.ID)
-			g.log.Debug("ignoring DM", "user", mc.Author.ID, "reason", reason)
-			if len(g.sharedGuildIDs(mc.Author.ID)) > 1 {
-				g.sendReply(s, mc, "You're in more than one of my servers, so I don't know which campaign to use here. Run `/dm-server` in this DM to pick one (and to switch later).")
+			reason := g.dmRejectReason(authorID)
+			g.log.Debug("ignoring DM", "user", authorID, "reason", reason)
+			if len(g.sharedGuildIDs(authorID)) > 1 {
+				g.sendReply(e, "You're in more than one of my servers, so I don't know which campaign to use here. Run `/dm-server` in this DM to pick one (and to switch later).")
 			}
 			return
 		}
-	} else if !g.allowsGuild(mc.GuildID) {
+	} else if !g.allowsGuild(e.GuildID.String()) {
 		return
 	} else {
-		guildID = mc.GuildID
+		guildID = e.GuildID.String()
 	}
 
-	// State.User is populated on Ready; guard against an early message.
-	if s.State == nil || s.State.User == nil {
+	// Self ID is populated after Ready; guard against an early message.
+	self, ok := e.Client().Caches.SelfUser()
+	if !ok {
 		return
 	}
-	selfID := s.State.User.ID
+	selfID := self.ID
 
 	mentioned := false
-	for _, u := range mc.Mentions {
+	for _, u := range msg.Mentions {
 		if u.ID == selfID {
 			mentioned = true
 			break
@@ -74,12 +76,12 @@ func (g *Gateway) onMessageCreate(s *discordgo.Session, mc *discordgo.MessageCre
 		return
 	}
 
-	content := stripMention(mc.Content, selfID)
+	content := stripMention(msg.Content, selfID)
 	if strings.TrimSpace(content) == "" {
 		content = "Say hello and briefly explain what you can do."
 	}
 
-	_ = s.ChannelTyping(mc.ChannelID)
+	_ = e.Client().Rest.SendTyping(channelID)
 
 	sys := prompts.LoreSystem
 	userMsg := content
@@ -94,29 +96,32 @@ func (g *Gateway) onMessageCreate(s *discordgo.Session, mc *discordgo.MessageCre
 		{Role: "system", Content: sys},
 		{Role: "user", Content: userMsg},
 	}, 500)
-	// AI request count/latency are recorded inside the litellm client; here we
-	// only track the end-to-end mention-handling latency and outcome.
 	metrics.CommandDuration.WithLabelValues("chat").Observe(time.Since(start).Seconds())
 	if err != nil {
-		g.log.Error("chat failed", "err", err, "user", mc.Author.ID, "channel", mc.ChannelID)
-		g.sendReply(s, mc, "Sorry, I couldn't answer that right now.")
+		g.log.Error("chat failed", "err", err, "user", authorID, "channel", channelID.String())
+		g.sendReply(e, "Sorry, I couldn't answer that right now.")
 		return
 	}
-	g.sendReply(s, mc, truncateForDiscord(answer))
+	g.sendReply(e, truncateForDiscord(answer))
 }
 
-// sendReply posts a reply referencing the triggering message.
-func (g *Gateway) sendReply(s *discordgo.Session, mc *discordgo.MessageCreate, content string) {
-	_, err := s.ChannelMessageSendReply(mc.ChannelID, content, mc.Reference())
-	if err != nil {
-		// Fall back to a plain message if reply referencing fails (e.g. in DMs).
-		_, _ = s.ChannelMessageSend(mc.ChannelID, content)
+// sendReply posts a reply referencing the triggering message, falling back to a
+// plain message if the referenced-reply send fails (e.g. in DMs).
+func (g *Gateway) sendReply(e *events.MessageCreate, content string) {
+	msgID := e.MessageID
+	ref := &discord.MessageReference{MessageID: &msgID}
+	if _, err := e.Client().Rest.CreateMessage(e.ChannelID, discord.MessageCreate{
+		Content:          content,
+		MessageReference: ref,
+	}); err != nil {
+		_, _ = e.Client().Rest.CreateMessage(e.ChannelID, discord.MessageCreate{Content: content})
 	}
 }
 
 // stripMention removes a leading <@id> / <@!id> mention from message content.
-func stripMention(content, botID string) string {
-	content = strings.ReplaceAll(content, "<@"+botID+">", "")
-	content = strings.ReplaceAll(content, "<@!"+botID+">", "")
+func stripMention(content string, botID snowflake.ID) string {
+	id := botID.String()
+	content = strings.ReplaceAll(content, "<@"+id+">", "")
+	content = strings.ReplaceAll(content, "<@!"+id+">", "")
 	return strings.TrimSpace(content)
 }

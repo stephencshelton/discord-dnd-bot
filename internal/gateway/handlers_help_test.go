@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/discord"
 )
 
 // TestCommandListEmbedCoversEveryCommand ensures the auto-generated overview has
@@ -15,7 +15,7 @@ func TestCommandListEmbedCoversEveryCommand(t *testing.T) {
 	for _, f := range e.Fields {
 		got[f.Name] = true
 	}
-	for _, c := range commandDefs() {
+	for _, c := range allCommandDefs() {
 		if !got["/"+c.Name] {
 			t.Errorf("/help overview missing command %q", c.Name)
 		}
@@ -25,7 +25,7 @@ func TestCommandListEmbedCoversEveryCommand(t *testing.T) {
 // TestHelpRespectsDiscordEmbedLimits checks the overview and every per-command
 // detail embed stay within Discord's field-count and field-length limits.
 func TestHelpRespectsDiscordEmbedLimits(t *testing.T) {
-	check := func(name string, e *discordgo.MessageEmbed) {
+	check := func(name string, e discord.Embed) {
 		if len(e.Fields) > 25 {
 			t.Errorf("%s: %d fields, Discord allows max 25", name, len(e.Fields))
 		}
@@ -39,7 +39,7 @@ func TestHelpRespectsDiscordEmbedLimits(t *testing.T) {
 		}
 	}
 	check("overview", commandListEmbed())
-	for _, c := range commandDefs() {
+	for _, c := range allCommandDefs() {
 		check("detail:"+c.Name, commandDetailEmbed(c.Name))
 	}
 }
@@ -59,10 +59,10 @@ func TestCommandDetailListsOptions(t *testing.T) {
 	}
 }
 
-// TestCommandDetailUnknown returns a helpful message rather than nil.
+// TestCommandDetailUnknown returns a helpful message rather than an empty embed.
 func TestCommandDetailUnknown(t *testing.T) {
 	e := commandDetailEmbed("does-not-exist")
-	if e == nil || e.Description == "" {
+	if e.Description == "" {
 		t.Fatal("expected a non-empty embed for an unknown command")
 	}
 }

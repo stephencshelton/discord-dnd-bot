@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/bwmarrin/discordgo"
+	"github.com/disgoorg/disgo/discord"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
@@ -13,18 +13,18 @@ import (
 )
 
 // handleLore answers a free-form worldbuilding question with the chat model.
-func (g *Gateway) handleLore(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID, ok := g.resolveGuild(ctx, i)
+func (g *Gateway) handleLore(ctx context.Context, ic *ictx) error {
+	guildID, ok := g.resolveGuild(ctx, ic.guildID(), ic.userID())
 	if !ok {
-		return g.reply(s, i, dmGuildHelp, true)
+		return ic.reply(dmGuildHelp, true)
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
-		return g.reply(s, i, err.Error(), true)
+		return ic.reply(err.Error(), true)
 	}
-	prompt := optString(i.ApplicationCommandData().Options, "prompt")
+	prompt := ic.optString("prompt")
 
-	if err := g.ack(s, i, false); err != nil {
+	if err := ic.ack(false); err != nil {
 		return err
 	}
 	msgs := []litellm.Message{
@@ -37,27 +37,27 @@ func (g *Gateway) handleLore(ctx context.Context, s *discordgo.Session, i *disco
 		return err
 	}
 	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
-	return g.followup(s, i, truncateForDiscord(answer))
+	return ic.followup(truncateForDiscord(answer))
 }
 
 // handleRecap generates a "previously on" from recent session notes.
-func (g *Gateway) handleRecap(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID, ok := g.resolveGuild(ctx, i)
+func (g *Gateway) handleRecap(ctx context.Context, ic *ictx) error {
+	guildID, ok := g.resolveGuild(ctx, ic.guildID(), ic.userID())
 	if !ok {
-		return g.reply(s, i, dmGuildHelp, true)
+		return ic.reply(dmGuildHelp, true)
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
-		return g.reply(s, i, err.Error(), true)
+		return ic.reply(err.Error(), true)
 	}
 	notes, err := g.store.RecentCompletedNotes(ctx, camp.ID, 3)
 	if err != nil {
 		return err
 	}
 	if len(notes) == 0 {
-		return g.reply(s, i, "No completed sessions yet — record one with `/session start`.", true)
+		return ic.reply("No completed sessions yet — record one with `/session start`.", true)
 	}
-	if err := g.ack(s, i, false); err != nil {
+	if err := ic.ack(false); err != nil {
 		return err
 	}
 	msgs := []litellm.Message{
@@ -70,37 +70,37 @@ func (g *Gateway) handleRecap(ctx context.Context, s *discordgo.Session, i *disc
 		return err
 	}
 	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
-	e := &discordgo.MessageEmbed{
+	e := discord.Embed{
 		Title:       "Previously, on " + camp.Name + "...",
 		Description: truncateForEmbed(recap),
 		Color:       0x8b5cf6,
 	}
-	return g.followupEmbed(s, i, e)
+	return ic.followupEmbed(e)
 }
 
 // handleAsk answers a question grounded in the campaign's session notes using
 // retrieval-augmented generation: embed the question, fetch the most similar
 // note passages (pgvector), and constrain the chat model to those excerpts.
-func (g *Gateway) handleAsk(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID, ok := g.resolveGuild(ctx, i)
+func (g *Gateway) handleAsk(ctx context.Context, ic *ictx) error {
+	guildID, ok := g.resolveGuild(ctx, ic.guildID(), ic.userID())
 	if !ok {
-		return g.reply(s, i, dmGuildHelp, true)
+		return ic.reply(dmGuildHelp, true)
 	}
-	question := strings.TrimSpace(optString(i.ApplicationCommandData().Options, "question"))
+	question := strings.TrimSpace(ic.optString("question"))
 	if question == "" {
-		return g.reply(s, i, "Ask me something about your campaign's history.", true)
+		return ic.reply("Ask me something about your campaign's history.", true)
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
-		return g.reply(s, i, err.Error(), true)
+		return ic.reply(err.Error(), true)
 	}
 
 	// Nothing indexed yet? Guide the user rather than returning an empty answer.
 	if has, herr := g.store.HasEmbeddings(ctx, camp.ID); herr == nil && !has {
-		return g.reply(s, i, "I don't have any indexed session notes for this campaign yet. Record and complete a session with `/session start`, then try `/ask` again.", true)
+		return ic.reply("I don't have any indexed session notes for this campaign yet. Record and complete a session with `/session start`, then try `/ask` again.", true)
 	}
 
-	if err := g.ack(s, i, false); err != nil {
+	if err := ic.ack(false); err != nil {
 		return err
 	}
 
@@ -108,7 +108,7 @@ func (g *Gateway) handleAsk(ctx context.Context, s *discordgo.Session, i *discor
 	qvecs, err := g.ai.Embed(ctx, g.cfg.LiteLLM.EmbedModel, []string{question})
 	if err != nil || len(qvecs) == 0 {
 		metrics.AIRequests.WithLabelValues("embed", "error").Inc()
-		return g.followup(s, i, "I couldn't process that question right now. Please try again later.")
+		return ic.followup("I couldn't process that question right now. Please try again later.")
 	}
 	metrics.AIRequests.WithLabelValues("embed", "ok").Inc()
 
@@ -118,7 +118,7 @@ func (g *Gateway) handleAsk(ctx context.Context, s *discordgo.Session, i *discor
 		return err
 	}
 	if len(chunks) == 0 {
-		return g.followup(s, i, "I couldn't find anything about that in this campaign's session notes.")
+		return ic.followup("I couldn't find anything about that in this campaign's session notes.")
 	}
 	passages := make([]string, 0, len(chunks))
 	for _, c := range chunks {
@@ -136,56 +136,56 @@ func (g *Gateway) handleAsk(ctx context.Context, s *discordgo.Session, i *discor
 		return err
 	}
 	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
-	return g.followup(s, i, truncateForDiscord(answer))
+	return ic.followup(truncateForDiscord(answer))
 }
 
 // handleReindex enqueues a job to (re)build the active campaign's /ask search
 // memory from all completed session notes. Useful after enabling embeddings, or
 // after changing the embedding model. Admin-gated (rebuilds can be expensive).
-func (g *Gateway) handleReindex(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID := i.GuildID
+func (g *Gateway) handleReindex(ctx context.Context, ic *ictx) error {
+	guildID := ic.guildID()
 	if guildID == "" {
-		return g.reply(s, i, "Use `/reindex` inside a server with an active campaign.", true)
+		return ic.reply("Use `/reindex` inside a server with an active campaign.", true)
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
-		return g.reply(s, i, err.Error(), true)
+		return ic.reply(err.Error(), true)
 	}
 	if err := g.queue.Enqueue(ctx, queue.JobReindexCampaign, queue.ReindexCampaignPayload{
 		CampaignID: camp.ID.String(),
 		GuildID:    guildID,
-		ChannelID:  i.ChannelID,
+		ChannelID:  ic.channelID(),
 	}); err != nil {
 		return err
 	}
 	metrics.JobsEnqueued.WithLabelValues(string(queue.JobReindexCampaign)).Inc()
-	return g.reply(s, i, "🔎 Rebuilding this campaign's `/ask` memory from completed sessions. I'll post here when it's done.", true)
+	return ic.reply("🔎 Rebuilding this campaign's `/ask` memory from completed sessions. I'll post here when it's done.", true)
 }
 
 // handleArt enqueues an art-generation job (offloaded to the worker so the
 // gateway isn't blocked on a slow image model).
-func (g *Gateway) handleArt(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID := i.GuildID
+func (g *Gateway) handleArt(ctx context.Context, ic *ictx) error {
+	guildID := ic.guildID()
 	if guildID == "" {
-		return g.reply(s, i, "Use `/art` inside a server.", true)
+		return ic.reply("Use `/art` inside a server.", true)
 	}
 
-	scene := optString(i.ApplicationCommandData().Options, "scene")
+	scene := ic.optString("scene")
 
-	if err := g.ack(s, i, false); err != nil {
+	if err := ic.ack(false); err != nil {
 		return err
 	}
 	payload := queue.GenerateArtPayload{
 		GuildID:   guildID,
-		ChannelID: i.ChannelID,
-		UserID:    interactionUser(i),
+		ChannelID: ic.channelID(),
+		UserID:    ic.userID(),
 		Prompt:    scene,
 	}
 	if err := g.queue.Enqueue(ctx, queue.JobGenerateArt, payload); err != nil {
 		return err
 	}
 	metrics.JobsEnqueued.WithLabelValues(string(queue.JobGenerateArt)).Inc()
-	return g.followup(s, i, "🎨 Painting your scene… I'll post it in this channel shortly.")
+	return ic.followup("🎨 Painting your scene… I'll post it in this channel shortly.")
 }
 
 // truncateForDiscord trims content to Discord's 2000-char message limit.
@@ -198,7 +198,7 @@ func truncateForDiscord(s string) string {
 	return string(r[:max-1]) + "\u2026"
 }
 
-// truncateForEmbed trims to the embed description limit.
+// truncateForEmbed trims content to Discord's 4096-char embed-description limit.
 func truncateForEmbed(s string) string {
 	const max = 4096
 	r := []rune(s)

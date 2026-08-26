@@ -144,3 +144,17 @@ CREATE TABLE IF NOT EXISTS feedback (
     body        TEXT NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Per-user preferences. Lets a user who shares multiple of the bot's guilds
+-- pick which guild's campaign their DMs operate against (via /dm-server).
+-- Without a preference the gateway falls back to the sole shared guild.
+CREATE TABLE IF NOT EXISTS user_prefs (
+    user_id     TEXT PRIMARY KEY,           -- Discord user ID
+    -- Selected guild for DM interactions. Not a FK to guilds(id): a user may
+    -- select a guild before any guild row exists, and the gateway validates
+    -- membership + allowlist at use time anyway.
+    dm_guild_id TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
