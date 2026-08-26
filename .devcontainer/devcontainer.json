@@ -1,0 +1,43 @@
+{
+  "name": "discord-dnd-bot",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "moby": true
+    },
+    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {
+      "version": "latest",
+      "helm": "latest",
+      "minikube": "none"
+    }
+  },
+  "containerEnv": {
+    "CGO_ENABLED": "1",
+    "CGO_CFLAGS": "-O2 -g -Wno-stringop-overread"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "ms-azuretools.vscode-docker",
+        "redhat.vscode-yaml",
+        "tim-koehler.helm-intellisense",
+        "vivswan.litellm-vscode-chat"
+      ],
+      "settings": {
+        "go.useLanguageServer": true,
+        "go.toolsManagement.autoUpdate": true,
+        "[go]": {
+          "editor.formatOnSave": true,
+          "editor.defaultFormatter": "golang.go"
+        }
+      }
+    }
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "go version && go env CGO_ENABLED && go mod download && go test ./... && (go install golang.org/x/tools/gopls@latest || true)"
+}

@@ -1,0 +1,105 @@
+{{- if and .Values.s3.enabled .Values.s3.iam.enabled }}
+{{- /*
+Provision an IAM role + policy via AWS Controllers for Kubernetes (ACK IAM
+controller, iam.services.k8s.aws) so the gateway/worker pods can access the
+bucket through IRSA — no long-lived STORAGE_ACCESS_KEY_ID/SECRET credentials.
+
+The role trusts the chart's ServiceAccount via the cluster OIDC provider, and
+the policy grants object + bucket access scoped to the provisioned bucket only.
+
+Requirements:
+  * The ACK IAM controller must be installed with permissions to manage IAM.
+  * aws.accountId and eks.oidcProvider must be set (see values.yaml).
+  * serviceAccount.create must be true; the resulting role ARN is auto-wired
+    onto the ServiceAccount via the eks.amazonaws.com/role-arn annotation.
+
+The rendered role ARN is:
+  arn:aws:iam::<aws.accountId>:role/<fullname>-s3
+*/}}
+{{- $bucketName := default .Values.config.storage.bucket .Values.s3.bucketName -}}
+{{- $roleName := printf "%s-s3" (include "discord-dnd-bot.fullname" .) -}}
+{{- $policyName := printf "%s-s3" (include "discord-dnd-bot.fullname" .) -}}
+{{- if not .Values.aws.accountId }}
+{{- fail "s3.iam.enabled requires aws.accountId to be set" }}
+{{- end }}
+{{- if not .Values.eks.oidcProvider }}
+{{- fail "s3.iam.enabled requires eks.oidcProvider to be set (OIDC issuer host/path without https://)" }}
+{{- end }}
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Role
+metadata:
+  name: {{ $roleName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  name: {{ $roleName }}
+  assumeRolePolicyDocument: |
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ExplicitSelfRoleAssumption",
+                "Effect": "Allow",
+                "Principal": {
+                    "AWS": "*"
+                },
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "ArnLike": {
+                        "aws:PrincipalArn": "arn:aws:iam::{{ .Values.aws.accountId }}:role/{{ $roleName }}"
+                    }
+                }
+            },
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "Federated": "arn:aws:iam::{{ .Values.aws.accountId }}:oidc-provider/{{ .Values.eks.oidcProvider }}"
+                },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                    "StringEquals": {
+                        "{{ .Values.eks.oidcProvider }}:sub": "system:serviceaccount:{{ .Release.Namespace }}:{{ include "discord-dnd-bot.serviceAccountName" . }}",
+                        "{{ .Values.eks.oidcProvider }}:aud": "sts.amazonaws.com"
+                    }
+                }
+            }
+        ]
+    }
+  policyRefs:
+    - from:
+        name: {{ $policyName }}
+---
+apiVersion: iam.services.k8s.aws/v1alpha1
+kind: Policy
+metadata:
+  name: {{ $policyName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  name: {{ $policyName }}
+  policyDocument: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:DeleteObject",
+            "s3:ListBucket"
+          ],
+          "Resource": [
+            "arn:aws:s3:::{{ $bucketName }}",
+            "arn:aws:s3:::{{ $bucketName }}/*"
+          ]
+        }
+      ]
+    }
+{{- end }}

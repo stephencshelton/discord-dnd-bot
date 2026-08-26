@@ -1,0 +1,168 @@
+# ArgoCD Application for discord-dnd-bot.
+#
+# Deploys the Helm chart from this repo with every optional feature this
+# environment uses enabled: bundled PostgreSQL (pgvector) + Redis, self-hosted
+# STT, ACK-provisioned S3 bucket + IAM (IRSA), Prometheus ServiceMonitor, the
+# Grafana dashboard, and secrets sourced from AWS Secrets Manager via the
+# External Secrets Operator.
+#
+# BEFORE APPLYING, replace every <PLACEHOLDER> below:
+#   <AWS_ACCOUNT_ID>        12-digit account that owns the cluster/bucket
+#   <EKS_OIDC_PROVIDER>     cluster OIDC issuer host+path, no https:// scheme,
+#                           e.g. oidc.eks.us-east-1.amazonaws.com/id/EXAMPLE
+#   <CLUSTER_SECRET_STORE>  name of your External Secrets ClusterSecretStore
+#                           that reads AWS Secrets Manager
+#   <TARGET_REVISION>       git branch/tag to track (e.g. main or a release tag)
+#
+# The chart is rendered with the inline values below (GitOps source of truth);
+# the chart's own values.yaml only supplies defaults.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: discord-dnd-bot
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/stephencshelton/discord-dnd-bot.git
+    targetRevision: <TARGET_REVISION>
+    path: charts/discord-dnd-bot
+    helm:
+      releaseName: discord-dnd-bot
+      valuesObject:
+        # --- AWS / EKS context (required for ACK IAM / IRSA) ---
+        aws:
+          accountId: "<AWS_ACCOUNT_ID>"
+        eks:
+          oidcProvider: "<EKS_OIDC_PROVIDER>"
+
+        serviceAccount:
+          create: true
+
+        # --- Non-secret application config ---
+        config:
+          logLevel: info
+          discord:
+            appID: "<DISCORD_APP_ID>"
+            guildIDs:
+              - "<DISCORD_GUILD_ID>"      # your server(s); add more as needed
+            allowDirectMessages: true
+          database:
+          database:
+            # Discrete parts; the bot assembles the DSN and the password comes
+            # from the Secret (DATABASE_PASSWORD) synced by ESO. Host matches the
+            # bundled PostgreSQL Service.
+            host: "discord-dnd-bot-postgresql"
+            port: 5432
+            user: "discord_dnd_bot"
+            name: "discord_dnd_bot"
+            sslMode: "disable"
+          redis:
+            addr: "discord-dnd-bot-redis-master:6379"
+            db: 0
+          storage:
+            endpoint: ""                 # empty = real AWS S3
+            region: "us-east-1"
+            bucket: "discord-dnd-bot"
+            usePathStyle: false          # false for real S3
+          litellm:
+            baseURL: "http://litellm.litellm:4000"
+            chatModel: "claude-4-5-sonnet"
+            notesModel: "claude-opus-4-5"
+            recapModel: "claude-4-5-haiku"
+            loreModel: "claude-4-5-sonnet"
+            askModel: "claude-4-5-sonnet"
+            transcribeModel: "voice-transcribe"   # requires the LiteLLM STT route (see below)
+            imageModel: "gpt-image-2"
+            embedModel: "amazon-titan-embed-text-v2:0"
+            embedDim: 1024                       # Titan Embed v2 dimension
+
+        # --- Secrets via External Secrets Operator (AWS Secrets Manager) ---
+        # The app never sees inline secret values; ESO syncs them from Secrets
+        # Manager into the Kubernetes Secret the workloads (and the bundled
+        # PostgreSQL, for DATABASE_PASSWORD) consume.
+        secrets:
+          create: false
+          externalSecret:
+            enabled: true
+            refreshInterval: 1h
+            secretStoreRef:
+              name: "<CLUSTER_SECRET_STORE>"
+              kind: ClusterSecretStore
+            target:
+              name: discord-dnd-bot-secrets
+              creationPolicy: Owner
+            # Maps each Secret key -> a property in the Secrets Manager JSON
+            # secret "discord-dnd-bot/production". No STORAGE_* keys: the pods
+            # reach S3 via IRSA (s3.iam). No REDIS_PASSWORD: bundled Redis auth
+            # is off. DATABASE_PASSWORD (not a full URL) is the only DB secret;
+            # the bot builds the connection string from config.database parts.
+            data:
+              - secretKey: DISCORD_TOKEN
+                remoteRef:
+                  key: discord-dnd-bot/production
+                  property: discord_token
+              - secretKey: DATABASE_PASSWORD
+                remoteRef:
+                  key: discord-dnd-bot/production
+                  property: database_password
+              - secretKey: LITELLM_API_KEY
+                remoteRef:
+                  key: discord-dnd-bot/production
+                  property: litellm_api_key
+
+        # --- Bundled PostgreSQL (pgvector) + Redis ---
+        postgresql:
+          enabled: true
+          persistence:
+            enabled: true
+            size: 8Gi
+        redis:
+          enabled: true
+          persistence:
+            enabled: true
+            size: 2Gi
+
+        # --- Self-hosted speech-to-text (Whisper) ---
+        # Enabled so /session transcription has a backend. You must register a
+        # matching LiteLLM route named "voice-transcribe" pointing at:
+        #   http://discord-dnd-bot-stt.discord-dnd-bot:8000/v1
+        stt:
+          enabled: true
+          persistence:
+            enabled: true
+            size: 5Gi
+
+        # --- Object storage provisioning via ACK (S3 bucket + IAM/IRSA) ---
+        s3:
+          enabled: true
+          bucketName: discord-dnd-bot
+          iam:
+            enabled: true
+
+        # --- Observability ---
+        serviceMonitor:
+          enabled: true
+          interval: 30s
+        grafanaDashboard:
+          enabled: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: discord-dnd-bot
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

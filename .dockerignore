@@ -1,0 +1,21 @@
+# Keep build context small and reproducible.
+.git
+.github
+.devcontainer
+deploy
+charts
+*.md
+LICENSE
+
+# local artifacts
+bin/
+out/
+dist/
+coverage.out
+coverage.html
+
+# editor / OS cruft
+.vscode
+.idea
+*.swp
+.DS_Store

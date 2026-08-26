@@ -1,0 +1,72 @@
+{{- if .Values.s3.enabled }}
+{{- /*
+Provision the object-storage bucket the bot needs using AWS Controllers for
+Kubernetes (ACK). Requires the ACK S3 controller (s3.services.k8s.aws) to be
+installed in the cluster with IAM permissions to create/manage buckets.
+
+The application still talks to the bucket via internal/storage using the name
+in .Values.config.storage.bucket, so keep .Values.s3.bucketName aligned with it
+(that is the default below).
+*/}}
+{{- $bucketName := default .Values.config.storage.bucket .Values.s3.bucketName -}}
+apiVersion: s3.services.k8s.aws/v1alpha1
+kind: Bucket
+metadata:
+  name: {{ $bucketName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    services.k8s.aws/deletion-policy: {{ .Values.s3.deletionPolicy | quote }}
+spec:
+  name: {{ $bucketName }}
+
+  # Versioning
+  versioning:
+    status: {{ .Values.s3.versioning }}
+
+  # Encryption (SSE-S3 by default; set an aws:kms key to use SSE-KMS).
+  encryption:
+    rules:
+      - applyServerSideEncryptionByDefault:
+          {{- if .Values.s3.encryption.kmsKeyID }}
+          sseAlgorithm: aws:kms
+          kmsMasterKeyID: {{ .Values.s3.encryption.kmsKeyID | quote }}
+          {{- else }}
+          sseAlgorithm: {{ .Values.s3.encryption.sseAlgorithm }}
+          {{- end }}
+
+  {{- with .Values.s3.cors }}
+  # CORS
+  cors:
+    corsRules:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}
+
+  {{- with .Values.s3.lifecycle }}
+  # Lifecycle rules (e.g. expire old session audio to control storage cost).
+  lifecycle:
+    rules:
+      {{- toYaml . | nindent 6 }}
+  {{- end }}
+
+  # Tags
+  tagging:
+    tagSet:
+      - key: Application
+        value: {{ include "discord-dnd-bot.name" . }}
+      - key: Environment
+        value: {{ .Release.Namespace }}
+      {{- range .Values.s3.extraTags }}
+      - key: {{ .key | quote }}
+        value: {{ .value | quote }}
+      {{- end }}
+
+  # Public access block — this bucket only ever holds private session audio and
+  # generated art, accessed by the app via IAM/IRSA. Keep it fully private.
+  {{- with .Values.s3.publicAccessBlock }}
+  publicAccessBlock:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

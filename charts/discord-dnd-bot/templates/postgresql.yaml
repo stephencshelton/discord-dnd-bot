@@ -1,0 +1,112 @@
+{{- if .Values.postgresql.enabled }}
+{{- /*
+Optional bundled PostgreSQL for evaluation / self-hosting. Uses the official
+pgvector/pgvector image so the `vector` extension (required by /ask) is always
+present — no third-party subchart, no Bitnami paywall. Service name matches
+config.database.host. Credentials come from config.database (user/name) and the
+app Secret's DATABASE_PASSWORD key, so the DB password is defined in exactly one
+place. For production, prefer managed PostgreSQL and set postgresql.enabled=false.
+*/}}
+{{- if .Values.config.database.url }}
+{{- fail "postgresql.enabled=true requires config.database.url to be empty (the bundled DB uses the discrete config.database parts + DATABASE_PASSWORD)" }}
+{{- end }}
+{{- $name := printf "%s-postgresql" (include "discord-dnd-bot.fullname" .) -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "discord-dnd-bot.componentSelectorLabels" (dict "root" . "component" "postgresql") | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  serviceName: {{ $name }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "discord-dnd-bot.componentSelectorLabels" (dict "root" . "component" "postgresql") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "discord-dnd-bot.componentSelectorLabels" (dict "root" . "component" "postgresql") | nindent 8 }}
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        runAsNonRoot: true
+      containers:
+        - name: postgresql
+          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.config.database.user | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.config.database.name | quote }}
+            # Same password the app uses to connect (single source of truth).
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "discord-dnd-bot.secretName" . }}
+                  key: DATABASE_PASSWORD
+            # Keep the data subdir off the volume mount root so the volume's
+            # lost+found doesn't block initdb.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          # The app runs CREATE EXTENSION vector on startup (under an advisory
+          # lock), and this image ships pgvector, so no init script is required.
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.config.database.user | quote }}, "-d", {{ .Values.config.database.name | quote }}]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.config.database.user | quote }}, "-d", {{ .Values.config.database.name | quote }}]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      {{- if not .Values.postgresql.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.postgresql.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- with .Values.postgresql.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.persistence.size }}
+  {{- end }}
+{{- end }}

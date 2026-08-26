@@ -1,0 +1,179 @@
+package worker
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/google/uuid"
+
+	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
+	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
+	"github.com/stephencshelton/discord-dnd-bot/internal/prompts"
+	"github.com/stephencshelton/discord-dnd-bot/internal/queue"
+)
+
+// handleTranscribeSession downloads the recorded audio, transcribes it, writes
+// session notes with the chat model, persists both, and posts the notes to the
+// guild's configured notes channel.
+func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessage) error {
+	p, err := unmarshal[queue.TranscribeSessionPayload](raw)
+	if err != nil {
+		return fmt.Errorf("decode payload: %w", err)
+	}
+	sessionID, err := uuid.Parse(p.SessionID)
+	if err != nil {
+		return fmt.Errorf("parse session id: %w", err)
+	}
+
+	sess, err := w.store.GetSession(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("load session: %w", err)
+	}
+	if sess.AudioKey == "" {
+		w.markFailed(ctx, sessionID, p.GuildID, "No audio was captured for that session.")
+		return fmt.Errorf("session %s has no audio key", sessionID)
+	}
+
+	// 1) Download the recording from object storage.
+	audioBytes, err := w.storage.Get(ctx, sess.AudioKey)
+	if err != nil {
+		w.markFailed(ctx, sessionID, p.GuildID, "I couldn't read the recording from storage.")
+		return fmt.Errorf("download audio: %w", err)
+	}
+
+	// 2) Transcribe via LiteLLM (provider-agnostic).
+	transcript, err := w.ai.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", bytes.NewReader(audioBytes))
+	if err != nil {
+		metrics.AIRequests.WithLabelValues("transcribe", "error").Inc()
+		w.markFailed(ctx, sessionID, p.GuildID, "Transcription failed. Please try again later.")
+		return fmt.Errorf("transcribe: %w", err)
+	}
+	metrics.AIRequests.WithLabelValues("transcribe", "ok").Inc()
+
+	// 3) Summarize the transcript into structured session notes.
+	camp, cerr := w.store.GetCampaign(ctx, sess.CampaignID)
+	campName, campSystem, campPremise := "", "", ""
+	if cerr == nil {
+		campName, campSystem, campPremise = camp.Name, camp.System, camp.Premise
+	}
+
+	// Gather concrete session metadata so the notes know *when* the session
+	// happened and *who* was in the call, rather than inferring it.
+	sessionDate := sess.StartedAt.UTC().Format("Monday, 2 January 2006 15:04 MST")
+	var participantNames []string
+	if parts, perr := w.store.ListParticipants(ctx, sessionID); perr == nil {
+		for _, p := range parts {
+			if p.DisplayName != "" {
+				participantNames = append(participantNames, p.DisplayName)
+			}
+		}
+	}
+
+	notes, err := w.ai.Chat(ctx, w.cfg.LiteLLM.Notes(), []litellm.Message{
+		{Role: "system", Content: prompts.SessionNotesSystem},
+		{Role: "user", Content: prompts.SessionNotesUser(campName, campSystem, campPremise, sessionDate, participantNames, transcript)},
+	}, 2000)
+	if err != nil {
+		metrics.AIRequests.WithLabelValues("chat", "error").Inc()
+		// We still keep the transcript so nothing is lost.
+		_ = w.store.SetSessionResult(ctx, sessionID, transcript, "", "failed")
+		w.notify(p.GuildID, sess.VoiceChannelID, "I transcribed the session but couldn't write the notes. Your transcript is saved.")
+		return fmt.Errorf("summarize: %w", err)
+	}
+	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
+
+	// 4) Persist results (status "complete" so recaps can find these notes).
+	if err := w.store.SetSessionResult(ctx, sessionID, transcript, notes, "complete"); err != nil {
+		return fmt.Errorf("save result: %w", err)
+	}
+
+	// 4b) Embed the notes for grounded /ask retrieval. Best-effort: a failure
+	// here must not fail the session (the notes are already saved and posted).
+	if err := w.embedSessionNotes(ctx, sessionID, sess.CampaignID, notes); err != nil {
+		metrics.AIRequests.WithLabelValues("embed", "error").Inc()
+		w.log.Warn("embed session notes", "session", sessionID, "err", err)
+	} else {
+		metrics.AIRequests.WithLabelValues("embed", "ok").Inc()
+	}
+
+	// 5) Post the notes to the guild's notes channel (fall back to the voice
+	// channel the session was recorded in).
+	channelID := w.notesChannel(ctx, p.GuildID, sess.VoiceChannelID)
+	w.postNotes(channelID, campName, notes)
+	return nil
+}
+
+// notesChannel resolves where to post: the guild's configured notes channel if
+// set, otherwise the provided fallback channel.
+func (w *Worker) notesChannel(ctx context.Context, guildID, fallback string) string {
+	if g, err := w.store.GetGuild(ctx, guildID); err == nil && g.NotesChannelID != "" {
+		return g.NotesChannelID
+	}
+	return fallback
+}
+
+// postNotes sends the notes, chunking to respect Discord's 2000-char limit and
+// attaching the full notes as a Markdown file for convenience.
+func (w *Worker) postNotes(channelID, campaign, notes string) {
+	if channelID == "" {
+		w.log.Warn("no channel to post session notes")
+		return
+	}
+	header := "📜 **Session notes are ready!**"
+	if campaign != "" {
+		header = fmt.Sprintf("📜 **%s — session notes are ready!**", campaign)
+	}
+	if _, err := w.discord.ChannelMessageSend(channelID, header); err != nil {
+		w.log.Error("post notes header", "err", err)
+	}
+	// Attach full notes as a file (avoids message-length juggling and is nicer
+	// to copy into a campaign wiki).
+	_, err := w.discord.ChannelFileSend(channelID, "session-notes.md", bytes.NewReader([]byte(notes)))
+	if err != nil {
+		w.log.Error("attach notes file", "err", err)
+		// Fall back to chunked inline messages.
+		for _, chunk := range chunkString(notes, 1900) {
+			if _, e := w.discord.ChannelMessageSend(channelID, chunk); e != nil {
+				w.log.Error("post notes chunk", "err", e)
+			}
+		}
+	}
+}
+
+// markFailed records a failed session and notifies the channel.
+func (w *Worker) markFailed(ctx context.Context, sessionID uuid.UUID, guildID, msg string) {
+	_ = w.store.SetSessionResult(ctx, sessionID, "", "", "failed")
+	// Best-effort notify in the notes channel.
+	if ch := w.notesChannel(ctx, guildID, ""); ch != "" {
+		w.notify(guildID, ch, "⚠️ "+msg)
+	}
+}
+
+// notify posts a short message to a channel (best effort).
+func (w *Worker) notify(_ string, channelID, msg string) {
+	if channelID == "" {
+		return
+	}
+	if _, err := w.discord.ChannelMessageSend(channelID, msg); err != nil {
+		w.log.Error("notify", "err", err)
+	}
+}
+
+// chunkString splits s into pieces no longer than size runes.
+func chunkString(s string, size int) []string {
+	if size <= 0 {
+		return []string{s}
+	}
+	var out []string
+	r := []rune(s)
+	for len(r) > size {
+		out = append(out, string(r[:size]))
+		r = r[size:]
+	}
+	if len(r) > 0 {
+		out = append(out, string(r))
+	}
+	return out
+}

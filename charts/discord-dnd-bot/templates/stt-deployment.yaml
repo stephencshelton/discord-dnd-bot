@@ -1,0 +1,126 @@
+{{- if .Values.stt.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "discord-dnd-bot.fullname" . }}-stt
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stt
+spec:
+  {{- if not .Values.stt.autoscaling.enabled }}
+  replicas: {{ .Values.stt.replicaCount }}
+  {{- end }}
+  # Model weights live on a single RWO PVC; avoid two pods mounting it at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "discord-dnd-bot.componentSelectorLabels" (dict "root" . "component" "stt") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "discord-dnd-bot.componentSelectorLabels" (dict "root" . "component" "stt") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "discord-dnd-bot.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: stt
+          image: "{{ .Values.stt.image.repository }}:{{ .Values.stt.image.tag }}"
+          imagePullPolicy: {{ .Values.stt.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            # Load the configured Whisper model on startup.
+            - name: WHISPER__MODEL
+              value: {{ .Values.stt.model | quote }}
+            # Keep model weights + HF cache on the mounted (writable) volume so
+            # readOnlyRootFilesystem is satisfied and restarts reuse the cache.
+            - name: HF_HOME
+              value: /home/appuser/.cache/huggingface
+            - name: HOME
+              value: /home/appuser
+            {{- with .Values.stt.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.stt.port }}
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.stt.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.stt.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.stt.startupProbe.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.stt.resources | nindent 12 }}
+          volumeMounts:
+            - name: cache
+              mountPath: /home/appuser/.cache
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          {{- if .Values.stt.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "discord-dnd-bot.fullname" . }}-stt
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.stt.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.stt.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.stt.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if .Values.stt.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "discord-dnd-bot.fullname" . }}-stt
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stt
+spec:
+  accessModes:
+    {{- toYaml .Values.stt.persistence.accessModes | nindent 4 }}
+  {{- with .Values.stt.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.stt.persistence.size }}
+{{- end }}
+{{- end }}

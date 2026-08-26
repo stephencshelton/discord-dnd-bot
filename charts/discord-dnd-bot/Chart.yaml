@@ -1,0 +1,33 @@
+apiVersion: v2
+name: discord-dnd-bot
+description: |
+  An AI-powered Discord bot for tabletop RPG session
+  note-taking. Kubernetes-native, split into independently-scalable services
+  (gateway + worker) that talk over Redis, use PostgreSQL for state, S3-compatible
+  object storage for audio/art, and a LiteLLM gateway for all AI.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - discord
+  - ttrpg
+  - ai
+  - litellm
+home: https://github.com/stephencshelton/discord-dnd-bot
+sources:
+  - https://github.com/stephencshelton/discord-dnd-bot
+maintainers:
+  - name: stephencshelton
+
+# This chart deploys the stateless services and, optionally, a bundled
+# PostgreSQL (with pgvector) and Redis for evaluation/self-hosting. By default
+# PostgreSQL, Redis, S3-compatible storage and the LiteLLM gateway are provided
+# externally (managed services, or their own charts) and referenced via
+# values.config / values.secrets, so the chart stays lightweight and does not
+# couple stateful infra lifecycle to the app unless you opt in.
+#
+# The optional bundled PostgreSQL/Redis are plain in-chart manifests using the
+# official pgvector/pgvector and redis images (no third-party subcharts), so
+# there is nothing to `helm dependency build` and no reliance on external chart
+# repos. The grounded /ask command (RAG) requires the pgvector `vector`
+# extension; if you bring your own PostgreSQL it must have pgvector available.

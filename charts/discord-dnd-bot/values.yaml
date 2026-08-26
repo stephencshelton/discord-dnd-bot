@@ -1,0 +1,499 @@
+# Default values for the discord-dnd-bot chart.
+#
+# The application is split into two independently-scalable services that share
+# the same container image (built once, run with a different `command`):
+#   * gateway — maintains the Discord gateway/websocket + voice, publishes jobs.
+#   * worker  — consumes jobs from Redis (transcribe, summarize, art).
+#
+# Scale each one on its own (replicaCount / autoscaling below). Postgres, Redis,
+# LiteLLM and S3 are external by default so every stateless piece scales freely.
+
+nameOverride: ""
+fullnameOverride: ""
+
+# AWS / EKS account context. Only required when using ACK IAM (s3.iam.enabled)
+# to provision an IRSA role for bucket access.
+aws:
+  # 12-digit AWS account ID that owns the cluster and bucket.
+  accountId: ""
+eks:
+  # Cluster OIDC provider (issuer host + path, WITHOUT the https:// scheme), e.g.
+  # oidc.eks.us-east-1.amazonaws.com/id/EXAMPLED539D4633E53DE1B716D3041E
+  oidcProvider: ""
+
+image:
+  repository: ghcr.io/stephencshelton/discord-dnd-bot
+  # The gateway and worker share this repo but are pushed as distinct tags by CI,
+  # e.g. gateway-<sha> and worker-<sha>. Override per-service under .gateway/.worker.
+  pullPolicy: IfNotPresent
+  tag: ""            # defaults to .Chart.AppVersion when empty
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+podLabels: {}
+
+# Pod-level and container-level hardening applied to every service.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -------------------------------------------------------------------------
+# Shared application configuration (12-factor: everything via env).
+# Non-secret values land in a ConfigMap; secrets in a Secret (or external ref).
+# -------------------------------------------------------------------------
+config:
+  logLevel: info
+  httpAddr: ":8080"
+
+  discord:
+    appID: ""
+    # Set one or more IDs to enable the bot only in these Discord servers.
+    # An empty list disables guild integrations; commands are never global.
+    guildIDs: []
+    # When enabled, only members of exactly one listed guild can use AI DMs.
+    allowDirectMessages: false
+
+  database:
+    # Connection is assembled from discrete parts so the password stays in the
+    # Secret (as DATABASE_PASSWORD) and is never embedded in a plaintext URL.
+    # Set `url` instead to override with a full connection string (e.g. a managed
+    # DB whose password you keep in the secret's DATABASE_URL); when `url` is set
+    # it takes precedence and the parts below are ignored.
+    url: ""
+    host: "discord-dnd-bot-postgresql"
+    port: 5432
+    user: "discord_dnd_bot"
+    name: "discord_dnd_bot"
+    sslMode: "disable"
+    maxConns: 10
+    connMaxLifetime: "30m"
+
+  redis:
+    # host:port of your Redis (managed or in-cluster).
+    addr: "discord-dnd-bot-redis-master:6379"
+    db: 0
+
+  storage:
+    endpoint: ""         # S3-compatible endpoint; empty = AWS S3
+    region: "us-east-1"
+    bucket: "discord-dnd-bot"
+    usePathStyle: true
+
+  litellm:
+    baseURL: "http://litellm.litellm:4000"
+    # These values must match the "Model Name" (public model id) of a route that
+    # exists in your LiteLLM deployment. You can either (a) create logical
+    # aliases in LiteLLM named dnd-chat/dnd-image/etc., or (b) set these to the
+    # concrete model ids you already have. Example using a real inventory:
+    #   chatModel:       "claude-4-5-sonnet"        # bedrock/…claude-sonnet-4-5
+    #   notesModel:      "claude-opus-4-5"          # stronger model for notes
+    #   recapModel:      "claude-4-5-haiku"         # cheap model for recaps
+    #   loreModel:       "claude-4-5-sonnet"
+    #   askModel:        "claude-4-5-sonnet"
+    #   embedModel:      "amazon-titan-embed-text-v2:0"
+    #   imageModel:      "gpt-image-2"              # Bedrock has no image route here
+    #   transcribeModel: "whisper-1"               # MUST add an STT route — none exist yet
+    #
+    # Default chat route. Used for any task-specific model left empty below,
+    # and for the conversational @mention fallback.
+    chatModel: "claude-4-5-sonnet"
+    # Per-endpoint chat models. Leave empty ("") to fall back to chatModel.
+    # Point these at cheaper/stronger LiteLLM routes per task without redeploying
+    # code — e.g. a small model for recaps, a stronger one for session notes.
+    notesModel: "claude-opus-4-5"   # /session notes — best-quality writeups
+    recapModel: "claude-4-5-haiku"  # /recap — cheap, runs often
+    loreModel: "claude-4-5-sonnet"  # /lore
+    askModel: "claude-4-5-sonnet"   # /ask grounded Q&A
+    # NOTE: no speech-to-text route exists in the LiteLLM inventory, and Bedrock
+    # cannot serve one via LiteLLM. This deployment enables the self-hosted `stt`
+    # service (below) and expects a matching LiteLLM route named "voice-transcribe":
+    #
+    #   # LiteLLM config.yaml
+    #   - model_name: voice-transcribe
+    #     litellm_params:
+    #       model: openai/Systran/faster-whisper-small
+    #       api_base: http://discord-dnd-bot-stt.discord-dnd-bot:8000/v1
+    #       api_key: "none"
+    #     model_info: { mode: audio_transcription }
+    #
+    # Until that route exists, session transcription (and therefore notes/ask)
+    # will fail — everything else works.
+    transcribeModel: "voice-transcribe"
+    # OpenAI image route from the inventory.
+    imageModel: "gpt-image-2"
+    # Embedding route backing grounded /ask retrieval (Amazon Titan Embed v2).
+    embedModel: "amazon-titan-embed-text-v2:0"
+    # Dimensionality of the vectors embedModel returns. MUST match the model
+    # behind the LiteLLM embed route because it sizes the pgvector column:
+    #   1536  OpenAI text-embedding-3-small / ada-002
+    #   3072  OpenAI text-embedding-3-large
+    #   1024  Amazon Titan Embed Text v2  <-- matches embedModel above
+    # Changing this after data exists requires re-embedding (drop rows / re-run).
+    embedDim: 1024
+    requestTimeout: "120s"
+    # Larger timeout for multipart audio uploads to the transcription model.
+    uploadTimeout: "300s"
+
+  # Recording / transcription tuning.
+  audio:
+    # Target seconds per transcription chunk; long sessions are split into
+    # parallel jobs then merged. 0 disables chunking (single whole-file call).
+    chunkSeconds: 600
+    # Drop near-silent frames before upload to cut billed transcription minutes.
+    silenceTrim: true
+    # Per-frame RMS amplitude (0..32767) below which a frame is treated as silence.
+    silenceRMSThreshold: 350
+    # Hard cap on a single recording's length. A live mixed-PCM buffer costs
+    # ~11.5 MB/minute of gateway memory, so this bounds a pod's footprint and
+    # prevents one runaway session from OOMing it. 0 disables. Default 3h.
+    maxSessionMinutes: 180
+
+  # In-pod job parallelism for worker replicas. Horizontal pod autoscaling on
+  # queue depth handles scaling beyond a single pod.
+  worker:
+    concurrency: 4
+
+# -------------------------------------------------------------------------
+# Object-storage bucket provisioning via AWS Controllers for Kubernetes (ACK).
+#
+# When enabled, the chart emits an `s3.services.k8s.aws/v1alpha1 Bucket` so the
+# bucket the bot needs is created and reconciled declaratively alongside the app.
+#
+# Requirements:
+#   * The ACK S3 controller must be installed in the cluster with IAM
+#     permissions to create/manage buckets (typically via IRSA on the
+#     controller's ServiceAccount).
+#   * This only manages an AWS S3 bucket. Leave disabled for MinIO/R2 or any
+#     non-AWS S3-compatible endpoint (config.storage.endpoint set).
+#
+# The application still reads/writes the bucket named in
+# config.storage.bucket, so bucketName defaults to that value — keep them aligned.
+# -------------------------------------------------------------------------
+s3:
+  enabled: false
+  # Bucket to create. Defaults to config.storage.bucket when empty.
+  bucketName: ""
+  # ACK deletion policy: "retain" keeps the AWS bucket when the CR is deleted;
+  # "delete" removes it (only works when the bucket is empty).
+  deletionPolicy: retain
+  # Object versioning: Enabled or Suspended.
+  versioning: Suspended
+  encryption:
+    # SSE-S3 (AES256) by default. Set kmsKeyID to switch to SSE-KMS (aws:kms).
+    sseAlgorithm: AES256
+    kmsKeyID: ""
+  # Keep the bucket fully private; the app accesses it via IAM/IRSA.
+  publicAccessBlock:
+    blockPublicACLs: true
+    blockPublicPolicy: true
+    ignorePublicACLs: true
+    restrictPublicBuckets: true
+  # Optional CORS rules (ACK Bucket.spec.cors.corsRules shape). Empty = no CORS.
+  cors: []
+  # Optional lifecycle rules (ACK Bucket.spec.lifecycle.rules shape), e.g.
+  # expire raw session audio after N days to control cost:
+  #   - id: expire-audio
+  #     status: Enabled
+  #     filter: { prefix: audio/ }
+  #     expiration: { days: 30 }
+  lifecycle: []
+  # Extra tags applied on top of Application/Environment.
+  extraTags: []
+  #   - key: CostCenter
+  #     value: dnd
+
+  # IAM role + policy for the pods to access the bucket via IRSA, provisioned
+  # by the ACK IAM controller (iam.services.k8s.aws). When enabled, the role
+  # ARN is auto-wired onto the ServiceAccount (eks.amazonaws.com/role-arn), so
+  # no static STORAGE_ACCESS_KEY_ID/SECRET credentials are needed.
+  #
+  # Requires: ACK IAM controller installed, serviceAccount.create=true, and
+  # aws.accountId + eks.oidcProvider set above. The role/policy are named
+  # <fullname>-s3 and the policy is scoped to this bucket only.
+  iam:
+    enabled: false
+
+# Secret values. Use exactly one source: inline values, an existing Secret, or
+# an External Secrets Operator resource.
+#
+# Required secret keys the app consumes: DISCORD_TOKEN, LITELLM_API_KEY, and the
+# database credential — either DATABASE_PASSWORD (when config.database.url is
+# empty and the URL is built from parts, the default) or a full DATABASE_URL
+# (when config.database.url is set). REDIS_PASSWORD only when Redis auth is on.
+# STORAGE_* keys are only for non-IRSA S3/MinIO; omit them when using IRSA.
+secrets:
+  # If set, the chart references this existing Secret instead of creating one.
+  existingSecret: ""
+  create: true
+  discordToken: ""
+  # Password for the database user. Used to build DATABASE_URL from the parts in
+  # config.database when config.database.url is empty.
+  databasePassword: "discord_dnd_bot"
+  litellmAPIKey: ""
+  # Only needed when the bundled/managed Redis requires auth.
+  redisPassword: ""
+  # Only for non-IRSA S3-compatible storage (MinIO/R2 or static AWS keys). Leave
+  # empty when pods authenticate to S3 via IRSA (s3.iam).
+  storageAccessKeyID: ""
+  storageSecretAccessKey: ""
+
+  # Optional External Secrets Operator integration. When enabled, this chart
+  # creates an ExternalSecret and both workloads consume its target Secret.
+  externalSecret:
+    enabled: false
+    name: ""
+    refreshInterval: 1h
+    secretStoreRef:
+      name: ""          # required when enabled
+      kind: ClusterSecretStore
+    target:
+      # Defaults to <release>-discord-dnd-bot-secrets when empty.
+      name: ""
+      creationPolicy: Owner
+    # Define remote values using ExternalSecret's native data entries. Required
+    # app keys: DISCORD_TOKEN, LITELLM_API_KEY, and the DB credential —
+    # DATABASE_PASSWORD (default) or DATABASE_URL (when config.database.url is
+    # set). Add REDIS_PASSWORD only if Redis auth is on, and STORAGE_ACCESS_KEY_ID
+    # / STORAGE_SECRET_ACCESS_KEY only for non-IRSA S3.
+    # data:
+    #   - secretKey: LITELLM_API_KEY
+    #     remoteRef:
+    #       key: discord-dnd-bot/production
+    #       property: litellm_api_key
+    data: []
+
+# -------------------------------------------------------------------------
+# Gateway service — one logical connection to Discord. Keep replicas modest;
+# Discord sharding is the scaling axis here (set DISCORD gateway intents/shards
+# as the bot grows). HTTP port exposes /healthz and /metrics.
+# -------------------------------------------------------------------------
+gateway:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ""       # defaults to .image.repository
+    tag: ""              # defaults to gateway-<appVersion>; set by CI
+  resources:
+    requests:
+      cpu: "1"
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 75
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# -------------------------------------------------------------------------
+# Worker service — stateless queue consumer. This is the primary scale-out
+# axis: bump replicaCount or enable the HPA to process more transcription /
+# summarization / art jobs in parallel.
+# -------------------------------------------------------------------------
+worker:
+  enabled: true
+  replicaCount: 2
+  # Seconds Kubernetes waits for in-flight jobs to drain on shutdown. Should be
+  # at least as long as the slowest single job (a transcription chunk).
+  terminationGracePeriodSeconds: 120
+  image:
+    repository: ""       # defaults to .image.repository
+    tag: ""              # defaults to worker-<appVersion>; set by CI
+  resources:
+    requests:
+      cpu: 2
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# -------------------------------------------------------------------------
+# Self-hosted speech-to-text (STT) service — OPTIONAL.
+#
+# Bedrock has no batch transcription model and LiteLLM's /audio/transcriptions
+# endpoint does not support Bedrock. If you don't have an external STT provider
+# (OpenAI/Deepgram/Groq/…), enable this to run an OpenAI-compatible Whisper
+# server in-cluster. It runs fine on CPU-only (GPU-less) EC2 instances.
+#
+# It uses Speaches (https://github.com/speaches-ai/speaches), a community
+# container exposing POST /v1/audio/transcriptions. Because transcription here
+# is an async background job, real-time latency is not required — a job may take
+# minutes and that is fine.
+#
+# After enabling, register it in your LiteLLM config.yaml as a model whose
+# api_base points at this Service, then set config.litellm.transcribeModel to
+# that route's public name. See README "Self-hosted speech-to-text".
+# -------------------------------------------------------------------------
+stt:
+  enabled: false
+  replicaCount: 1
+  image:
+    repository: ghcr.io/speaches-ai/speaches
+    tag: "latest-cpu"
+    pullPolicy: IfNotPresent
+  # Whisper model to load. Swap freely without code changes:
+  #   Systran/faster-whisper-small   (default — good CPU speed/quality)
+  #   Systran/faster-whisper-medium  (slower, more accurate)
+  #   Systran/faster-whisper-large-v3 (heavy; large instances only)
+  model: "Systran/faster-whisper-medium"
+  # Port the Speaches server listens on inside the container.
+  port: 8000
+  # Persist downloaded model weights so restarts don't re-download. Requires a
+  # default StorageClass; set enabled=false to use an ephemeral emptyDir.
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+  # STT is CPU/RAM heavy relative to the Go services. Tune to your instance size.
+  resources:
+    requests:
+      cpu: "4"
+      memory: 6Gi
+    limits:
+      cpu: "4"
+      memory: 6Gi
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  # Model download + load on cold start can take a while; give it slack.
+  startupProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    failureThreshold: 60
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Extra env vars passed to the Speaches container (advanced tuning).
+  extraEnv: []
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# Emit a Prometheus Operator ServiceMonitor for scraping /metrics.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+# Ship the Grafana dashboard as a ConfigMap for sidecar auto-discovery (the
+# Grafana Helm chart / kube-prometheus-stack picks up ConfigMaps carrying the
+# sidecar label below). Disabled by default; you can also import
+# dashboards/discord-dnd-bot.json manually into any Grafana.
+grafanaDashboard:
+  enabled: false
+  # Label the Grafana sidecar watches for. kube-prometheus-stack defaults to
+  # grafana_dashboard: "1"; the standalone Grafana chart often uses the same.
+  sidecarLabel: grafana_dashboard
+  sidecarLabelValue: "1"
+  # Optional: set the Grafana folder to file the dashboard under.
+  folder: ""
+  # Extra labels to add to the ConfigMap (e.g. to target a specific Grafana).
+  extraLabels: {}
+
+# PodDisruptionBudget for the worker pool (keep at least one consumer alive).
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# -------------------------------------------------------------------------
+# Bundled PostgreSQL — OPTIONAL, disabled by default.
+#
+# For evaluation / self-hosting only. Rendered as a plain in-chart StatefulSet
+# using the official pgvector/pgvector image, so the `vector` extension that
+# /ask needs is always present (no third-party subchart, no Bitnami paywall).
+# The app runs CREATE EXTENSION vector on startup under an advisory lock.
+#
+# Credentials come from config.database (user/name) and the app Secret's
+# DATABASE_PASSWORD, so the DB password is defined in exactly one place. The
+# Service name is <release>-postgresql, which config.database.host points at.
+# Requires config.database.url to be empty. Any PostgreSQL 13+ with pgvector
+# works — nothing in the app pins a major version.
+#
+# For production, prefer managed PostgreSQL with pgvector (AWS RDS/Aurora, Azure
+# Database for PostgreSQL, GCP Cloud SQL) and leave this disabled.
+# -------------------------------------------------------------------------
+postgresql:
+  enabled: false
+  image:
+    # Official pgvector image (PostgreSQL + the vector extension prebuilt).
+    # Tags: pg13..pg17 — any works; pg16 is a safe default.
+    repository: pgvector/pgvector
+    tag: "pg16"
+    pullPolicy: IfNotPresent
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# -------------------------------------------------------------------------
+# Bundled Redis — OPTIONAL, disabled by default.
+#
+# For evaluation / self-hosting. Rendered as a plain in-chart Deployment using
+# the official redis image. The Service is named <release>-redis-master to match
+# the default config.redis.addr. When auth is enabled, set secrets.redisPassword
+# to the same value the app uses.
+# -------------------------------------------------------------------------
+redis:
+  enabled: false
+  image:
+    repository: redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  auth:
+    enabled: false
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 256Mi
+    limits:
+      cpu: "500m"
+      memory: 256Mi

@@ -1,0 +1,25 @@
+{{- if .Values.grafanaDashboard.enabled }}
+{{- /*
+Ship the Grafana dashboard as a ConfigMap for sidecar auto-discovery. The
+Grafana sidecar (kube-prometheus-stack / Grafana Helm chart) imports ConfigMaps
+carrying the configured label. The dashboard JSON is read from the chart's
+dashboards/ directory, so it stays the single source of truth.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "discord-dnd-bot.fullname" . }}-grafana-dashboard
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+    {{ .Values.grafanaDashboard.sidecarLabel }}: {{ .Values.grafanaDashboard.sidecarLabelValue | quote }}
+    {{- with .Values.grafanaDashboard.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.grafanaDashboard.folder }}
+  annotations:
+    grafana_folder: {{ . | quote }}
+  {{- end }}
+data:
+  discord-dnd-bot.json: |-
+    {{- .Files.Get "dashboards/discord-dnd-bot.json" | nindent 4 }}
+{{- end }}

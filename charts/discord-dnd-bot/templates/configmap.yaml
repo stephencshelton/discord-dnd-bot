@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "discord-dnd-bot.configMapName" . }}
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+data:
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  HTTP_ADDR: {{ .Values.config.httpAddr | quote }}
+
+  DISCORD_APP_ID: {{ .Values.config.discord.appID | quote }}
+  DISCORD_GUILD_IDS: {{ join "," .Values.config.discord.guildIDs | quote }}
+  DISCORD_ALLOW_DIRECT_MESSAGES: {{ .Values.config.discord.allowDirectMessages | quote }}
+
+  DATABASE_MAX_CONNS: {{ .Values.config.database.maxConns | quote }}
+  DATABASE_CONN_MAX_LIFETIME: {{ .Values.config.database.connMaxLifetime | quote }}
+  {{- if not .Values.config.database.url }}
+  {{- /* Non-secret connection parts; the password comes from the Secret as
+         DATABASE_PASSWORD and the app assembles the DSN. When database.url is
+         set instead, it is provided via the Secret and these are unused. */}}
+  DATABASE_HOST: {{ .Values.config.database.host | quote }}
+  DATABASE_PORT: {{ .Values.config.database.port | quote }}
+  DATABASE_USER: {{ .Values.config.database.user | quote }}
+  DATABASE_NAME: {{ .Values.config.database.name | quote }}
+  DATABASE_SSLMODE: {{ .Values.config.database.sslMode | quote }}
+  {{- end }}
+
+  REDIS_ADDR: {{ .Values.config.redis.addr | quote }}
+  REDIS_DB: {{ .Values.config.redis.db | quote }}
+
+  STORAGE_ENDPOINT: {{ .Values.config.storage.endpoint | quote }}
+  STORAGE_REGION: {{ .Values.config.storage.region | quote }}
+  STORAGE_BUCKET: {{ .Values.config.storage.bucket | quote }}
+  STORAGE_USE_PATH_STYLE: {{ .Values.config.storage.usePathStyle | quote }}
+
+  LITELLM_BASE_URL: {{ .Values.config.litellm.baseURL | quote }}
+  LITELLM_CHAT_MODEL: {{ .Values.config.litellm.chatModel | quote }}
+  {{- with .Values.config.litellm.notesModel }}
+  LITELLM_NOTES_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.litellm.recapModel }}
+  LITELLM_RECAP_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.litellm.loreModel }}
+  LITELLM_LORE_MODEL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.litellm.askModel }}
+  LITELLM_ASK_MODEL: {{ . | quote }}
+  {{- end }}
+  LITELLM_TRANSCRIBE_MODEL: {{ .Values.config.litellm.transcribeModel | quote }}
+  LITELLM_IMAGE_MODEL: {{ .Values.config.litellm.imageModel | quote }}
+  LITELLM_EMBED_MODEL: {{ .Values.config.litellm.embedModel | quote }}
+  LITELLM_EMBED_DIM: {{ .Values.config.litellm.embedDim | quote }}
+  LITELLM_REQUEST_TIMEOUT: {{ .Values.config.litellm.requestTimeout | quote }}
+  LITELLM_UPLOAD_TIMEOUT: {{ .Values.config.litellm.uploadTimeout | quote }}
+
+  AUDIO_CHUNK_SECONDS: {{ .Values.config.audio.chunkSeconds | quote }}
+  AUDIO_SILENCE_TRIM: {{ .Values.config.audio.silenceTrim | quote }}
+  AUDIO_SILENCE_RMS_THRESHOLD: {{ .Values.config.audio.silenceRMSThreshold | quote }}
+  AUDIO_MAX_SESSION_MINUTES: {{ .Values.config.audio.maxSessionMinutes | quote }}
+
+  WORKER_CONCURRENCY: {{ .Values.config.worker.concurrency | quote }}

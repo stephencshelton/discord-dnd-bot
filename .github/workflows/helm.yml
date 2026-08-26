@@ -1,0 +1,61 @@
+name: Helm
+
+on:
+  push:
+    branches: [main]
+    paths: ["charts/**"]
+  pull_request:
+    branches: [main]
+    paths: ["charts/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - name: helm lint
+        run: helm lint charts/discord-dnd-bot
+      - name: helm template (default)
+        run: helm template rel charts/discord-dnd-bot > /dev/null
+      - name: helm template (autoscaling + servicemonitor + existing secret)
+        run: |
+          helm template rel charts/discord-dnd-bot \
+            --set gateway.autoscaling.enabled=true \
+            --set serviceMonitor.enabled=true \
+            --set secrets.create=false \
+            --set secrets.existingSecret=discord-dnd-bot-secrets > /dev/null
+      - name: helm template (external secret)
+        run: |
+          helm template rel charts/discord-dnd-bot \
+            --set secrets.create=false \
+            --set secrets.externalSecret.enabled=true \
+            --set secrets.externalSecret.secretStoreRef.name=production-secrets \
+            --set secrets.externalSecret.data[0].secretKey=LITELLM_API_KEY \
+            --set secrets.externalSecret.data[0].remoteRef.key=discord-dnd-bot/production \
+            --set secrets.externalSecret.data[0].remoteRef.property=litellm_api_key > /dev/null
+
+  kubeconform:
+    name: Validate manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - name: Install kubeconform
+        run: |
+          curl -sSfL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin kubeconform
+      - name: Render and validate
+        run: |
+          helm template rel charts/discord-dnd-bot \
+            | kubeconform -strict -ignore-missing-schemas -summary

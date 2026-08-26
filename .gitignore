@@ -1,0 +1,29 @@
+# Build artifacts
+bin/
+out/
+dist/
+*.exe
+app
+
+# Test / coverage output
+coverage.out
+coverage.html
+*.test
+
+# Local environment / secrets — never commit these
+.env
+.env.*
+*.local
+
+# Local media the bot may produce while testing
+*.wav
+
+# Helm chart dependencies (fetched via `helm dependency build`)
+charts/**/charts/
+charts/**/Chart.lock
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
