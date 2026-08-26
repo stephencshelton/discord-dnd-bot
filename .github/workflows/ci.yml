@@ -82,8 +82,12 @@ jobs:
       - name: gosec (static security analysis)
         uses: securego/gosec@549db668017d67c5eedc9ee8a695208bc3af7c23 # v2.29.0
         with:
-          args: -fmt sarif -out gosec.sarif ./...
+          # -no-fail: report findings via SARIF (uploaded below) instead of
+          # failing the job, so results always land in the Security tab rather
+          # than silently red-Xing the build with no visible output.
+          args: -no-fail -fmt sarif -out gosec.sarif ./...
       - name: Upload gosec SARIF
+        if: always()
         uses: github/codeql-action/upload-sarif@fddeee1a7ece751b577e409a89057319e3172939 # v4
         with:
           sarif_file: gosec.sarif

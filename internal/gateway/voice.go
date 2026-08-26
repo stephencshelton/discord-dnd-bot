@@ -105,7 +105,9 @@ func (r *recording) onSpeakingUpdate(_ *discordgo.VoiceConnection, vs *discordgo
 	if vs == nil || vs.UserID == "" {
 		return
 	}
-	ssrc := uint32(vs.SSRC)
+	// SSRC is a 32-bit RTP identifier that discordgo surfaces as int; mask to
+	// the low 32 bits so the conversion can never overflow.
+	ssrc := uint32(vs.SSRC & 0xFFFFFFFF) //#nosec G115 -- masked to low 32 bits
 	r.mu.Lock()
 	r.ssrcUser[ssrc] = vs.UserID
 	alreadySeen := r.seen[vs.UserID]
