@@ -78,7 +78,9 @@ config:
     # DB whose password you keep in the secret's DATABASE_URL); when `url` is set
     # it takes precedence and the parts below are ignored.
     url: ""
-    host: "discord-dnd-bot-postgresql"
+    # host is auto-derived from the bundled PostgreSQL Service when
+    # postgresql.enabled=true. Set it explicitly only for an external/managed DB.
+    host: ""
     port: 5432
     user: "discord_dnd_bot"
     name: "discord_dnd_bot"
@@ -87,8 +89,9 @@ config:
     connMaxLifetime: "30m"
 
   redis:
-    # host:port of your Redis (managed or in-cluster).
-    addr: "discord-dnd-bot-redis-master:6379"
+    # addr is auto-derived from the bundled Redis Service when redis.enabled=true.
+    # Set it explicitly only for an external/managed Redis.
+    addr: ""
     db: 0
 
   storage:

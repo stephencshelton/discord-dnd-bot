@@ -74,6 +74,36 @@ Used to annotate the ServiceAccount when s3 + s3.iam are enabled.
 {{- end }}
 
 {{/*
+Effective database host. When the bundled PostgreSQL is enabled the chart owns
+the Service name, so it is derived from the fullname automatically; an explicit
+config.database.host still wins (for a managed/external DB).
+*/}}
+{{- define "discord-dnd-bot.databaseHost" -}}
+{{- if .Values.config.database.host }}
+{{- .Values.config.database.host }}
+{{- else if .Values.postgresql.enabled }}
+{{- printf "%s-postgresql" (include "discord-dnd-bot.fullname" .) }}
+{{- else }}
+{{- "localhost" }}
+{{- end }}
+{{- end }}
+
+{{/*
+Effective Redis address (host:port). When the bundled Redis is enabled the chart
+owns the Service name, so it is derived from the fullname automatically; an
+explicit config.redis.addr still wins (for a managed/external Redis).
+*/}}
+{{- define "discord-dnd-bot.redisAddr" -}}
+{{- if .Values.config.redis.addr }}
+{{- .Values.config.redis.addr }}
+{{- else if .Values.redis.enabled }}
+{{- printf "%s-redis-master:6379" (include "discord-dnd-bot.fullname" .) }}
+{{- else }}
+{{- "localhost:6379" }}
+{{- end }}
+{{- end }}
+
+{{/*
 Name of the Secret holding sensitive env. Uses existingSecret when provided.
 */}}
 {{- define "discord-dnd-bot.secretName" -}}

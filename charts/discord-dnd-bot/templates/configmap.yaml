@@ -17,15 +17,17 @@ data:
   {{- if not .Values.config.database.url }}
   {{- /* Non-secret connection parts; the password comes from the Secret as
          DATABASE_PASSWORD and the app assembles the DSN. When database.url is
-         set instead, it is provided via the Secret and these are unused. */}}
-  DATABASE_HOST: {{ .Values.config.database.host | quote }}
+         set instead, it is provided via the Secret and these are unused.
+         DATABASE_HOST is derived from the bundled PostgreSQL Service when
+         postgresql.enabled and no explicit host is set. */}}
+  DATABASE_HOST: {{ include "discord-dnd-bot.databaseHost" . | quote }}
   DATABASE_PORT: {{ .Values.config.database.port | quote }}
   DATABASE_USER: {{ .Values.config.database.user | quote }}
   DATABASE_NAME: {{ .Values.config.database.name | quote }}
   DATABASE_SSLMODE: {{ .Values.config.database.sslMode | quote }}
   {{- end }}
 
-  REDIS_ADDR: {{ .Values.config.redis.addr | quote }}
+  REDIS_ADDR: {{ include "discord-dnd-bot.redisAddr" . | quote }}
   REDIS_DB: {{ .Values.config.redis.db | quote }}
 
   STORAGE_ENDPOINT: {{ .Values.config.storage.endpoint | quote }}

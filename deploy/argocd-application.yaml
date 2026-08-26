@@ -52,17 +52,14 @@ spec:
               - "<DISCORD_GUILD_ID>"      # your server(s); add more as needed
             allowDirectMessages: true
           database:
-          database:
             # Discrete parts; the bot assembles the DSN and the password comes
-            # from the Secret (DATABASE_PASSWORD) synced by ESO. Host matches the
-            # bundled PostgreSQL Service.
-            host: "discord-dnd-bot-postgresql"
-            port: 5432
+            # from the Secret (DATABASE_PASSWORD) synced by ESO. The host is
+            # auto-derived from the bundled PostgreSQL Service (postgresql below).
             user: "discord_dnd_bot"
             name: "discord_dnd_bot"
             sslMode: "disable"
           redis:
-            addr: "discord-dnd-bot-redis-master:6379"
+            # addr is auto-derived from the bundled Redis Service (redis below).
             db: 0
           storage:
             endpoint: ""                 # empty = real AWS S3
