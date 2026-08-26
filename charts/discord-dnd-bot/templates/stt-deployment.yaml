@@ -33,24 +33,43 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # The Speaches image is built around its own "ubuntu" user (UID 1000) with
+      # HOME=/home/ubuntu and PATH pointing at /home/ubuntu/speaches/.venv/bin
+      # (where uvicorn lives). The chart's global hardening pins UID 10001, which
+      # loses that PATH and HOME -> `uvicorn: not found`. Run STT as UID 1000 but
+      # keep the other hardening (non-root, no privilege escalation, dropped caps).
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: stt
           image: "{{ .Values.stt.image.repository }}:{{ .Values.stt.image.tag }}"
           imagePullPolicy: {{ .Values.stt.image.pullPolicy }}
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           env:
             # Load the configured Whisper model on startup.
             - name: WHISPER__MODEL
               value: {{ .Values.stt.model | quote }}
+            # Match the image's baked-in user home. uvicorn is installed in the
+            # venv at /home/ubuntu/speaches/.venv/bin; set PATH explicitly so it
+            # is always found regardless of how the runtime resolves the image env.
+            - name: HOME
+              value: /home/ubuntu
+            - name: PATH
+              value: /home/ubuntu/speaches/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             # Keep model weights + HF cache on the mounted (writable) volume so
             # readOnlyRootFilesystem is satisfied and restarts reuse the cache.
             - name: HF_HOME
-              value: /home/appuser/.cache/huggingface
-            - name: HOME
-              value: /home/appuser
+              value: /home/ubuntu/.cache/huggingface
             {{- with .Values.stt.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -79,7 +98,7 @@ spec:
             {{- toYaml .Values.stt.resources | nindent 12 }}
           volumeMounts:
             - name: cache
-              mountPath: /home/appuser/.cache
+              mountPath: /home/ubuntu/.cache
             - name: tmp
               mountPath: /tmp
       volumes:
