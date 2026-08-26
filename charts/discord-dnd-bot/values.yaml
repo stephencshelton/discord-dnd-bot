@@ -362,7 +362,12 @@ stt:
   replicaCount: 1
   image:
     repository: ghcr.io/speaches-ai/speaches
-    tag: "latest-cpu"
+    # Pin an explicit CPU tag. Do NOT use the floating `latest-cpu`: it lags
+    # behind and predates the `preload_models` (PRELOAD_MODELS) feature added in
+    # 0.9.0-rc.3, so the STT deployment's PRELOAD_MODELS env is silently ignored,
+    # the HF cache is never populated, and transcription fails with
+    # `CacheNotFound: /home/ubuntu/.cache/huggingface/hub`. This tag has it.
+    tag: "0.9.0-rc.3-cpu"
     pullPolicy: IfNotPresent
   # Whisper model to load. Swap freely without code changes:
   #   Systran/faster-whisper-small   (default — good CPU speed/quality)

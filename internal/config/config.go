@@ -224,5 +224,12 @@ func Load() (*Config, error) {
 	if err := envconfig.Process("", &c); err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
+	// Normalize the Discord bot token. Secrets frequently arrive with a
+	// trailing newline (e.g. from `echo`/`kubectl create secret`) or with an
+	// accidental "Bot " prefix; both make Discord reject the identify with
+	// close code 4004 ("Authentication failed") even though the raw token is
+	// valid. The session code adds the "Bot " scheme itself, so strip it here.
+	c.Discord.Token = strings.TrimSpace(c.Discord.Token)
+	c.Discord.Token = strings.TrimSpace(strings.TrimPrefix(c.Discord.Token, "Bot "))
 	return &c, nil
 }
