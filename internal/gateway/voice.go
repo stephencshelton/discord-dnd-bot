@@ -95,9 +95,6 @@ func (m *voiceManager) start(guildID, channelID, sessionID string) error {
 		anchor:    make(map[uint32]streamAnchor),
 	}
 
-	// Inject our receiver before opening so no early frames are missed.
-	conn.SetOpusFrameReceiver(r)
-
 	// Open the connection: self-mute (we never speak) but NOT self-deaf (we must
 	// hear). disgo negotiates the DAVE/E2EE handshake as part of Open, and only
 	// returns once the voice UDP + encryption (incl. DAVE) handshake completes.
@@ -117,6 +114,12 @@ func (m *voiceManager) start(guildID, channelID, sessionID string) error {
 	m.g.log.Info("voice conn opened",
 		"guild", guildID, "channel", channelID, "session", sessionID,
 		"elapsed_ms", time.Since(openStart).Milliseconds())
+
+	// Attach our receiver AFTER Open: SetOpusFrameReceiver immediately starts a
+	// goroutine that calls conn.UDP().ReadPacket(); the UDP socket is only dialed
+	// during Open, so attaching before Open races and dereferences a nil conn
+	// (SIGSEGV in disgo's udpConnImpl.ReadPacket). By now the socket is ready.
+	conn.SetOpusFrameReceiver(r)
 
 	m.mu.Lock()
 	m.rec[guildID] = r
