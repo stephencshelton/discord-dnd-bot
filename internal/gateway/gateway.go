@@ -31,7 +31,6 @@ type Gateway struct {
 	appID         string
 	regIDs        []string // registered command IDs, for cleanup
 	allowedGuilds map[string]struct{}
-	allowDMs      bool
 	isGuildMember func(guildID, userID string) bool
 }
 
@@ -63,7 +62,6 @@ func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, 
 		storage:       st,
 		appID:         cfg.Discord.AppID,
 		allowedGuilds: allowedGuilds,
-		allowDMs:      cfg.Discord.AllowDirectMessages,
 		isGuildMember: func(guildID, userID string) bool {
 			_, err := sess.GuildMember(guildID, userID)
 			return err == nil
@@ -118,24 +116,87 @@ func (g *Gateway) allowsGuild(guildID string) bool {
 	return allowed
 }
 
-// directMessageGuildID resolves a DM to the sole allowlisted guild containing
-// the user. Multiple memberships are rejected to avoid mixing campaign data.
-func (g *Gateway) directMessageGuildID(userID string) (string, bool) {
-	if !g.allowDMs || g.isGuildMember == nil {
+// resolveGuild determines which guild a command should operate against. In a
+// guild it's simply i.GuildID. In a DM there is no guild, so it resolves the
+// user's selected/sole shared guild via directMessageGuildID. Returns
+// ("", false) when a DM can't be mapped to a single guild (unset selection with
+// multiple shared servers, or no shared servers) — the caller should tell the
+// user to run /dm-server.
+func (g *Gateway) resolveGuild(ctx context.Context, i *discordgo.InteractionCreate) (string, bool) {
+	if i.GuildID != "" {
+		return i.GuildID, true
+	}
+	return g.directMessageGuildID(ctx, interactionUserID(i))
+}
+
+// dmGuildHelp is the message shown when a DM command can't resolve a guild.
+const dmGuildHelp = "I couldn't tell which server's campaign to use. If you're in more than one of my servers, run `/dm-server` here to pick one (and to switch later)."
+
+// directMessageGuildID resolves a DM to a single allowlisted guild for the
+// user. Resolution order:
+//  1. the user's explicitly selected DM guild (via /dm-server), if they're
+//     still an allowlisted member of it;
+//  2. otherwise, if they belong to exactly one allowlisted guild, that guild;
+//  3. otherwise ambiguous — no guild (the caller explains why to the user).
+//
+// ctx is used to read the stored preference; a store error falls back to the
+// membership-based resolution rather than failing the DM outright.
+func (g *Gateway) directMessageGuildID(ctx context.Context, userID string) (string, bool) {
+	if g.isGuildMember == nil {
 		return "", false
 	}
 
+	// 1. Honor an explicit selection when the user is still a valid member.
+	if g.store != nil {
+		if pref, err := g.store.GetDMGuildID(ctx, userID); err == nil && pref != "" {
+			if _, ok := g.allowedGuilds[pref]; ok && g.isGuildMember(pref, userID) {
+				return pref, true
+			}
+		}
+	}
+
+	// 2. Fall back to the sole shared guild.
 	matchedGuildID := ""
 	for guildID := range g.allowedGuilds {
 		if !g.isGuildMember(guildID, userID) {
 			continue
 		}
 		if matchedGuildID != "" {
-			return "", false
+			return "", false // ambiguous: multiple guilds and no valid preference
 		}
 		matchedGuildID = guildID
 	}
 	return matchedGuildID, matchedGuildID != ""
+}
+
+// sharedGuildIDs returns the allowlisted guilds the user is a member of.
+func (g *Gateway) sharedGuildIDs(userID string) []string {
+	if g.isGuildMember == nil {
+		return nil
+	}
+	var out []string
+	for guildID := range g.allowedGuilds {
+		if g.isGuildMember(guildID, userID) {
+			out = append(out, guildID)
+		}
+	}
+	return out
+}
+
+// dmRejectReason explains, for logging/troubleshooting, why a DM from userID is
+// not actioned. It mirrors directMessageGuildID's logic without side effects.
+func (g *Gateway) dmRejectReason(userID string) string {
+	if g.isGuildMember == nil {
+		return "membership lookup unavailable"
+	}
+	switch matches := len(g.sharedGuildIDs(userID)); {
+	case matches == 0:
+		return "user is not a member of any allowlisted guild"
+	case matches > 1:
+		return "user is a member of multiple allowlisted guilds and has no /dm-server selection"
+	default:
+		return "allowed"
+	}
 }
 
 func (g *Gateway) onReady(s *discordgo.Session, r *discordgo.Ready) {

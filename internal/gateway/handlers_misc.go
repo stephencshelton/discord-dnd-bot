@@ -104,6 +104,71 @@ func (g *Gateway) handleFeedback(ctx context.Context, s *discordgo.Session, i *d
 	return g.reply(s, i, "🙏 Thank you! Your feedback was recorded.", true)
 }
 
+// handleDMServer lets a user who shares multiple servers with the bot choose
+// which server's campaign their DM chat/recaps use, and switch between them.
+// With no argument it reports the current selection and lists the options.
+func (g *Gateway) handleDMServer(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
+	userID := interactionUser(i)
+	if userID == "" {
+		return g.reply(s, i, "Couldn't identify you.", true)
+	}
+
+	shared := g.sharedGuildIDs(userID)
+	if len(shared) == 0 {
+		return g.reply(s, i, "You're not in any server I'm configured for, so there's nothing to select.", true)
+	}
+
+	selected := optString(i.ApplicationCommandData().Options, "server")
+
+	// No argument: show current selection + available servers.
+	if selected == "" {
+		current, _ := g.store.GetDMGuildID(ctx, userID)
+		var b strings.Builder
+		if current != "" && g.isMemberOfAllowlisted(current, userID) {
+			b.WriteString(fmt.Sprintf("Your DMs currently use **%s**.\n\n", g.guildName(s, current)))
+		} else if len(shared) == 1 {
+			b.WriteString(fmt.Sprintf("Your DMs use **%s** (the only server we share).\n\n", g.guildName(s, shared[0])))
+		} else {
+			b.WriteString("You haven't picked a server for DMs yet.\n\n")
+		}
+		b.WriteString("Available servers:\n")
+		for _, gid := range shared {
+			b.WriteString(fmt.Sprintf("• %s\n", g.guildName(s, gid)))
+		}
+		b.WriteString("\nRun `/dm-server server:<name>` to choose or switch.")
+		return g.reply(s, i, b.String(), true)
+	}
+
+	// Setting a selection: validate it's a server the user actually shares.
+	if !g.isMemberOfAllowlisted(selected, userID) {
+		return g.reply(s, i, "That isn't a server we share (or I'm not configured for it). Pick one from the suggestions.", true)
+	}
+	if err := g.store.SetDMGuildID(ctx, userID, selected); err != nil {
+		return err
+	}
+	return g.reply(s, i, fmt.Sprintf("✅ Your DMs will now use **%s**. Run `/dm-server` again anytime to switch.", g.guildName(s, selected)), true)
+}
+
+// isMemberOfAllowlisted reports whether guildID is allowlisted AND the user is a
+// member of it.
+func (g *Gateway) isMemberOfAllowlisted(guildID, userID string) bool {
+	if _, ok := g.allowedGuilds[guildID]; !ok {
+		return false
+	}
+	return g.isGuildMember != nil && g.isGuildMember(guildID, userID)
+}
+
+// guildName resolves a guild's display name from the session cache, falling
+// back to the ID when it isn't cached.
+func (g *Gateway) guildName(s *discordgo.Session, guildID string) string {
+	if s != nil && s.State != nil {
+		if gd, err := s.State.Guild(guildID); err == nil && gd != nil && gd.Name != "" {
+			return gd.Name
+		}
+	}
+	return guildID
+}
+
 // routeAutocomplete provides suggestions for campaign/character name options.
 func (g *Gateway) routeAutocomplete(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -113,7 +178,8 @@ func (g *Gateway) routeAutocomplete(s *discordgo.Session, i *discordgo.Interacti
 
 	switch data.Name {
 	case "campaign":
-		camps, _ := g.store.ListCampaigns(ctx, i.GuildID, true)
+		guildID, _ := g.resolveGuild(ctx, i) // "" in an unresolvable DM -> no suggestions
+		camps, _ := g.store.ListCampaigns(ctx, guildID, true)
 		for _, c := range camps {
 			choices = append(choices, &discordgo.ApplicationCommandOptionChoice{Name: c.Name, Value: c.Name})
 			if len(choices) >= 25 {
@@ -121,7 +187,8 @@ func (g *Gateway) routeAutocomplete(s *discordgo.Session, i *discordgo.Interacti
 			}
 		}
 	case "character":
-		if camp, err := g.store.GetActiveCampaign(ctx, i.GuildID); err == nil {
+		guildID, _ := g.resolveGuild(ctx, i)
+		if camp, err := g.store.GetActiveCampaign(ctx, guildID); err == nil {
 			pcs, _ := g.store.ListPCs(ctx, camp.ID)
 			for _, pc := range pcs {
 				choices = append(choices, &discordgo.ApplicationCommandOptionChoice{Name: pc.Name, Value: pc.Name})
@@ -136,6 +203,20 @@ func (g *Gateway) routeAutocomplete(s *discordgo.Session, i *discordgo.Interacti
 			if partial == "" || strings.Contains(name, partial) {
 				choices = append(choices, &discordgo.ApplicationCommandOptionChoice{Name: name, Value: name})
 			}
+			if len(choices) >= 25 {
+				break
+			}
+		}
+	case "dm-server":
+		// Suggest the servers the invoking user shares with the bot. The choice
+		// value is the guild ID; the label is the guild's name (falling back to
+		// the ID if the name can't be resolved from cache).
+		userID := interactionUser(i)
+		for _, gid := range g.sharedGuildIDs(userID) {
+			choices = append(choices, &discordgo.ApplicationCommandOptionChoice{
+				Name:  g.guildName(s, gid),
+				Value: gid,
+			})
 			if len(choices) >= 25 {
 				break
 			}

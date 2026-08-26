@@ -32,12 +32,23 @@ func (g *Gateway) onMessageCreate(s *discordgo.Session, mc *discordgo.MessageCre
 		}
 	}()
 
+	ctx, cancel := context.WithTimeout(context.Background(), interactionTimeout)
+	defer cancel()
+
 	isDM := mc.GuildID == ""
 	var guildID string
 	if isDM {
 		var allowed bool
-		guildID, allowed = g.directMessageGuildID(mc.Author.ID)
+		guildID, allowed = g.directMessageGuildID(ctx, mc.Author.ID)
 		if !allowed {
+			// A DM was received but not actioned. Log the reason, and — when the
+			// user is in multiple servers with no selection — reply with guidance
+			// instead of staying silent, so they know to run /dm-server.
+			reason := g.dmRejectReason(mc.Author.ID)
+			g.log.Debug("ignoring DM", "user", mc.Author.ID, "reason", reason)
+			if len(g.sharedGuildIDs(mc.Author.ID)) > 1 {
+				g.sendReply(s, mc, "You're in more than one of my servers, so I don't know which campaign to use here. Run `/dm-server` in this DM to pick one (and to switch later).")
+			}
 			return
 		}
 	} else if !g.allowsGuild(mc.GuildID) {
@@ -62,9 +73,6 @@ func (g *Gateway) onMessageCreate(s *discordgo.Session, mc *discordgo.MessageCre
 	if !isDM && !mentioned {
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), interactionTimeout)
-	defer cancel()
 
 	content := stripMention(mc.Content, selfID)
 	if strings.TrimSpace(content) == "" {

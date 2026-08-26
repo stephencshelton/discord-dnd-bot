@@ -14,9 +14,9 @@ import (
 
 // handleLore answers a free-form worldbuilding question with the chat model.
 func (g *Gateway) handleLore(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID := i.GuildID
-	if guildID == "" {
-		return g.reply(s, i, "Use `/lore` inside a server with an active campaign.", true)
+	guildID, ok := g.resolveGuild(ctx, i)
+	if !ok {
+		return g.reply(s, i, dmGuildHelp, true)
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
@@ -42,9 +42,9 @@ func (g *Gateway) handleLore(ctx context.Context, s *discordgo.Session, i *disco
 
 // handleRecap generates a "previously on" from recent session notes.
 func (g *Gateway) handleRecap(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID := i.GuildID
-	if guildID == "" {
-		return g.reply(s, i, "Use `/recap` inside a server.", true)
+	guildID, ok := g.resolveGuild(ctx, i)
+	if !ok {
+		return g.reply(s, i, dmGuildHelp, true)
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
@@ -82,9 +82,9 @@ func (g *Gateway) handleRecap(ctx context.Context, s *discordgo.Session, i *disc
 // retrieval-augmented generation: embed the question, fetch the most similar
 // note passages (pgvector), and constrain the chat model to those excerpts.
 func (g *Gateway) handleAsk(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	guildID := i.GuildID
-	if guildID == "" {
-		return g.reply(s, i, "Use `/ask` inside a server with an active campaign.", true)
+	guildID, ok := g.resolveGuild(ctx, i)
+	if !ok {
+		return g.reply(s, i, dmGuildHelp, true)
 	}
 	question := strings.TrimSpace(optString(i.ApplicationCommandData().Options, "question"))
 	if question == "" {

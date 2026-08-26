@@ -46,8 +46,9 @@ type DiscordConfig struct {
 	// GuildIDs registers commands only in the listed guilds. Empty disables
 	// guild integrations.
 	GuildIDs []string `envconfig:"DISCORD_GUILD_IDS"`
-	// AllowDirectMessages enables AI chat for users who belong to exactly one
-	// allowlisted guild. It is disabled by default.
+	// AllowDirectMessages is DEPRECATED and no longer consulted: DMs are always
+	// enabled. Retained so existing env/values with DISCORD_ALLOW_DIRECT_MESSAGES
+	// still parse. Remove after the setting is dropped from deployments.
 	AllowDirectMessages bool `envconfig:"DISCORD_ALLOW_DIRECT_MESSAGES" default:"false"`
 }
 

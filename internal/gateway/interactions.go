@@ -26,13 +26,19 @@ func (g *Gateway) onInteraction(s *discordgo.Session, i *discordgo.InteractionCr
 }
 
 func (g *Gateway) routeCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	if !g.allowsGuild(i.GuildID) {
-		g.log.Warn("ignored command from unconfigured guild", "guild", i.GuildID)
-		_ = g.reply(s, i, "This bot is not configured for this server.", true)
-		return
+	name := i.ApplicationCommandData().Name
+
+	// DM-capable global commands (e.g. /dm-server) arrive with an empty GuildID
+	// and must bypass the guild allowlist check. Everything else must come from
+	// a configured guild.
+	if i.GuildID != "" || !isDMCommand(name) {
+		if !g.allowsGuild(i.GuildID) {
+			g.log.Warn("ignored command from unconfigured guild", "guild", i.GuildID, "command", name)
+			_ = g.reply(s, i, "This bot is not configured for this server.", true)
+			return
+		}
 	}
 
-	name := i.ApplicationCommandData().Name
 	start := time.Now()
 
 	// Build a per-interaction correlation ID + child logger so every log line
@@ -102,6 +108,8 @@ func (g *Gateway) routeCommand(s *discordgo.Session, i *discordgo.InteractionCre
 		err = g.handleFeedback(ctx, s, i)
 	case "help":
 		err = g.handleHelp(ctx, s, i)
+	case "dm-server":
+		err = g.handleDMServer(ctx, s, i)
 	default:
 		err = fmt.Errorf("unknown command %q", name)
 	}
@@ -123,6 +131,13 @@ func interactionUserID(i *discordgo.InteractionCreate) string {
 		return i.User.ID
 	}
 	return ""
+}
+
+// isDMCommand reports whether a command is a global, DM-capable command that
+// must be allowed to run outside a configured guild.
+func isDMCommand(name string) bool {
+	_, ok := dmCapableCommands()[name]
+	return ok
 }
 
 // --- interaction reply helpers ---

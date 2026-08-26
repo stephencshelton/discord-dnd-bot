@@ -49,7 +49,7 @@ func testDefs() []*discordgo.ApplicationCommand {
 
 func TestRegisterGuildCommands_AllSucceed(t *testing.T) {
 	r := &fakeRegistrar{}
-	ids, err := registerGuildCommands(r, testLogger(), "app", []string{"g1", "g2"}, testDefs())
+	ids, err := registerGuildCommands(r, testLogger(), "app", []string{"g1", "g2"}, testDefs(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestRegisterGuildCommands_PartialFailureStillSucceeds(t *testing.T) {
 	forbidden := errors.New("HTTP 403 Forbidden: Missing Access")
 	r := &fakeRegistrar{perGuild: map[string]error{"g1": forbidden}}
 
-	ids, err := registerGuildCommands(r, testLogger(), "app", []string{"g1", "g2"}, testDefs())
+	ids, err := registerGuildCommands(r, testLogger(), "app", []string{"g1", "g2"}, testDefs(), nil)
 	if err != nil {
 		t.Fatalf("partial failure should not error, got: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestRegisterGuildCommands_AllFailReturnsError(t *testing.T) {
 	forbidden := errors.New("HTTP 403 Forbidden: Missing Access")
 	r := &fakeRegistrar{perGuild: map[string]error{"g1": forbidden, "g2": forbidden}}
 
-	ids, err := registerGuildCommands(r, testLogger(), "app", []string{"g1", "g2"}, testDefs())
+	ids, err := registerGuildCommands(r, testLogger(), "app", []string{"g1", "g2"}, testDefs(), nil)
 	if err == nil {
 		t.Fatal("expected an error when every guild fails")
 	}
@@ -104,7 +104,7 @@ func TestRegisterGuildCommands_AllFailReturnsError(t *testing.T) {
 
 func TestRegisterGuildCommands_NoGuildsIsNoError(t *testing.T) {
 	r := &fakeRegistrar{}
-	ids, err := registerGuildCommands(r, testLogger(), "app", nil, testDefs())
+	ids, err := registerGuildCommands(r, testLogger(), "app", nil, testDefs(), nil)
 	if err != nil {
 		t.Fatalf("no configured guilds should not error, got: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestRegisterGuildCommands_GlobalClearFailureAborts(t *testing.T) {
 	// If clearing global commands fails, that's a systemic problem (bad app
 	// ID/token) and should abort before touching any guild.
 	r := &fakeRegistrar{globalErr: errors.New("boom")}
-	ids, err := registerGuildCommands(r, testLogger(), "app", []string{"g1"}, testDefs())
+	ids, err := registerGuildCommands(r, testLogger(), "app", []string{"g1"}, testDefs(), nil)
 	if err == nil {
 		t.Fatal("expected an error when the global clear fails")
 	}

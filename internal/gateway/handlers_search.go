@@ -12,14 +12,15 @@ import (
 // consuming an AI quota. Results are snippets so the command stays useful in a
 // live session and does not dump private transcripts into a channel.
 func (g *Gateway) handleSearch(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	if i.GuildID == "" {
-		return g.reply(s, i, "Use `/search` inside a server with an active campaign.", true)
+	guildID, ok := g.resolveGuild(ctx, i)
+	if !ok {
+		return g.reply(s, i, dmGuildHelp, true)
 	}
 	query := strings.TrimSpace(optString(i.ApplicationCommandData().Options, "query"))
 	if query == "" {
 		return g.reply(s, i, "Give me a word or phrase to search for.", true)
 	}
-	campaign, err := g.activeCampaign(ctx, i.GuildID)
+	campaign, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
 		return g.reply(s, i, err.Error(), true)
 	}

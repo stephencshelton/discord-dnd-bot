@@ -44,7 +44,7 @@ func commandListEmbed() *discordgo.MessageEmbed {
 		Color:       helpColor,
 		Description: "Type `/help command:<name>` for a command's full options. Discord's slash-command picker also shows each option as you type.",
 	}
-	for _, c := range commandDefs() {
+	for _, c := range allCommandDefs() {
 		e.Fields = append(e.Fields, &discordgo.MessageEmbedField{
 			Name:   "/" + c.Name,
 			Value:  clampField(commandSummary(c)),
@@ -53,7 +53,7 @@ func commandListEmbed() *discordgo.MessageEmbed {
 	}
 	e.Fields = append(e.Fields, &discordgo.MessageEmbedField{
 		Name:  "Chat",
-		Value: "**@mention** me or **DM** me to chat about your campaign (DMs are opt-in per deployment).",
+		Value: "**@mention** me in a channel or **DM** me to chat about your campaign. If you're in more than one of my servers, use `/dm-server` to pick which one your DMs use.",
 	})
 	return e
 }
@@ -87,7 +87,7 @@ func commandSummary(c *discordgo.ApplicationCommand) string {
 // commandDetailEmbed builds the full breakdown for a single command.
 func commandDetailEmbed(name string) *discordgo.MessageEmbed {
 	var cmd *discordgo.ApplicationCommand
-	for _, c := range commandDefs() {
+	for _, c := range allCommandDefs() {
 		if c.Name == name {
 			cmd = c
 			break
@@ -212,7 +212,7 @@ func clampField(s string) string {
 
 // helpCommandNames returns the top-level command names, for /help autocomplete.
 func helpCommandNames() []string {
-	defs := commandDefs()
+	defs := allCommandDefs()
 	names := make([]string, 0, len(defs))
 	for _, c := range defs {
 		names = append(names, c.Name)

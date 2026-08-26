@@ -23,9 +23,9 @@ func (g *Gateway) activeCampaign(ctx context.Context, guildID string) (*db.Campa
 
 func (g *Gateway) handleCampaign(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	sub := i.ApplicationCommandData().Options[0]
-	guildID := i.GuildID
-	if guildID == "" {
-		return g.reply(s, i, "Campaigns must be managed inside a server.", true)
+	guildID, ok := g.resolveGuild(ctx, i)
+	if !ok {
+		return g.reply(s, i, dmGuildHelp, true)
 	}
 	if _, err := g.store.EnsureGuild(ctx, guildID); err != nil {
 		return err
@@ -113,9 +113,9 @@ func (g *Gateway) findCampaignByName(ctx context.Context, guildID, name string) 
 
 func (g *Gateway) handleCharacter(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	sub := i.ApplicationCommandData().Options[0]
-	guildID := i.GuildID
-	if guildID == "" {
-		return g.reply(s, i, "Characters must be managed inside a server.", true)
+	guildID, ok := g.resolveGuild(ctx, i)
+	if !ok {
+		return g.reply(s, i, dmGuildHelp, true)
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
@@ -176,9 +176,9 @@ func (g *Gateway) handleCharacter(ctx context.Context, s *discordgo.Session, i *
 
 func (g *Gateway) handleWorld(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	sub := i.ApplicationCommandData().Options[0]
-	guildID := i.GuildID
-	if guildID == "" {
-		return g.reply(s, i, "World entries must be managed inside a server.", true)
+	guildID, ok := g.resolveGuild(ctx, i)
+	if !ok {
+		return g.reply(s, i, dmGuildHelp, true)
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
