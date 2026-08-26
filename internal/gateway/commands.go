@@ -220,7 +220,9 @@ func commandDefs() []*discordgo.ApplicationCommand {
 		},
 
 		// ---- Help ----
-		{Name: "help", Description: "How to use the bot"},
+		{Name: "help", Description: "How to use the bot", Options: []*discordgo.ApplicationCommandOption{
+			{Type: discordgo.ApplicationCommandOptionString, Name: "command", Description: "Show detailed options for one command", Required: false, Autocomplete: true},
+		}},
 	}
 }
 

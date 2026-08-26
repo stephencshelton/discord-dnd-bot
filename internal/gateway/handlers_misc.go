@@ -104,35 +104,6 @@ func (g *Gateway) handleFeedback(ctx context.Context, s *discordgo.Session, i *d
 	return g.reply(s, i, "🙏 Thank you! Your feedback was recorded.", true)
 }
 
-// handleHelp prints usage guidance.
-func (g *Gateway) handleHelp(_ context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
-	e := &discordgo.MessageEmbed{
-		Title: "📖 DnD Bot — Help",
-		Color: 0x8b5cf6,
-		Description: strings.Join([]string{
-			"**Campaigns**: `/campaign create|list|activate|archive`",
-			"**Characters**: `/character add|list|remove`",
-			"**World**: `/world add|list` (NPCs, locations, factions, quests)",
-			"**Sessions**: `/session start|stop|status` — I join your voice channel, record, then post AI notes.",
-			"**Dice**: `/roll 2d6+3` (also `d20`, `4d6kh3`) — free & instant",
-			"**Memory**: `/search <text>` (keyword) and `/ask <question>` (AI answers from your session notes)",
-			"**AI**: `/lore <prompt>`, `/recap`, `/art <scene>`",
-			"**Reminders**: `/remind set|clear|show`",
-			"**Admin**: `/notes-channel #channel`, `/reindex` (rebuild `/ask` memory)",
-			"**Account**: `/feedback`",
-			"",
-			"You can also **@mention me** or **DM me** to chat about your campaign (DMs are opt-in per deployment).",
-		}, "\n"),
-	}
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Embeds: []*discordgo.MessageEmbed{e},
-			Flags:  discordgo.MessageFlagsEphemeral,
-		},
-	})
-}
-
 // routeAutocomplete provides suggestions for campaign/character name options.
 func (g *Gateway) routeAutocomplete(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -157,6 +128,16 @@ func (g *Gateway) routeAutocomplete(s *discordgo.Session, i *discordgo.Interacti
 				if len(choices) >= 25 {
 					break
 				}
+			}
+		}
+	case "help":
+		partial := strings.ToLower(optString(data.Options, "command"))
+		for _, name := range helpCommandNames() {
+			if partial == "" || strings.Contains(name, partial) {
+				choices = append(choices, &discordgo.ApplicationCommandOptionChoice{Name: name, Value: name})
+			}
+			if len(choices) >= 25 {
+				break
 			}
 		}
 	}
