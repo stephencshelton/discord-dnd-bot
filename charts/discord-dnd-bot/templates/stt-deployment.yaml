@@ -56,9 +56,16 @@ spec:
               drop:
                 - ALL
           env:
-            # Load the configured Whisper model on startup.
+            # Default model name for requests that don't specify one.
             - name: WHISPER__MODEL
               value: {{ .Values.stt.model | quote }}
+            # Preload (download) the model on startup. WHISPER__MODEL only sets
+            # the default *name*; it does NOT fetch weights. Without this the HF
+            # cache dir is never created and transcription fails with
+            # `CacheNotFound: /home/ubuntu/.cache/huggingface/hub`. PRELOAD_MODELS
+            # downloads each listed model at boot, creating the cache and weights.
+            - name: PRELOAD_MODELS
+              value: '["{{ .Values.stt.model }}"]'
             # Match the image's baked-in user home. uvicorn is installed in the
             # venv at /home/ubuntu/speaches/.venv/bin; set PATH explicitly so it
             # is always found regardless of how the runtime resolves the image env.
@@ -68,8 +75,12 @@ spec:
               value: /home/ubuntu/speaches/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             # Keep model weights + HF cache on the mounted (writable) volume so
             # readOnlyRootFilesystem is satisfied and restarts reuse the cache.
+            # Set both HF_HOME and HF_HUB_CACHE: huggingface_hub scans the
+            # `<HF_HUB_CACHE>` path directly, so it must point at the hub subdir.
             - name: HF_HOME
               value: /home/ubuntu/.cache/huggingface
+            - name: HF_HUB_CACHE
+              value: /home/ubuntu/.cache/huggingface/hub
             {{- with .Values.stt.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
