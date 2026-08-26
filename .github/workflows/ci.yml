@@ -28,7 +28,7 @@ jobs:
       - name: Install libopus
         run: sudo apt-get update && sudo apt-get install -y libopus-dev pkg-config
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@d583c34f0599d37dbac4a198b9c83201be380893 # v9.3.0
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           # v2.13.1 is built with Go 1.26; older releases (e.g. v2.5.0, built
           # with Go 1.25) refuse to lint a `go 1.26.0` module.
