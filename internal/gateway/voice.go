@@ -99,21 +99,39 @@ func (m *voiceManager) start(guildID, channelID, sessionID string) error {
 	conn.SetOpusFrameReceiver(r)
 
 	// Open the connection: self-mute (we never speak) but NOT self-deaf (we must
-	// hear). disgo negotiates the DAVE/E2EE handshake as part of Open.
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// hear). disgo negotiates the DAVE/E2EE handshake as part of Open, and only
+	// returns once the voice UDP + encryption (incl. DAVE) handshake completes.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	openStart := time.Now()
 	if err := conn.Open(ctx, cid, true /*selfMute*/, false /*selfDeaf*/); err != nil {
+		m.g.log.Error("voice conn open failed",
+			"guild", guildID, "channel", channelID, "session", sessionID,
+			"elapsed_ms", time.Since(openStart).Milliseconds(), "err", err)
 		// Tear down the half-open connection so it doesn't linger/retry.
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		conn.Close(closeCtx)
 		closeCancel()
 		return err
 	}
+	m.g.log.Info("voice conn opened",
+		"guild", guildID, "channel", channelID, "session", sessionID,
+		"elapsed_ms", time.Since(openStart).Milliseconds())
 
 	m.mu.Lock()
 	m.rec[guildID] = r
 	m.mu.Unlock()
+	m.g.log.Info("voice recording started",
+		"guild", guildID, "channel", channelID, "session", sessionID)
 	return nil
+}
+
+// has reports whether an in-memory recording exists for the guild.
+func (m *voiceManager) has(guildID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.rec[guildID]
+	return ok
 }
 
 // ReceiveOpusFrame is called by disgo for every received Opus frame with the
@@ -294,6 +312,8 @@ func (m *voiceManager) stop(ctx context.Context, guildID string) (string, time.D
 	}
 	m.mu.Unlock()
 	if !ok {
+		m.g.log.Warn("stop called but no in-memory recording for guild",
+			"guild", guildID)
 		return "", 0, fmt.Errorf("no recording for guild %s", guildID)
 	}
 

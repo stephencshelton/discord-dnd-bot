@@ -66,6 +66,9 @@ func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, 
 	g.voice = newVoiceManager(g)
 
 	client, err := disgo.New(cfg.Discord.Token,
+		// Surface disgo's internal logs (incl. voice gateway / UDP / DAVE
+		// handshake) through our structured logger for diagnosability.
+		bot.WithLogger(log),
 		// Guild + voice-state intents for recording; message content for mention/DM.
 		bot.WithGatewayConfigOpts(gateway.WithIntents(
 			gateway.IntentGuilds,

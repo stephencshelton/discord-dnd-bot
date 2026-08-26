@@ -30,15 +30,27 @@ func (g *Gateway) handleSession(ctx context.Context, ic *ictx) error {
 	case "status":
 		return g.sessionStatus(ctx, ic, guildID)
 	}
-	return fmt.Errorf("unknown session subcommand")
+	return fmt.Errorf("unknown session subcommand %q", ic.subcommand())
 }
 
 func (g *Gateway) sessionStart(ctx context.Context, ic *ictx, guildID string) error {
+	log := logging.FromContext(ctx, g.log)
 	// Reject if already recording. A non-not-found error means the DB is
 	// unreachable — surface it rather than silently starting a second session.
-	switch _, err := g.store.GetActiveSession(ctx, guildID); {
+	switch existing, err := g.store.GetActiveSession(ctx, guildID); {
 	case err == nil:
-		return ic.reply("A session is already recording. Use `/session stop` first.", true)
+		// The DB says a session is recording. If this pod actually holds the
+		// in-memory recording, it's a genuine duplicate. Otherwise the row is
+		// stale (pod restart, or a prior start whose voice handshake half-
+		// failed) — clear it so the user isn't wedged, then start fresh.
+		if g.voice.has(guildID) {
+			return ic.reply("A session is already recording. Use `/session stop` first.", true)
+		}
+		log.Warn("clearing stale recording session with no in-memory recording",
+			"guild", guildID, "session", existing.ID)
+		if serr := g.store.SetSessionResult(ctx, existing.ID, "", "", "failed"); serr != nil {
+			return serr
+		}
 	case !errors.Is(err, db.ErrNotFound):
 		return err
 	}
@@ -75,6 +87,7 @@ func (g *Gateway) sessionStart(ctx context.Context, ic *ictx, guildID string) er
 }
 
 func (g *Gateway) sessionStop(ctx context.Context, ic *ictx, guildID string) error {
+	log := logging.FromContext(ctx, g.log)
 	sess, err := g.store.GetActiveSession(ctx, guildID)
 	if errors.Is(err, db.ErrNotFound) {
 		return ic.reply("No active session to stop.", true)
@@ -82,6 +95,22 @@ func (g *Gateway) sessionStop(ctx context.Context, ic *ictx, guildID string) err
 	if err != nil {
 		return err
 	}
+
+	// If the DB says a session is recording but this pod holds no in-memory
+	// recording, the audio can't be finalized (pod restart, or a start whose
+	// voice handshake never completed). Mark it failed and tell the user
+	// clearly instead of erroring with a cryptic "no recording".
+	if !g.voice.has(guildID) {
+		log.Warn("stop with no in-memory recording; marking session failed",
+			"guild", guildID, "session", sess.ID)
+		_ = g.store.SetSessionResult(ctx, sess.ID, "", "", "failed")
+		return ic.reply(
+			"⚠️ I couldn't finalize that recording — I lost the live audio connection "+
+				"(the bot may have restarted or never fully joined). The session has been "+
+				"cleared; please run `/session start` again.",
+			true)
+	}
+
 	if err := ic.ack(false); err != nil {
 		return err
 	}
