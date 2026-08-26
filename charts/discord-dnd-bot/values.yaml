@@ -317,7 +317,7 @@ gateway:
 # -------------------------------------------------------------------------
 worker:
   enabled: true
-  replicaCount: 2
+  replicaCount: 1
   # Seconds Kubernetes waits for in-flight jobs to drain on shutdown. Should be
   # at least as long as the slowest single job (a transcription chunk).
   terminationGracePeriodSeconds: 120
@@ -333,8 +333,8 @@ worker:
       memory: 1Gi
   autoscaling:
     enabled: true
-    minReplicas: 2
-    maxReplicas: 10
+    minReplicas: 1
+    maxReplicas: 5
     targetCPUUtilizationPercentage: 70
   nodeSelector: {}
   tolerations: []
