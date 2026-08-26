@@ -69,6 +69,7 @@ type Session struct {
 	VoiceChannelID  string
 	Status          string
 	AudioKey        string
+	ChunkPrefix     string
 	Transcript      string
 	Notes           string
 	DurationSeconds int

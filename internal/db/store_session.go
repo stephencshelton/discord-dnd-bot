@@ -11,37 +11,107 @@ import (
 
 // --- Sessions ---
 
-// CreateSession starts a recording session row.
+// CreateSession starts a recording session row. chunkPrefix is the
+// object-storage prefix under which the live recorder checkpoints raw PCM.
 func (s *Store) CreateSession(ctx context.Context, campaignID uuid.UUID, guildID, voiceChannelID string) (*Session, error) {
 	var sess Session
 	err := s.db.Pool.QueryRow(ctx,
 		`INSERT INTO sessions (campaign_id, guild_id, voice_channel_id, status)
 		 VALUES ($1,$2,$3,'recording')
-		 RETURNING id, campaign_id, guild_id, COALESCE(voice_channel_id,''), status, started_at`,
+		 RETURNING id, campaign_id, guild_id, COALESCE(voice_channel_id,''), status,
+		           COALESCE(chunk_prefix,''), started_at`,
 		campaignID, guildID, voiceChannelID).
-		Scan(&sess.ID, &sess.CampaignID, &sess.GuildID, &sess.VoiceChannelID, &sess.Status, &sess.StartedAt)
+		Scan(&sess.ID, &sess.CampaignID, &sess.GuildID, &sess.VoiceChannelID, &sess.Status,
+			&sess.ChunkPrefix, &sess.StartedAt)
 	return &sess, err
+}
+
+// SetSessionChunkPrefix records where the live recorder checkpoints PCM chunks.
+func (s *Store) SetSessionChunkPrefix(ctx context.Context, id uuid.UUID, prefix string) error {
+	_, err := s.db.Pool.Exec(ctx,
+		`UPDATE sessions SET chunk_prefix=$2 WHERE id=$1`, id, prefix)
+	return err
+}
+
+// TouchSessionHeartbeat marks a recording session as still alive. The reaper
+// finalizes 'recording' sessions whose heartbeat has gone stale.
+func (s *Store) TouchSessionHeartbeat(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.Pool.Exec(ctx,
+		`UPDATE sessions SET heartbeat_at=now() WHERE id=$1 AND status='recording'`, id)
+	return err
+}
+
+// ListRecordingSessions returns all sessions currently in 'recording' status,
+// used on startup to resume (or finalize) sessions the previous pod owned.
+func (s *Store) ListRecordingSessions(ctx context.Context) ([]Session, error) {
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT id, campaign_id, guild_id, COALESCE(voice_channel_id,''), status,
+		        COALESCE(chunk_prefix,''), started_at
+		 FROM sessions WHERE status='recording' ORDER BY started_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Session
+	for rows.Next() {
+		var sess Session
+		if err := rows.Scan(&sess.ID, &sess.CampaignID, &sess.GuildID, &sess.VoiceChannelID,
+			&sess.Status, &sess.ChunkPrefix, &sess.StartedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, sess)
+	}
+	return out, rows.Err()
+}
+
+// StaleRecordingSessions returns 'recording' sessions whose heartbeat is older
+// than the cutoff — their owning pod died and nothing resumed them.
+func (s *Store) StaleRecordingSessions(ctx context.Context, olderThan time.Duration) ([]Session, error) {
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT id, campaign_id, guild_id, COALESCE(voice_channel_id,''), status,
+		        COALESCE(chunk_prefix,''), started_at
+		 FROM sessions
+		 WHERE status='recording' AND heartbeat_at < now() - make_interval(secs => $1)
+		 ORDER BY started_at`, olderThan.Seconds())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Session
+	for rows.Next() {
+		var sess Session
+		if err := rows.Scan(&sess.ID, &sess.CampaignID, &sess.GuildID, &sess.VoiceChannelID,
+			&sess.Status, &sess.ChunkPrefix, &sess.StartedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, sess)
+	}
+	return out, rows.Err()
 }
 
 // GetActiveSession returns the currently-recording session for a guild.
 func (s *Store) GetActiveSession(ctx context.Context, guildID string) (*Session, error) {
 	var sess Session
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT id, campaign_id, guild_id, COALESCE(voice_channel_id,''), status, started_at
+		`SELECT id, campaign_id, guild_id, COALESCE(voice_channel_id,''), status,
+		        COALESCE(chunk_prefix,''), started_at
 		 FROM sessions WHERE guild_id=$1 AND status='recording'
 		 ORDER BY started_at DESC LIMIT 1`, guildID).
-		Scan(&sess.ID, &sess.CampaignID, &sess.GuildID, &sess.VoiceChannelID, &sess.Status, &sess.StartedAt)
+		Scan(&sess.ID, &sess.CampaignID, &sess.GuildID, &sess.VoiceChannelID, &sess.Status,
+			&sess.ChunkPrefix, &sess.StartedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	return &sess, err
 }
 
-// EndSession marks a session as processing and records duration + audio key.
-func (s *Store) EndSession(ctx context.Context, id uuid.UUID, audioKey string, durationSeconds int) error {
+// EndSession marks a session as processing and records its duration. The audio
+// itself lives as PCM chunks under the session's chunk_prefix (set at start),
+// which the transcribe worker reassembles.
+func (s *Store) EndSession(ctx context.Context, id uuid.UUID, durationSeconds int) error {
 	_, err := s.db.Pool.Exec(ctx,
-		`UPDATE sessions SET status='processing', audio_key=$2, duration_seconds=$3, ended_at=now() WHERE id=$1`,
-		id, audioKey, durationSeconds)
+		`UPDATE sessions SET status='processing', duration_seconds=$2, ended_at=now() WHERE id=$1`,
+		id, durationSeconds)
 	return err
 }
 
@@ -58,11 +128,11 @@ func (s *Store) GetSession(ctx context.Context, id uuid.UUID) (*Session, error) 
 	var sess Session
 	err := s.db.Pool.QueryRow(ctx,
 		`SELECT id, campaign_id, guild_id, COALESCE(voice_channel_id,''), status,
-		        COALESCE(audio_key,''), COALESCE(transcript,''), COALESCE(notes,''),
+		        COALESCE(audio_key,''), COALESCE(chunk_prefix,''), COALESCE(transcript,''), COALESCE(notes,''),
 		        duration_seconds, started_at, ended_at
 		 FROM sessions WHERE id=$1`, id).
 		Scan(&sess.ID, &sess.CampaignID, &sess.GuildID, &sess.VoiceChannelID, &sess.Status,
-			&sess.AudioKey, &sess.Transcript, &sess.Notes, &sess.DurationSeconds, &sess.StartedAt, &sess.EndedAt)
+			&sess.AudioKey, &sess.ChunkPrefix, &sess.Transcript, &sess.Notes, &sess.DurationSeconds, &sess.StartedAt, &sess.EndedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

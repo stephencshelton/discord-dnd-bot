@@ -68,10 +68,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     voice_channel_id TEXT,
     status      TEXT NOT NULL DEFAULT 'recording', -- recording|processing|complete|failed
     audio_key   TEXT,                        -- object-storage key of raw mix
+    -- chunk_prefix is the object-storage prefix under which the live recorder
+    -- periodically checkpoints raw PCM chunks (chunk-000001.pcm, ...). It lets a
+    -- crashed/restarted session be reassembled from S3 so a pod death only loses
+    -- roughly the downtime window rather than the whole recording.
+    chunk_prefix TEXT,
     transcript  TEXT,
     notes       TEXT,                        -- final AI-generated writeup
     duration_seconds INT NOT NULL DEFAULT 0,
     started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- heartbeat_at is bumped by the live recorder on each checkpoint; a reaper
+    -- finalizes 'recording' sessions whose heartbeat has gone stale (the owning
+    -- pod died and nothing resumed them).
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     ended_at    TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_campaign ON sessions(campaign_id);

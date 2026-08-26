@@ -83,3 +83,31 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+// List returns the keys of all objects under prefix, sorted lexicographically
+// (S3 returns them sorted; checkpoint chunk keys are zero-padded so lexical
+// order == chronological order). It pages through the full result set.
+func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	var token *string
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list objects %s: %w", prefix, err)
+		}
+		for _, obj := range out.Contents {
+			if obj.Key != nil {
+				keys = append(keys, *obj.Key)
+			}
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	return keys, nil
+}

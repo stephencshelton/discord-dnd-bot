@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"runtime/debug"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/audio"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
+	"github.com/stephencshelton/discord-dnd-bot/internal/queue"
 )
 
 // voiceManager owns active voice recordings, one per guild. Opus packets are
@@ -37,11 +39,20 @@ type recording struct {
 	conn      voice.Conn
 	sessionID string
 	guildID   string
+	channelID string
 	started   time.Time
 
 	// g lets capture goroutines persist participants as speakers are identified;
 	// read-only from the recording's perspective.
 	g *Gateway
+
+	// chunkPrefix is the object-storage prefix for this session's PCM checkpoints
+	// (chunkPrefix/chunk-000001.pcm, ...). chunkSeq is the next chunk number.
+	chunkPrefix string
+	chunkSeq    int
+	// stop signals the checkpoint loop to exit; done is closed when it has.
+	stopCh chan struct{}
+	doneCh chan struct{}
 
 	mu       sync.Mutex
 	decoders map[uint32]*gopus.Decoder // per-SSRC Opus decoder
@@ -52,6 +63,9 @@ type recording struct {
 	// stay aligned and silence gaps leave empty slots instead of collapsing,
 	// which previously caused drift on long sessions.
 	frames [][]int16
+	// flushed is the number of leading frames already checkpointed to storage;
+	// each checkpoint uploads frames[flushed:] and advances flushed.
+	flushed int
 	// anchor maps each SSRC to its first packet's alignment: baseTS is that
 	// packet's RTP timestamp, baseFrame the timeline index (from wall-clock
 	// arrival). Later slots = baseFrame + (pkt.Timestamp-baseTS)/FrameSize.
@@ -64,8 +78,21 @@ type streamAnchor struct {
 	baseFrame int    // timeline frame index that first packet was placed at
 }
 
-// start joins the voice channel and begins capturing.
+// checkpointInterval is how often the live recorder flushes newly-mixed PCM to
+// object storage, so a pod crash loses at most this much unsaved tail (plus the
+// downtime window itself). Chosen to balance data-loss window vs. S3 PUT churn.
+const checkpointInterval = 30 * time.Second
+
+// start joins the voice channel and begins capturing a NEW session. chunkSeq
+// begins at 1. sessionID's chunk prefix is recorded so a crash can be recovered.
 func (m *voiceManager) start(guildID, channelID, sessionID string) error {
+	return m.join(guildID, channelID, sessionID, 0)
+}
+
+// join is the shared connect+record path for both a fresh start and a resume.
+// startSeq is the chunk number already present in storage (0 for a new session);
+// new checkpoints continue after it so a resumed session's audio is contiguous.
+func (m *voiceManager) join(guildID, channelID, sessionID string, startSeq int) error {
 	m.mu.Lock()
 	if _, ok := m.rec[guildID]; ok {
 		m.mu.Unlock()
@@ -85,14 +112,19 @@ func (m *voiceManager) start(guildID, channelID, sessionID string) error {
 	conn := m.g.client.VoiceManager.CreateConn(gid)
 
 	r := &recording{
-		conn:      conn,
-		sessionID: sessionID,
-		guildID:   guildID,
-		started:   time.Now(),
-		g:         m.g,
-		decoders:  make(map[uint32]*gopus.Decoder),
-		seen:      make(map[string]bool),
-		anchor:    make(map[uint32]streamAnchor),
+		conn:        conn,
+		sessionID:   sessionID,
+		guildID:     guildID,
+		channelID:   channelID,
+		started:     time.Now(),
+		g:           m.g,
+		chunkPrefix: chunkPrefixFor(guildID, sessionID),
+		chunkSeq:    startSeq + 1,
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		decoders:    make(map[uint32]*gopus.Decoder),
+		seen:        make(map[string]bool),
+		anchor:      make(map[uint32]streamAnchor),
 	}
 
 	// Open the connection: self-mute (we never speak) but NOT self-deaf (we must
@@ -121,11 +153,20 @@ func (m *voiceManager) start(guildID, channelID, sessionID string) error {
 	// (SIGSEGV in disgo's udpConnImpl.ReadPacket). By now the socket is ready.
 	conn.SetOpusFrameReceiver(r)
 
+	// Record where checkpoints live so a crashed session can be reassembled.
+	if err := m.g.store.SetSessionChunkPrefix(context.Background(), mustSessionUUID(sessionID), r.chunkPrefix); err != nil {
+		m.g.log.Warn("record chunk prefix", "session", sessionID, "err", err)
+	}
+
+	// Periodically flush accumulated PCM to storage for crash recovery.
+	go r.checkpointLoop()
+
 	m.mu.Lock()
 	m.rec[guildID] = r
 	m.mu.Unlock()
 	m.g.log.Info("voice recording started",
-		"guild", guildID, "channel", channelID, "session", sessionID)
+		"guild", guildID, "channel", channelID, "session", sessionID,
+		"start_seq", startSeq)
 	return nil
 }
 
@@ -135,6 +176,113 @@ func (m *voiceManager) has(guildID string) bool {
 	defer m.mu.Unlock()
 	_, ok := m.rec[guildID]
 	return ok
+}
+
+// chunkPrefixFor returns the object-storage prefix for a session's PCM chunks.
+func chunkPrefixFor(guildID, sessionID string) string {
+	return fmt.Sprintf("sessions/%s/%s/chunks", guildID, sessionID)
+}
+
+// chunkKey returns the storage key for chunk number seq (zero-padded so lexical
+// order matches chronological order when the worker lists and stitches them).
+func chunkKey(prefix string, seq int) string {
+	return fmt.Sprintf("%s/chunk-%06d.pcm", prefix, seq)
+}
+
+// mustSessionUUID parses a session ID string, returning the zero UUID on error
+// (callers only use it for best-effort DB writes that tolerate a bad ID).
+func mustSessionUUID(s string) uuid.UUID {
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return uuid.UUID{}
+	}
+	return id
+}
+
+// checkpointLoop periodically flushes newly-mixed PCM to object storage until
+// the recording stops, so a pod crash loses at most one interval of unsaved
+// tail plus the downtime window. It also heartbeats the DB row so the reaper
+// can tell a live session from an abandoned one.
+func (r *recording) checkpointLoop() {
+	defer close(r.doneCh)
+	defer func() {
+		if rec := recover(); rec != nil {
+			metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
+			r.g.log.Error("checkpoint loop panicked; recovered",
+				"panic", fmt.Sprintf("%v", rec), "stack", string(debug.Stack()),
+				"guild", r.guildID, "session", r.sessionID)
+		}
+	}()
+	ticker := time.NewTicker(checkpointInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-ticker.C:
+			if err := r.checkpoint(); err != nil {
+				r.g.log.Warn("checkpoint failed", "guild", r.guildID, "session", r.sessionID, "err", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if err := r.g.store.TouchSessionHeartbeat(ctx, mustSessionUUID(r.sessionID)); err != nil {
+				r.g.log.Warn("heartbeat failed", "session", r.sessionID, "err", err)
+			}
+			cancel()
+		}
+	}
+}
+
+// checkpoint uploads the frames accumulated since the last checkpoint as one
+// raw-PCM chunk and advances the flushed watermark. A no-op when nothing new.
+//
+// It holds back the most recent frames (holdbackFrames) from each periodic
+// flush so that late-arriving concurrent-speaker packets still land in the
+// in-memory slot before it's frozen into a chunk. The final flush at stop time
+// passes final=true to drain everything.
+func (r *recording) checkpoint() error { return r.checkpointUpTo(holdbackFrames) }
+
+// holdbackFrames is ~1s of 20ms frames kept un-flushed on periodic checkpoints
+// so concurrent-speaker mixing settles before a slot is frozen.
+const holdbackFrames = 50
+
+func (r *recording) checkpointUpTo(holdback int) error {
+	r.mu.Lock()
+	upTo := len(r.frames) - holdback
+	if upTo <= r.flushed {
+		r.mu.Unlock()
+		return nil
+	}
+	// Copy the settled new frames out under the lock, then release it before the
+	// upload.
+	newFrames := r.frames[r.flushed:upTo]
+	pcm := make([]int16, 0, len(newFrames)*audio.FrameSize*audio.Channels)
+	for _, f := range newFrames {
+		pcm = append(pcm, f...)
+	}
+	seq := r.chunkSeq
+	prefix := r.chunkPrefix
+	newFlushed := upTo
+	r.mu.Unlock()
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, pcm); err != nil {
+		return fmt.Errorf("encode chunk: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := r.g.storage.Put(ctx, chunkKey(prefix, seq), "application/octet-stream", buf); err != nil {
+		return fmt.Errorf("upload chunk %d: %w", seq, err)
+	}
+
+	// Only advance the watermarks after a successful upload so a failed PUT is
+	// retried (with the same frames) on the next tick.
+	r.mu.Lock()
+	r.flushed = newFlushed
+	r.chunkSeq++
+	r.mu.Unlock()
+	r.g.log.Info("checkpointed recording chunk",
+		"guild", r.guildID, "session", r.sessionID, "seq", seq, "frames", len(newFrames))
+	return nil
 }
 
 // ReceiveOpusFrame is called by disgo for every received Opus frame with the
@@ -305,8 +453,9 @@ func clip16(v int32) int16 {
 	return int16(v)
 }
 
-// stop leaves the channel, encodes the mixed PCM to WAV, uploads it to object
-// storage, and returns the object key plus recorded duration.
+// stop leaves the channel, flushes any un-checkpointed tail PCM as a final
+// chunk, and returns the session's chunk prefix (which the worker reassembles
+// into a single WAV) plus the recorded duration.
 func (m *voiceManager) stop(ctx context.Context, guildID string) (string, time.Duration, error) {
 	m.mu.Lock()
 	r, ok := m.rec[guildID]
@@ -321,41 +470,37 @@ func (m *voiceManager) stop(ctx context.Context, guildID string) (string, time.D
 	}
 
 	duration := time.Since(r.started)
+
+	// Stop the checkpoint loop and wait for it to exit so it can't race with our
+	// final flush.
+	close(r.stopCh)
+	select {
+	case <-r.doneCh:
+	case <-time.After(5 * time.Second):
+	}
+
 	// Close the connection; disgo stops the receiver (Close/CleanupUser) and
 	// tears down the DAVE session and UDP socket.
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	r.conn.Close(closeCtx)
 	closeCancel()
 
-	// Flatten frames into one interleaved PCM slice, in timeline order.
-	r.mu.Lock()
-	pcm := make([]int16, 0, len(r.frames)*audio.FrameSize*audio.Channels)
-	for _, f := range r.frames {
-		pcm = append(pcm, f...)
+	// Flush the final tail (all remaining frames, including the held-back ones)
+	// so the stored chunks cover the whole recording.
+	if err := r.checkpointUpTo(0); err != nil {
+		// Non-fatal: earlier chunks are still usable; log and continue.
+		m.g.log.Warn("final checkpoint flush failed",
+			"guild", guildID, "session", r.sessionID, "err", err)
 	}
-	r.mu.Unlock()
-
-	// Optionally drop near-silent frames to cut billed transcription minutes.
-	if m.g.cfg.Audio.SilenceTrim {
-		pcm = audio.TrimSilence(pcm, audio.FrameSize*audio.Channels, m.g.cfg.Audio.SilenceRMSThreshold)
-	}
-
-	var buf bytes.Buffer
-	if err := audio.WriteWAV(&buf, pcm, audio.SampleRate, audio.Channels); err != nil {
-		return "", duration, err
-	}
-	key := fmt.Sprintf("sessions/%s/%s.wav", guildID, r.sessionID)
-	if _, err := m.g.storage.Put(ctx, key, "audio/wav", &buf); err != nil {
-		return "", duration, err
-	}
-	return key, duration, nil
+	_ = ctx // reassembly happens in the worker; nothing else to upload here.
+	return r.chunkPrefix, duration, nil
 }
 
-// stopAll disconnects every active recording on shutdown, waits briefly for
-// capture to exit, and marks in-flight sessions failed so the DB row isn't
-// stuck 'recording' (which blocks the one-active-session unique index).
-// Captured audio is not uploaded — a dropped recording is preferable to a
-// stuck session.
+// stopAll is called on shutdown (e.g. SIGTERM during a rollout). It stops the
+// checkpoint loops and flushes each recording's tail so the audio captured so
+// far is durably in storage, then closes the voice connections. Sessions are
+// LEFT in 'recording' status (heartbeat frozen) so the next pod can resume them
+// on startup; if none does, the reaper finalizes them from their chunks.
 func (m *voiceManager) stopAll() {
 	m.mu.Lock()
 	recs := make([]*recording, 0, len(m.rec))
@@ -366,15 +511,143 @@ func (m *voiceManager) stopAll() {
 	m.mu.Unlock()
 
 	for _, r := range recs {
+		close(r.stopCh)
+		select {
+		case <-r.doneCh:
+		case <-time.After(3 * time.Second):
+		}
+		if err := r.checkpointUpTo(0); err != nil {
+			m.g.log.Warn("flush recording on shutdown", "session", r.sessionID, "err", err)
+		}
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		r.conn.Close(closeCtx)
 		closeCancel()
-		if sid, err := uuid.Parse(r.sessionID); err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			if err := m.g.store.SetSessionResult(ctx, sid, "", "", "failed"); err != nil {
-				m.g.log.Warn("mark session failed on shutdown", "session", r.sessionID, "err", err)
-			}
-			cancel()
+		m.g.log.Info("recording checkpointed for resume on shutdown",
+			"guild", r.guildID, "session", r.sessionID)
+	}
+}
+
+// resumeActive is called on startup. For every session still in 'recording'
+// status (owned by a pod that died or was rolled), it rejoins the voice channel
+// and continues recording into new chunks after the ones already in storage, so
+// only the downtime window is lost. If rejoining isn't possible, the session is
+// left for the reaper to finalize from its existing chunks.
+func (m *voiceManager) resumeActive(ctx context.Context) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
+			m.g.log.Error("resumeActive panicked; recovered",
+				"panic", fmt.Sprintf("%v", rec), "stack", string(debug.Stack()))
+		}
+	}()
+	sessions, err := m.g.store.ListRecordingSessions(ctx)
+	if err != nil {
+		m.g.log.Error("list recording sessions for resume", "err", err)
+		return
+	}
+	for _, sess := range sessions {
+		if sess.VoiceChannelID == "" {
+			m.g.log.Warn("cannot resume session with no voice channel; leaving for reaper",
+				"session", sess.ID, "guild", sess.GuildID)
+			continue
+		}
+		// Continue chunk numbering after whatever is already in storage.
+		prefix := sess.ChunkPrefix
+		if prefix == "" {
+			prefix = chunkPrefixFor(sess.GuildID, sess.ID.String())
+		}
+		lastSeq := 0
+		if keys, lerr := m.g.storage.List(ctx, prefix); lerr == nil {
+			lastSeq = len(keys)
+		}
+		if err := m.join(sess.GuildID, sess.VoiceChannelID, sess.ID.String(), lastSeq); err != nil {
+			m.g.log.Warn("failed to resume recording; leaving for reaper",
+				"session", sess.ID, "guild", sess.GuildID, "channel", sess.VoiceChannelID, "err", err)
+			continue
+		}
+		m.g.log.Info("resumed recording after restart",
+			"session", sess.ID, "guild", sess.GuildID, "channel", sess.VoiceChannelID, "resumed_after_seq", lastSeq)
+	}
+}
+
+// reapStale finalizes 'recording' sessions whose heartbeat has gone stale and
+// which are not live on this pod. These are sessions whose owning pod died and
+// which nothing resumed (e.g. the users left the voice channel, so resume
+// couldn't rejoin). If any PCM chunks were checkpointed, it hands the session to
+// the transcribe worker to reassemble what was captured before the crash;
+// otherwise it marks the session failed so the guild isn't wedged.
+func (m *voiceManager) reapStale(ctx context.Context, staleAfter time.Duration) {
+	sessions, err := m.g.store.StaleRecordingSessions(ctx, staleAfter)
+	if err != nil {
+		m.g.log.Error("query stale sessions", "err", err)
+		return
+	}
+	for _, sess := range sessions {
+		// Skip anything we're actively recording (heartbeat should keep these
+		// fresh, but guard against clock skew).
+		if m.has(sess.GuildID) {
+			continue
+		}
+		prefix := sess.ChunkPrefix
+		if prefix == "" {
+			prefix = chunkPrefixFor(sess.GuildID, sess.ID.String())
+		}
+		keys, lerr := m.g.storage.List(ctx, prefix)
+		if lerr != nil {
+			m.g.log.Warn("reaper: list chunks failed", "session", sess.ID, "err", lerr)
+			continue
+		}
+		if len(keys) == 0 {
+			// Nothing was captured; clear the wedged 'recording' row.
+			m.g.log.Warn("reaper: stale session with no chunks; marking failed",
+				"session", sess.ID, "guild", sess.GuildID)
+			_ = m.g.store.SetSessionResult(ctx, sess.ID, "", "", "failed")
+			continue
+		}
+		// Move to processing and enqueue transcription of the recovered chunks.
+		if err := m.g.store.EndSession(ctx, sess.ID, 0); err != nil {
+			m.g.log.Warn("reaper: end session", "session", sess.ID, "err", err)
+			continue
+		}
+		if err := m.g.queue.Enqueue(ctx, queue.JobTranscribeSession, queue.TranscribeSessionPayload{
+			SessionID: sess.ID.String(),
+			GuildID:   sess.GuildID,
+		}); err != nil {
+			m.g.log.Warn("reaper: enqueue transcribe", "session", sess.ID, "err", err)
+			continue
+		}
+		metrics.JobsEnqueued.WithLabelValues(string(queue.JobTranscribeSession)).Inc()
+		m.g.log.Info("reaper: recovered crashed session from checkpoints",
+			"session", sess.ID, "guild", sess.GuildID, "chunks", len(keys))
+	}
+}
+
+// RunSessionReaper periodically finalizes abandoned 'recording' sessions (owning
+// pod died and nothing resumed them). Runs in the gateway process alongside the
+// reminder loop. staleAfter should comfortably exceed the checkpoint interval so
+// a briefly-restarting pod that resumes isn't reaped out from under itself.
+func (g *Gateway) RunSessionReaper(ctx context.Context, interval, staleAfter time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	g.log.Info("session reaper started", "interval", interval.String(), "staleAfter", staleAfter.String())
+	for {
+		select {
+		case <-ctx.Done():
+			g.log.Info("session reaper stopped")
+			return
+		case <-ticker.C:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						metrics.PanicsRecovered.WithLabelValues("goroutine").Inc()
+						g.log.Error("session reaper tick panicked; recovered",
+							"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
+					}
+				}()
+				rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				g.voice.reapStale(rctx, staleAfter)
+			}()
 		}
 	}
 }

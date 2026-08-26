@@ -115,14 +115,15 @@ func (g *Gateway) sessionStop(ctx context.Context, ic *ictx, guildID string) err
 		return err
 	}
 
-	// Stop capture, flush the recording, and upload it.
-	audioKey, duration, err := g.voice.stop(ctx, guildID)
+	// Stop capture and flush the final tail chunk. The audio is stored as PCM
+	// chunks under the session's chunk_prefix; the worker reassembles them.
+	_, duration, err := g.voice.stop(ctx, guildID)
 	if err != nil {
 		_ = g.store.SetSessionResult(ctx, sess.ID, "", "", "failed")
 		return fmt.Errorf("finalize recording: %w", err)
 	}
 
-	if err := g.store.EndSession(ctx, sess.ID, audioKey, int(duration.Seconds())); err != nil {
+	if err := g.store.EndSession(ctx, sess.ID, int(duration.Seconds())); err != nil {
 		return err
 	}
 

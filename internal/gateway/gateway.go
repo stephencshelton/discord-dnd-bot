@@ -134,6 +134,16 @@ func (g *Gateway) Open(ctx context.Context) error {
 	if err := g.registerCommands(); err != nil {
 		return fmt.Errorf("register commands: %w", err)
 	}
+	// Resume any sessions the previous pod was recording (crash/rollout). This
+	// runs after the gateway is open so the guild/voice-state caches can populate
+	// and the voice channel can be rejoined. Best-effort; it logs and moves on.
+	go func() {
+		// Give the guild caches a moment to hydrate before rejoining voice.
+		time.Sleep(3 * time.Second)
+		rctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		g.voice.resumeActive(rctx)
+	}()
 	return nil
 }
 

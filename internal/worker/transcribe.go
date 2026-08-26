@@ -3,12 +3,15 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 
 	"github.com/disgoorg/disgo/discord"
 	"github.com/google/uuid"
 
+	"github.com/stephencshelton/discord-dnd-bot/internal/audio"
+	"github.com/stephencshelton/discord-dnd-bot/internal/db"
 	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 	"github.com/stephencshelton/discord-dnd-bot/internal/prompts"
@@ -32,16 +35,19 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 	if err != nil {
 		return fmt.Errorf("load session: %w", err)
 	}
-	if sess.AudioKey == "" {
-		w.markFailed(ctx, sessionID, p.GuildID, "No audio was captured for that session.")
-		return fmt.Errorf("session %s has no audio key", sessionID)
-	}
 
-	// 1) Download the recording from object storage.
-	audioBytes, err := w.storage.Get(ctx, sess.AudioKey)
+	// Reassemble the recording from the PCM checkpoint chunks the gateway wrote
+	// (sessions/<guild>/<session>/chunks/chunk-NNNNNN.pcm). Concatenating the
+	// chunks in order reconstructs the whole recording; a mid-session pod crash
+	// only drops the downtime window, not the earlier audio.
+	audioBytes, err := w.reassembleSessionAudio(ctx, sess)
 	if err != nil {
 		w.markFailed(ctx, sessionID, p.GuildID, "I couldn't read the recording from storage.")
-		return fmt.Errorf("download audio: %w", err)
+		return fmt.Errorf("reassemble audio: %w", err)
+	}
+	if len(audioBytes) == 0 {
+		w.markFailed(ctx, sessionID, p.GuildID, "No audio was captured for that session.")
+		return fmt.Errorf("session %s has no audio", sessionID)
 	}
 
 	// 2) Transcribe via LiteLLM (provider-agnostic).
@@ -104,6 +110,60 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 	channelID := w.notesChannel(ctx, p.GuildID, sess.VoiceChannelID)
 	w.postNotes(channelID, campName, notes)
 	return nil
+}
+
+// reassembleSessionAudio downloads the session's PCM checkpoint chunks in order,
+// concatenates them into one interleaved 48kHz stereo stream, optionally trims
+// silence, and wraps the result in a WAV container ready for transcription.
+// Concatenating the chunks reconstructs the full recording; if a pod crashed
+// mid-session, only the chunks that made it to storage (everything up to the
+// crash, minus at most one un-flushed interval) are present — the downtime gap
+// is simply absent.
+func (w *Worker) reassembleSessionAudio(ctx context.Context, sess *db.Session) ([]byte, error) {
+	prefix := sess.ChunkPrefix
+	if prefix == "" {
+		prefix = fmt.Sprintf("sessions/%s/%s/chunks", sess.GuildID, sess.ID)
+	}
+	keys, err := w.storage.List(ctx, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("list chunks: %w", err)
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	// Keys are zero-padded, so lexical order (as returned by List) is
+	// chronological. Download and concatenate the raw little-endian int16 PCM.
+	var pcm []int16
+	for _, key := range keys {
+		raw, gerr := w.storage.Get(ctx, key)
+		if gerr != nil {
+			// A missing/corrupt chunk shouldn't sink the whole recording; log and
+			// skip it (leaves a small gap) rather than fail the session.
+			w.log.Warn("skip unreadable chunk", "session", sess.ID, "key", key, "err", gerr)
+			continue
+		}
+		samples := make([]int16, len(raw)/2)
+		if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &samples); err != nil {
+			w.log.Warn("skip undecodable chunk", "session", sess.ID, "key", key, "err", err)
+			continue
+		}
+		pcm = append(pcm, samples...)
+	}
+	if len(pcm) == 0 {
+		return nil, nil
+	}
+
+	// Optionally drop near-silent frames to cut billed transcription minutes
+	// (mirrors what the gateway used to do at stop time).
+	if w.cfg.Audio.SilenceTrim {
+		pcm = audio.TrimSilence(pcm, audio.FrameSize*audio.Channels, w.cfg.Audio.SilenceRMSThreshold)
+	}
+
+	var buf bytes.Buffer
+	if err := audio.WriteWAV(&buf, pcm, audio.SampleRate, audio.Channels); err != nil {
+		return nil, fmt.Errorf("encode wav: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // notesChannel resolves where to post: the guild's configured notes channel if

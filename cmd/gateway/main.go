@@ -91,6 +91,11 @@ func main() {
 	// --- reminder scheduler (runs in the gateway since it has the Discord session) ---
 	go gateway.RunReminderLoop(ctx, log, store, gw.Client(), 60*time.Second)
 
+	// --- session reaper: finalize recordings orphaned by a crashed/rolled pod ---
+	// staleAfter (2m) comfortably exceeds the 30s checkpoint interval so a pod
+	// that restarts and resumes isn't reaped out from under itself.
+	go gw.RunSessionReaper(ctx, 60*time.Second, 2*time.Minute)
+
 	<-ctx.Done()
 	log.Info("shutting down")
 	if err := gw.Close(); err != nil && !errors.Is(err, context.Canceled) {
