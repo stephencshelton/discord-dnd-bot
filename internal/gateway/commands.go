@@ -185,7 +185,7 @@ func commandDefs() []*discordgo.ApplicationCommand {
 					Name:        "set",
 					Description: "Set a weekly reminder",
 					Options: []*discordgo.ApplicationCommandOption{
-						{Type: discordgo.ApplicationCommandOptionString, Name: "weekday", Description: "Day of week", Required: true, Choices: weekdayChoices()},
+						{Type: discordgo.ApplicationCommandOptionInteger, Name: "weekday", Description: "Day of week", Required: true, Choices: weekdayChoices()},
 						{Type: discordgo.ApplicationCommandOptionString, Name: "time", Description: "24h time UTC, e.g. 18:30", Required: true},
 					},
 				},
