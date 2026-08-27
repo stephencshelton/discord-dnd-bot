@@ -58,17 +58,22 @@ type recording struct {
 	decoders map[uint32]*gopus.Decoder // per-SSRC Opus decoder
 	seen     map[string]bool           // userIDs already persisted this session
 	capped   bool
-	// frames holds mixed stereo PCM, one 20ms slot per shared timeline index.
-	// Packets are placed by RTP timestamp (see anchor) so concurrent speakers
-	// stay aligned and silence gaps leave empty slots instead of collapsing,
-	// which previously caused drift on long sessions.
+	// frames is a SLIDING WINDOW of mixed stereo PCM, one 20ms slot per timeline
+	// index, holding only frames not yet checkpointed. frames[i] corresponds to
+	// absolute timeline index frameBase+i. After each checkpoint the flushed
+	// leading frames are dropped and frameBase advances, so memory stays bounded
+	// to ~one checkpoint interval regardless of session length (a 3h session no
+	// longer holds ~2GB in RAM). Packets are placed by RTP timestamp (see anchor)
+	// so concurrent speakers stay aligned and silence gaps leave empty slots.
 	frames [][]int16
-	// flushed is the number of leading frames already checkpointed to storage;
-	// each checkpoint uploads frames[flushed:] and advances flushed.
-	flushed int
+	// frameBase is the absolute timeline index of frames[0]. Everything before it
+	// has been uploaded to storage and freed. totalFrames is the absolute count
+	// of frames ever produced (frameBase+len(frames)); used for the session cap.
+	frameBase   int
+	totalFrames int
 	// anchor maps each SSRC to its first packet's alignment: baseTS is that
-	// packet's RTP timestamp, baseFrame the timeline index (from wall-clock
-	// arrival). Later slots = baseFrame + (pkt.Timestamp-baseTS)/FrameSize.
+	// packet's RTP timestamp, baseFrame the ABSOLUTE timeline index (from
+	// wall-clock arrival). Later slots = baseFrame + (pkt.Timestamp-baseTS)/FrameSize.
 	anchor map[uint32]streamAnchor
 }
 
@@ -284,21 +289,22 @@ const holdbackFrames = 50
 
 func (r *recording) checkpointUpTo(holdback int) error {
 	r.mu.Lock()
-	upTo := len(r.frames) - holdback
-	if upTo <= r.flushed {
+	// Flush all but the last `holdback` frames in the live window.
+	flushCount := len(r.frames) - holdback
+	if flushCount <= 0 {
 		r.mu.Unlock()
 		return nil
 	}
-	// Copy the settled new frames out under the lock, then release it before the
-	// upload.
-	newFrames := r.frames[r.flushed:upTo]
-	pcm := make([]int16, 0, len(newFrames)*audio.FrameSize*audio.Channels)
-	for _, f := range newFrames {
+	// Copy the frames-to-flush out under the lock, then release it before the
+	// upload. We do NOT drop them from the window yet — only after a successful
+	// upload — so a failed PUT is retried with the same frames next tick.
+	toFlush := r.frames[:flushCount]
+	pcm := make([]int16, 0, len(toFlush)*audio.FrameSize*audio.Channels)
+	for _, f := range toFlush {
 		pcm = append(pcm, f...)
 	}
 	seq := r.chunkSeq
 	prefix := r.chunkPrefix
-	newFlushed := upTo
 	r.mu.Unlock()
 
 	buf := new(bytes.Buffer)
@@ -311,14 +317,20 @@ func (r *recording) checkpointUpTo(holdback int) error {
 		return fmt.Errorf("upload chunk %d: %w", seq, err)
 	}
 
-	// Only advance the watermarks after a successful upload so a failed PUT is
-	// retried (with the same frames) on the next tick.
+	// Upload succeeded: drop the flushed frames from the front of the window and
+	// advance frameBase so their RAM is freed. Re-slice into a fresh backing
+	// array so the old (large) array can be GC'd rather than retained by the
+	// sub-slice's shared capacity.
 	r.mu.Lock()
-	r.flushed = newFlushed
+	remaining := r.frames[flushCount:]
+	kept := make([][]int16, len(remaining))
+	copy(kept, remaining)
+	r.frames = kept
+	r.frameBase += flushCount
 	r.chunkSeq++
 	r.mu.Unlock()
 	r.g.log.Info("checkpointed recording chunk",
-		"guild", r.guildID, "session", r.sessionID, "seq", seq, "frames", len(newFrames))
+		"guild", r.guildID, "session", r.sessionID, "seq", seq, "frames", flushCount)
 	return nil
 }
 
@@ -362,7 +374,7 @@ func (r *recording) ReceiveOpusFrame(userID snowflake.ID, pkt *voice.Packet) (er
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if maxFrames > 0 && len(r.frames) >= maxFrames {
+	if maxFrames > 0 && r.totalFrames >= maxFrames {
 		if !r.capped {
 			r.capped = true
 			r.g.log.Warn("recording hit max length; further audio dropped",
@@ -450,27 +462,39 @@ func (r *recording) frameIndexFor(ssrc uint32, ts uint32) int {
 	return idx
 }
 
-// mixFrame sums a decoded stereo frame into the timeline at idx, extending the
-// buffer as needed. A corrupt/huge RTP-derived idx is clamped (dropped) rather
-// than allowed to force a giant allocation. Caller holds r.mu.
+// mixFrame sums a decoded stereo frame into the timeline at ABSOLUTE index idx,
+// extending the sliding window as needed. Frames whose absolute index is below
+// frameBase have already been checkpointed and freed, so a late packet for one
+// is dropped. A corrupt/huge RTP-derived idx is clamped (dropped) rather than
+// allowed to force a giant allocation. Caller holds r.mu.
 func (r *recording) mixFrame(idx int, pcm []int16) {
 	if idx < 0 {
 		return
 	}
-	// A legitimate gap is silence; more than ~1h ahead of the tail indicates a
-	// bogus timestamp — drop it rather than allocate.
-	const maxGapFrames = 180000
-	if idx > len(r.frames)+maxGapFrames {
+	// Already flushed & freed — can't retroactively mix. Rare (only within the
+	// checkpoint holdback window); the frame is already durably uploaded.
+	if idx < r.frameBase {
 		return
 	}
-	// Respect the overall session cap.
+	local := idx - r.frameBase
+	// A legitimate gap is silence; more than ~1h ahead of the window tail
+	// indicates a bogus timestamp — drop it rather than allocate.
+	const maxGapFrames = 180000
+	if local > len(r.frames)+maxGapFrames {
+		return
+	}
+	// Respect the overall session cap (absolute).
 	if m := r.g.cfg.Audio.MaxSessionMinutes; m > 0 && idx >= m*60*50 {
 		return
 	}
-	for len(r.frames) <= idx {
+	for len(r.frames) <= local {
 		r.frames = append(r.frames, make([]int16, audio.FrameSize*audio.Channels))
 	}
-	dst := r.frames[idx]
+	// Track the absolute high-water mark for the session cap.
+	if abs := r.frameBase + len(r.frames); abs > r.totalFrames {
+		r.totalFrames = abs
+	}
+	dst := r.frames[local]
 	n := len(pcm)
 	if n > len(dst) {
 		n = len(dst)
