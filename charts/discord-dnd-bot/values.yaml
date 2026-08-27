@@ -170,11 +170,12 @@ config:
     # Per-frame RMS amplitude (0..32767) below which a frame is treated as silence.
     silenceRMSThreshold: 350
     # Split each speaker's track into <= this many minutes per WAV segment when
-    # transcribing (with a few seconds of overlap). Bounds worker AND STT peak
-    # RAM to one segment (~11.5 MB/min of PCM) instead of the whole session, so a
-    # multi-hour recording won't OOM-kill the worker. 0 disables segmenting
-    # (whole-track transcription — only safe for short sessions).
-    transcribeSegmentMinutes: 10
+    # transcribing (with a few seconds of overlap), and downmix each segment to
+    # mono before sending. Bounds BOTH worker and STT peak RAM to one mono
+    # segment. Keep small enough that a segment fits the STT backend's memory —
+    # faster-whisper-medium OOMs on ~10-min segments at 8Gi, so the default is 3.
+    # 0 disables segmenting (whole-track transcription — only safe for short sessions).
+    transcribeSegmentMinutes: 3
     # Hard cap on a single recording's length. Audio is buffered per speaker and
     # flushed to storage every ~30s (then freed), so gateway memory scales with
     # CONCURRENT speech in a checkpoint window (~5.6 MB per simultaneously-talking

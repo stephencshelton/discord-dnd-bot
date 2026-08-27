@@ -237,14 +237,17 @@ func (w *Worker) transcribeUserTrack(ctx context.Context, sess *db.Session, keys
 		buf []int16 // current segment being accumulated
 	)
 
-	// transcribeBuf encodes the buffered PCM as one WAV, transcribes it, and
-	// appends the text. Callers manage what stays in buf afterward.
+	// transcribeBuf downmixes the buffered stereo PCM to mono, encodes it as one
+	// mono WAV, transcribes it, and appends the text. Mono halves the bytes the
+	// STT backend must decode/hold (transcription doesn't need stereo). Callers
+	// manage what stays in buf afterward.
 	transcribeBuf := func(seg []int16) error {
 		if len(seg) == 0 {
 			return nil
 		}
+		mono := audio.DownmixToMono(seg, audio.Channels)
 		var wav bytes.Buffer
-		if err := audio.WriteWAV(&wav, seg, audio.SampleRate, audio.Channels); err != nil {
+		if err := audio.WriteWAV(&wav, mono, audio.SampleRate, 1); err != nil {
 			return fmt.Errorf("encode wav segment: %w", err)
 		}
 		text, err := w.transcribeAI.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", &wav)

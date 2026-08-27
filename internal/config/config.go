@@ -216,12 +216,13 @@ type AudioConfig struct {
 	// TranscribeSegmentMinutes bounds how much of a speaker's track the worker
 	// buffers and transcribes at once. A long track is split into <= this many
 	// minutes per WAV segment (with a few seconds of overlap so a word spanning
-	// a boundary isn't lost), so the worker's peak RAM — and the STT backend's —
-	// scales with the segment length, NOT the (possibly multi-hour) session
-	// length. Without it, reassembling + WAV-encoding a whole track OOM-kills the
-	// worker (~11.5 MB/min of PCM per active speaker). 0 disables segmenting
-	// (transcribe the whole track in one request — only safe for short sessions).
-	TranscribeSegmentMinutes int `envconfig:"AUDIO_TRANSCRIBE_SEGMENT_MINUTES" default:"10"`
+	// a boundary isn't lost), so BOTH the worker's peak RAM and the STT backend's
+	// scale with the segment length, NOT the (possibly multi-hour) session length.
+	// Segments are downmixed to mono before encoding, halving STT input size.
+	// Keep this small enough that one mono segment fits the STT backend's memory
+	// (faster-whisper-medium OOMs on ~10-min segments at 8Gi; 3 min is safe). 0
+	// disables segmenting (whole track in one request — only safe for short sessions).
+	TranscribeSegmentMinutes int `envconfig:"AUDIO_TRANSCRIBE_SEGMENT_MINUTES" default:"3"`
 	// MaxSessionMinutes hard-caps how long a recording stays in memory before
 	// auto-stopping. Audio is buffered per speaker and flushed to storage every
 	// ~30s (then freed), so gateway memory scales with CONCURRENT speech in a

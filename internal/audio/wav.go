@@ -114,6 +114,33 @@ func TrimSilence(pcm []int16, samplesPerFrame, rmsThreshold int) []int16 {
 	return out
 }
 
+// DownmixToMono averages interleaved multi-channel PCM down to a single channel.
+// Transcription only needs mono, so downmixing before encoding halves (for
+// stereo) the bytes the STT backend must decode and hold — a direct cut to its
+// peak memory — with no loss of transcription quality.
+//
+// channels must be >= 1. When channels == 1 the input is returned unchanged. A
+// trailing partial frame (fewer than `channels` samples) is averaged over the
+// samples present rather than dropped.
+func DownmixToMono(pcm []int16, channels int) []int16 {
+	if channels <= 1 || len(pcm) == 0 {
+		return pcm
+	}
+	mono := make([]int16, 0, (len(pcm)+channels-1)/channels)
+	for i := 0; i < len(pcm); i += channels {
+		end := i + channels
+		if end > len(pcm) {
+			end = len(pcm)
+		}
+		var sum int
+		for _, s := range pcm[i:end] {
+			sum += int(s)
+		}
+		mono = append(mono, int16(sum/(end-i))) //#nosec G115 -- mean of int16 samples stays in int16 range
+	}
+	return mono
+}
+
 // frameRMS returns the root-mean-square amplitude of a PCM frame.
 func frameRMS(frame []int16) float64 {
 	if len(frame) == 0 {

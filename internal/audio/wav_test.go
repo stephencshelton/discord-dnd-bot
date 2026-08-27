@@ -120,6 +120,45 @@ func TestTrimSilence(t *testing.T) {
 	})
 }
 
+func TestDownmixToMono(t *testing.T) {
+	t.Run("averages stereo pairs", func(t *testing.T) {
+		// L,R pairs: (10,20)->15, (-100,-200)->-150, (32767,32767)->32767
+		in := []int16{10, 20, -100, -200, 32767, 32767}
+		got := DownmixToMono(in, 2)
+		want := []int16{15, -150, 32767}
+		if len(got) != len(want) {
+			t.Fatalf("len = %d, want %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("sample %d = %d, want %d", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("mono is unchanged", func(t *testing.T) {
+		in := []int16{1, 2, 3}
+		got := DownmixToMono(in, 1)
+		if len(got) != 3 || got[0] != 1 || got[2] != 3 {
+			t.Fatalf("mono input must pass through unchanged, got %v", got)
+		}
+	})
+
+	t.Run("trailing partial frame averaged over present samples", func(t *testing.T) {
+		in := []int16{10, 20, 30} // last "frame" has only L=30
+		got := DownmixToMono(in, 2)
+		if len(got) != 2 || got[0] != 15 || got[1] != 30 {
+			t.Fatalf("got %v, want [15 30]", got)
+		}
+	})
+
+	t.Run("empty input", func(t *testing.T) {
+		if got := DownmixToMono(nil, 2); len(got) != 0 {
+			t.Fatalf("len = %d, want 0", len(got))
+		}
+	})
+}
+
 // failWriter fails after allowing n successful writes, to exercise error paths.
 type failWriter struct {
 	remaining int
