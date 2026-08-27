@@ -86,10 +86,10 @@ func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, 
 			cache.FlagVoiceStates,
 			cache.FlagChannels,
 		)),
-		// DAVE (E2EE voice) via the pure-Go dave-go backend. Required by Discord
-		// for all voice connections; without it voice fails with close 4017. Can
-		// be disabled (falls back to the noop DAVE session, protocol v0) to
-		// isolate a stalling DAVE handshake — see DISCORD_DISABLE_DAVE.
+		// DAVE (E2EE voice) via the pure-Go dave-go backend. Requires a disgo build
+		// with the RTP-padding decrypt fix (disgo #594); older builds fail to
+		// decrypt every incoming packet. Toggle off via DISCORD_DISABLE_DAVE (falls
+		// back to the noop session, transport-only encryption) — see config.
 		bot.WithVoiceManagerConfigOpts(
 			voice.WithDaveSessionCreateFunc(daveSessionCreateFunc(cfg.Discord.DisableDAVE)),
 		),
@@ -131,11 +131,11 @@ func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, 
 	return g, nil
 }
 
-// daveSessionCreateFunc returns the DAVE (E2EE voice) session factory: the real
-// pure-Go dave-go implementation (advertises DAVE protocol v1), or the noop
-// session (protocol v0, DAVE disabled) when disabled is true. Disabling is a
-// diagnostic/escape hatch for when the DAVE/MLS handshake stalls the voice
-// connection; note Discord may reject voice (close 4017) without DAVE.
+// daveSessionCreateFunc returns the DAVE (E2EE voice) session factory. Enabled
+// (the default) it returns the real pure-Go dave-go session (protocol v1);
+// disabled (DISCORD_DISABLE_DAVE=true) it returns the noop session (protocol
+// v0), which yields transport-only encrypted voice. DAVE requires a disgo build
+// with the RTP-padding decrypt fix (disgo #594).
 func daveSessionCreateFunc(disabled bool) godave.SessionCreateFunc {
 	if disabled {
 		return godave.NewNoopSession
@@ -157,10 +157,16 @@ func (g *Gateway) Open(ctx context.Context) error {
 	// Resume any sessions the previous pod was recording (crash/rollout). This
 	// runs after the gateway is open so the guild/voice-state caches can populate
 	// and the voice channel can be rejoined. Best-effort; it logs and moves on.
+	// Derive from the caller's (process-lifetime, signal-scoped) context so the
+	// goroutine is cancelled on shutdown rather than running detached.
 	go func() {
 		// Give the guild caches a moment to hydrate before rejoining voice.
-		time.Sleep(3 * time.Second)
-		rctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		select {
+		case <-time.After(3 * time.Second):
+		case <-ctx.Done():
+			return
+		}
+		rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
 		g.voice.resumeActive(rctx)
 	}()

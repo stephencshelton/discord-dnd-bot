@@ -50,11 +50,16 @@ type DiscordConfig struct {
 	// enabled. Retained so existing env/values with DISCORD_ALLOW_DIRECT_MESSAGES
 	// still parse. Remove after the setting is dropped from deployments.
 	AllowDirectMessages bool `envconfig:"DISCORD_ALLOW_DIRECT_MESSAGES" default:"false"`
-	// DisableDAVE turns off Discord's DAVE end-to-end voice encryption handshake
-	// (advertises DAVE protocol version 0 / noop). DAVE is normally required, but
-	// if the pure-Go DAVE handshake stalls the voice connection ("context
-	// deadline exceeded" on /session start after the bot appears to join), this
-	// isolates whether DAVE is the cause. Default false (DAVE enabled).
+	// DisableDAVE controls Discord's DAVE end-to-end voice encryption. Default
+	// false (DAVE ENABLED) via the pure-Go thomas-vilte/dave-go backend.
+	//
+	// Earlier every incoming packet failed to DAVE-decrypt; the root cause was a
+	// disgo bug (RTP padding bit masked as 0x04 instead of 0x20 — disgo #593,
+	// fixed in #594) that left RTP padding attached and pushed the DAVE frame
+	// marker off the end of the buffer. Fixed by upgrading disgo past that PR.
+	//
+	// Set DISCORD_DISABLE_DAVE=true to fall back to the noop session (advertises
+	// DAVE v0): voice is then only transport-encrypted. Kept as an escape hatch.
 	DisableDAVE bool `envconfig:"DISCORD_DISABLE_DAVE" default:"false"`
 }
 

@@ -70,6 +70,10 @@ config:
     guildIDs: []
     # When enabled, only members of exactly one listed guild can use AI DMs.
     allowDirectMessages: false
+    # DAVE end-to-end voice encryption. Default false (ENABLED) via the pure-Go
+    # dave-go backend; requires the disgo RTP-padding decrypt fix (disgo #594).
+    # Set true to fall back to transport-only encryption (noop DAVE session).
+    disableDAVE: false
 
   database:
     # Connection is assembled from discrete parts so the password stays in the
