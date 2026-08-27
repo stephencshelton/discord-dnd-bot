@@ -153,13 +153,24 @@ func (ic *ictx) replyError() {
 }
 
 // onInteraction is the disgo listener for slash-command interactions.
+//
+// disgo dispatches events SYNCHRONOUSLY while holding its event-listener mutex
+// (asyncEventsEnabled is off). Some commands (notably /session start) block for
+// many seconds inside conn.Open waiting for VOICE_STATE_UPDATE/
+// VOICE_SERVER_UPDATE — but disgo delivers those very events through the same
+// mutex-guarded dispatch path, so running the handler inline deadlocks the
+// gateway: the voice events can't arrive until the handler returns, and the
+// handler can't return until the voice events arrive (they only flush after our
+// timeout). Running the command on its own goroutine frees the dispatch loop so
+// the events flow while the handler waits. routeCommand has its own panic
+// recovery and acks the interaction first, so the token stays valid.
 func (g *Gateway) onInteraction(e *events.ApplicationCommandInteractionCreate) {
 	data, ok := e.Data.(discord.SlashCommandInteractionData)
 	if !ok {
 		return // not a slash command (e.g. user/message command); unused here
 	}
 	ic := &ictx{g: g, e: e, data: data}
-	g.routeCommand(ic)
+	go g.routeCommand(ic)
 }
 
 func (g *Gateway) routeCommand(ic *ictx) {

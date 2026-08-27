@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
+	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
 
 // handleRemind manages the per-campaign weekly reminder.
@@ -172,7 +174,21 @@ func (g *Gateway) guildName(guildID string) string {
 
 // onAutocomplete provides suggestions for campaign/character/help/dm-server
 // name options. disgo invokes this for every autocomplete interaction.
+//
+// Runs on its own goroutine so it never blocks disgo's synchronous, mutex-held
+// event dispatch (which would stall other gateway events, including voice).
 func (g *Gateway) onAutocomplete(e *events.AutocompleteInteractionCreate) {
+	go g.handleAutocomplete(e)
+}
+
+func (g *Gateway) handleAutocomplete(e *events.AutocompleteInteractionCreate) {
+	defer func() {
+		if r := recover(); r != nil {
+			metrics.PanicsRecovered.WithLabelValues("autocomplete").Inc()
+			g.log.Error("autocomplete handler panicked; recovered",
+				"panic", fmt.Sprintf("%v", r), "stack", string(debug.Stack()))
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	data := e.Data

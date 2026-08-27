@@ -18,7 +18,17 @@ import (
 
 // onMessageCreate powers conversational chat: @mentions in a guild, and DMs to
 // the bot. Both route through the chat model with the active campaign as context.
+//
+// Runs on its own goroutine: disgo dispatches events synchronously while
+// holding its event-listener mutex, and this handler can block for seconds on
+// the AI call. Blocking the dispatch loop would stall all other gateway events
+// (including voice), so we hand off immediately. handleMessageCreate has its own
+// panic recovery.
 func (g *Gateway) onMessageCreate(e *events.MessageCreate) {
+	go g.handleMessageCreate(e)
+}
+
+func (g *Gateway) handleMessageCreate(e *events.MessageCreate) {
 	msg := e.Message
 	if msg.Author.Bot {
 		return
