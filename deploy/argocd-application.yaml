@@ -150,6 +150,20 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: discord-dnd-bot
+  # The External Secrets CRD/controller server-side-defaults several optional
+  # fields our Helm template intentionally omits (remoteRef conversion/decoding/
+  # metadata strategies and target.deletionPolicy). Argo would otherwise see the
+  # live object (with defaults) vs desired (without) and report OutOfSync
+  # forever. Ignore those controller-managed defaults so sync converges. Do NOT
+  # try to hand-render them in the chart — they're CRD enum defaults.
+  ignoreDifferences:
+    - group: external-secrets.io
+      kind: ExternalSecret
+      jqPathExpressions:
+        - .spec.target.deletionPolicy
+        - .spec.data[].remoteRef.conversionStrategy
+        - .spec.data[].remoteRef.decodingStrategy
+        - .spec.data[].remoteRef.metadataPolicy
   syncPolicy:
     automated:
       prune: true

@@ -13,11 +13,12 @@ PostgreSQL, Redis, object storage, and LiteLLM are external service boundaries. 
 
 The implemented command surface includes:
 
-- `/campaign create`, `list`, `activate`, and `archive`
+- `/campaign create`, `list`, `activate`, `archive`, and `delete` (delete purges the campaign's sessions, notes, embeddings, and S3 audio — guarded by retyping the name)
 - `/character add`, `list`, and `remove`
 - `/world add` and `list` for NPCs, locations, factions, and quests
 - `/session start`, `stop`, and `status`
-- Voice recording with multi-user PCM mixing and WAV storage
+- `/session list` and `/session requeue` to inspect the active campaign's sessions by status and re-run a failed/lost transcription
+- Voice recording with per-speaker tracks, crash-safe PCM checkpointing to object storage, and automatic resume/reaping after a gateway restart
 - Automatic transcription and AI-generated session notes
 - `/roll` for dice (e.g. `2d6+3`, `d20`, `4d6kh3`) — free, instant, no AI
 - `/lore` for campaign-aware worldbuilding assistance
@@ -25,14 +26,17 @@ The implemented command surface includes:
 - `/search` for lexical full-text search over completed session notes/transcripts
 - `/ask` for grounded Q&A over your campaign's session notes (retrieval-augmented generation with pgvector)
 - `/art` for AI-generated campaign scene art
-- `/reindex` (admin) to rebuild `/ask` memory from all completed sessions
+- `/reindex` to rebuild `/ask` memory from all completed sessions
 - `/remind set`, `clear`, and `show` for weekly UTC reminders
 - `/notes-channel` for choosing where generated notes are posted
+- `/feedback` to send feedback (stored, with an optional real-time DM to the maintainer)
+- `/dm-server` to pick which allowlisted server a DM conversation uses
+- `/help` for an overview or per-command details
 - Public channel mentions and direct-message conversations
 - Campaign context from player characters and world entities
 - Prometheus metrics and Kubernetes liveness/readiness endpoints
 
-All AI calls use LiteLLM’s OpenAI-compatible API. Provider-specific SDKs are intentionally not used in the application.
+All AI calls use LiteLLM’s OpenAI-compatible API. Provider-specific SDKs are intentionally not used in the application. Voice uses [disgo](https://github.com/disgoorg/disgo) with Discord's mandatory DAVE end-to-end voice encryption handled by the pure-Go [`thomas-vilte/dave-go`](https://github.com/thomas-vilte/dave-go) backend (no libdave/C++ toolchain required).
 
 ## Architecture
 
@@ -55,12 +59,12 @@ The gateway uses a `Recreate` deployment strategy because a Discord gateway conn
 
 ## Prerequisites
 
-- Go 1.23 for local development
-- CGO and `libopus-dev` for gateway voice decoding
+- Go 1.26 for local development
+- CGO and `libopus-dev` for gateway voice decoding (Discord's DAVE end-to-end voice encryption is handled by the pure-Go `thomas-vilte/dave-go` backend — no libdave/C++ toolchain needed)
 - PostgreSQL 13 or newer with the `pgcrypto` and `vector` (pgvector) extensions available. pgvector powers the grounded `/ask` command; the optional bundled PostgreSQL uses the official `pgvector/pgvector` image, and managed PostgreSQL (AWS RDS/Aurora, Azure Database for PostgreSQL, GCP Cloud SQL) all support pgvector.
 - Redis 7 or newer
 - S3, MinIO, Cloudflare R2, or another S3-compatible object store
-- A LiteLLM proxy configured with chat, transcription, and image model routes
+- A LiteLLM proxy configured with chat, transcription, image, and embeddings model routes
 - A Discord application with a bot token and the required gateway intents
 - Docker and Helm for container or Kubernetes deployment
 
@@ -77,7 +81,9 @@ Configuration is loaded from environment variables. The same configuration is us
 | `DISCORD_APP_ID` | Yes | empty | Discord application ID |
 | `DISCORD_GUILD_IDS` | Gateway | empty | Comma-separated guild allowlist; empty disables guild integrations and commands are never global |
 | `DISCORD_GUILD_ID` | No | empty | Deprecated single-guild fallback; use `DISCORD_GUILD_IDS` |
-| `DISCORD_ALLOW_DIRECT_MESSAGES` | No | `false` | Enable AI DMs for users in exactly one allowlisted guild; disabled by default |
+| `DISCORD_ALLOW_DIRECT_MESSAGES` | No | `false` | **Deprecated and ignored** — DMs are always enabled; retained only so existing env still parses |
+| `DISCORD_DISABLE_DAVE` | No | `false` | Set `true` to fall back to transport-only voice encryption (noop DAVE session); default keeps DAVE enabled |
+| `DISCORD_FEEDBACK_DM_USER_ID` | No | (maintainer id) | Discord user ID that receives a DM on `/feedback`; empty disables the DM (feedback is still stored) |
 | `DATABASE_URL` | No | empty | Full connection string. When set, takes precedence over the discrete parts below |
 | `DATABASE_HOST` | No | `localhost` | DB host (used when `DATABASE_URL` is empty) |
 | `DATABASE_PORT` | No | `5432` | DB port |
@@ -111,8 +117,12 @@ Configuration is loaded from environment variables. The same configuration is us
 | `LITELLM_UPLOAD_TIMEOUT` | No | `300s` | Timeout for multipart audio uploads |
 | `AUDIO_SILENCE_TRIM` | No | `true` | Drop near-silent frames before upload to cut billed minutes |
 | `AUDIO_SILENCE_RMS_THRESHOLD` | No | `350` | Per-frame RMS (0–32767) treated as silence |
+| `AUDIO_TRANSCRIBE_SEGMENT_MINUTES` | No | `3` | Split each speaker's track into ≤ this many minutes per WAV segment (downmixed to mono) when transcribing, bounding worker and STT memory (`0` = whole track in one request) |
 | `AUDIO_MAX_SESSION_MINUTES` | No | `180` | Hard cap on a single recording's length to bound gateway memory (`0` = no cap) |
 | `WORKER_CONCURRENCY` | No | `4` | Jobs processed in parallel per worker pod |
+| `WORKER_TRANSCRIBE_JOB_TIMEOUT` | No | `4h` | Max time for a single transcribe+summarize job (CPU Whisper runs below realtime) |
+| `WORKER_JOB_TIMEOUT` | No | `15m` | Max time for non-transcribe jobs (art, reindex) |
+| `WORKER_MAX_RETRIES` | No | `3` | Times a job is requeued after a transient failure before it is abandoned (`0` = no retries; permanent failures are never retried) |
 
 Each chat endpoint (notes, recap, lore, ask) can point at a different LiteLLM
 route, so operators can pick the cheapest capable model per task purely through
@@ -187,7 +197,7 @@ The target Secret must provide `DISCORD_TOKEN`, `LITELLM_API_KEY`, and the DB cr
 
 ## Discord Access Control
 
-Configure `DISCORD_GUILD_IDS` with every permitted server ID. The gateway registers no global commands and ignores unlisted guilds, even when the bot is installed there. Set `DISCORD_ALLOW_DIRECT_MESSAGES=true` to allow DM AI only for users who are members of exactly one allowlisted guild; their DM uses that guild's campaign context. Users in more than one allowlisted guild must ask in the relevant server until a guild-selection flow is added.
+Configure `DISCORD_GUILD_IDS` with every permitted server ID. The gateway registers guild-scoped commands only in the listed servers and ignores unlisted guilds, even when the bot is installed there. (DM-capable commands are registered as global commands with DM interaction contexts so they also work in direct messages.) Direct messages are always enabled: a DM from a user who belongs to exactly one allowlisted server uses that server's active campaign automatically; a user in more than one must pick one with `/dm-server` (an ambiguous DM is answered with a prompt to run it).
 
 Also disable **Public Bot** in the Discord Developer Portal under **Bot**. That prevents people outside your application team from installing the bot through an OAuth2 URL; the runtime allowlist remains the second line of defense.
 
@@ -265,7 +275,7 @@ The existing Secret must contain these keys:
 
 For development, the chart can create the Secret from values instead. For production, use an external secret manager or a pre-created Secret rather than storing credentials in Helm values.
 
-The gateway and worker have independent `replicaCount`, resource, node selector, affinity, toleration, and autoscaling settings. Worker autoscaling defaults to 2–10 replicas based on CPU utilization. Queue-depth autoscaling can be added with KEDA without changing the worker code or gateway deployment.
+The gateway and worker have independent `replicaCount`, resource, node selector, affinity, toleration, and autoscaling settings. Worker autoscaling defaults to 1–5 replicas based on CPU utilization. Queue depth is exported as a Prometheus gauge, so queue-depth autoscaling can be added with KEDA without changing the worker code or gateway deployment.
 
 Enable Prometheus Operator scraping with:
 
@@ -369,10 +379,19 @@ The bot is designed to scale gracefully in and out on Kubernetes:
 - **Silence trimming** — near-silent audio frames are dropped before upload
   (`AUDIO_SILENCE_TRIM`), reducing the minutes billed by the transcription model
   without degrading speech.
+- **Segmented, mono transcription** — each speaker's track is transcribed in
+  bounded WAV segments (`AUDIO_TRANSCRIBE_SEGMENT_MINUTES`, downmixed to mono),
+  streamed one segment at a time. This keeps both worker and STT peak memory flat
+  regardless of how long the session runs, so a multi-hour recording won't OOM.
+- **At-least-once retries** — a job that fails transiently (a LiteLLM/storage
+  blip, or the worker being killed mid-job) is requeued up to `WORKER_MAX_RETRIES`
+  times; permanent failures (no audio, empty transcript) are not retried. A lost
+  transcription can also be re-run manually with `/session requeue`, since the
+  raw audio chunks persist in object storage.
 - **Participant tracking** — the gateway records which Discord users spoke
-  (via voice speaking events) into `session_participants`. Session notes are told
-  *when* the session occurred and *who* was in the call, and `/session status`
-  shows who has been heard so far.
+  (disgo resolves each voice packet's SSRC to a user) into `session_participants`.
+  Session notes are told *when* the session occurred and *who* was in the call,
+  and `/session status` shows who has been heard so far.
 
 ### Mapping logical routes to your LiteLLM inventory
 
@@ -463,14 +482,20 @@ Enable it in `values.yaml`:
 ```yaml
 stt:
   enabled: true
-  model: "Systran/faster-whisper-small"   # swap to -medium / -large-v3 freely
+  model: "Systran/faster-whisper-medium"  # chart default; swap to -small / -large-v3 freely
   resources:
-    requests: { cpu: "1", memory: 2Gi }
-    limits:   { cpu: "4", memory: 6Gi }
+    requests: { cpu: "4", memory: 8Gi }
+    limits:   { cpu: "4", memory: 8Gi }
   persistence:
     enabled: true       # caches model weights across restarts (RWO PVC)
     size: 5Gi
 ```
+
+Transcription requests are already bounded to `AUDIO_TRANSCRIBE_SEGMENT_MINUTES`
+of mono audio each (see [Scalability](#scalability-and-cost)), which keeps the
+STT server's peak memory flat regardless of session length. If you still see the
+STT pod OOM on a very heavy talker, lower `AUDIO_TRANSCRIBE_SEGMENT_MINUTES` or
+raise `stt.resources`.
 
 Then register the in-cluster service as your transcription route in LiteLLM's
 `config.yaml` (Speaches is OpenAI-compatible, so use the `openai/` prefix and
@@ -480,22 +505,24 @@ point `api_base` at the Service DNS name):
 model_list:
   - model_name: voice-transcribe
     litellm_params:
-      model: openai/Systran/faster-whisper-small
+      model: openai/Systran/faster-whisper-medium
       api_base: http://<release>-discord-dnd-bot-stt:8000/v1
       api_key: "none"
     model_info:
       mode: audio_transcription
 ```
 
-Leave `config.litellm.transcribeModel` as `voice-transcribe` (its public name).
+The `model:` here must match the model the `stt` deployment loads
+(`stt.model`). Leave `config.litellm.transcribeModel` as `voice-transcribe` (its
+public name).
 
 **CPU sizing guidance** (approximate real-time factor; RTF < 1.0 = faster than
 real-time, so a 1-hour session finishes in `RTF × 60 min`):
 
 | Model | CPU request | RTF (a few vCPUs) | Quality |
 | --- | --- | --- | --- |
-| `faster-whisper-small` | 1–2 | ~0.3–0.7× | Good (default) |
-| `faster-whisper-medium` | 2–4 | ~0.7–1.5× | Better |
+| `faster-whisper-small` | 1–2 | ~0.3–0.7× | Good |
+| `faster-whisper-medium` | 2–4 | ~0.7–1.5× | Better (chart default) |
 | `faster-whisper-large-v3` | 4+ | ~1.5–3× | Best (heavy) |
 
 Scale it like the other services: bump `stt.replicaCount` or enable
