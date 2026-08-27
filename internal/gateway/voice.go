@@ -109,6 +109,24 @@ func (m *voiceManager) join(guildID, channelID, sessionID string, startSeq int) 
 		return fmt.Errorf("invalid channel id %q: %w", channelID, err)
 	}
 
+	// Clear any lingering/ghost voice session before joining. A prior attempt
+	// (or a crashed pod) can leave Discord believing the bot is still connected
+	// to a voice channel in this guild; when that happens the new join op is
+	// accepted but Discord withholds VOICE_SERVER_UPDATE/VOICE_STATE_UPDATE until
+	// something forces a reconciliation, so conn.Open hangs the full 30s and then
+	// only gets the events once our timeout sends the leave. To avoid that, send
+	// an explicit leave (channel_id=null) first, drop any stale disgo conn, and
+	// give Discord a moment to settle before the real join.
+	resetCtx, resetCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if verr := m.g.client.UpdateVoiceState(resetCtx, gid, nil, false, false); verr != nil {
+		m.g.log.Debug("pre-join voice-state reset failed (continuing)",
+			"guild", guildID, "err", verr)
+	}
+	resetCancel()
+	m.g.client.VoiceManager.RemoveConn(gid)
+	// Brief settle so Discord drops the old voice session before we re-join.
+	time.Sleep(1 * time.Second)
+
 	conn := m.g.client.VoiceManager.CreateConn(gid)
 
 	r := &recording{
