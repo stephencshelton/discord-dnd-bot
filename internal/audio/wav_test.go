@@ -120,6 +120,58 @@ func TestTrimSilence(t *testing.T) {
 	})
 }
 
+func TestSegmentPCM(t *testing.T) {
+	seq := func(n int) []int16 {
+		s := make([]int16, n)
+		for i := range s {
+			s[i] = int16(i)
+		}
+		return s
+	}
+
+	t.Run("shorter than one segment returns whole input", func(t *testing.T) {
+		segs := SegmentPCM(seq(10), 100, 5)
+		if len(segs) != 1 || len(segs[0]) != 10 {
+			t.Fatalf("segments = %d (first len %d), want 1 whole segment", len(segs), len(segs[0]))
+		}
+	})
+
+	t.Run("segmentSamples<=0 disables segmenting", func(t *testing.T) {
+		segs := SegmentPCM(seq(1000), 0, 0)
+		if len(segs) != 1 || len(segs[0]) != 1000 {
+			t.Fatalf("segments = %d, want 1 whole segment when disabled", len(segs))
+		}
+	})
+
+	t.Run("splits with overlap and covers all samples", func(t *testing.T) {
+		segs := SegmentPCM(seq(25), 10, 3) // step 7: [0:10] [7:17] [14:24] [21:25]
+		if len(segs) != 4 {
+			t.Fatalf("segments = %d, want 4", len(segs))
+		}
+		if segs[0][0] != 0 || segs[0][len(segs[0])-1] != 9 {
+			t.Errorf("seg0 = [%d..%d], want [0..9]", segs[0][0], segs[0][len(segs[0])-1])
+		}
+		if segs[1][0] != 7 {
+			t.Errorf("seg1 start = %d, want 7 (overlap)", segs[1][0])
+		}
+		last := segs[len(segs)-1]
+		if last[len(last)-1] != 24 {
+			t.Errorf("last sample = %d, want 24", last[len(last)-1])
+		}
+	})
+
+	t.Run("overlap >= segment is clamped and still terminates", func(t *testing.T) {
+		segs := SegmentPCM(seq(30), 10, 100) // clamped to 9
+		if len(segs) == 0 {
+			t.Fatal("expected progress, got no segments")
+		}
+		last := segs[len(segs)-1]
+		if last[len(last)-1] != 29 {
+			t.Errorf("last sample = %d, want 29", last[len(last)-1])
+		}
+	})
+}
+
 // failWriter fails after allowing n successful writes, to exercise error paths.
 type failWriter struct {
 	remaining int

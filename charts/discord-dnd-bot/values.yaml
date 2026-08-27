@@ -169,6 +169,12 @@ config:
     silenceTrim: true
     # Per-frame RMS amplitude (0..32767) below which a frame is treated as silence.
     silenceRMSThreshold: 350
+    # Split each speaker's track into <= this many minutes per WAV segment when
+    # transcribing (with a few seconds of overlap). Bounds worker AND STT peak
+    # RAM to one segment (~11.5 MB/min of PCM) instead of the whole session, so a
+    # multi-hour recording won't OOM-kill the worker. 0 disables segmenting
+    # (whole-track transcription — only safe for short sessions).
+    transcribeSegmentMinutes: 10
     # Hard cap on a single recording's length. Audio is buffered per speaker and
     # flushed to storage every ~30s (then freed), so gateway memory scales with
     # CONCURRENT speech in a checkpoint window (~5.6 MB per simultaneously-talking
@@ -347,10 +353,13 @@ worker:
   resources:
     requests:
       cpu: 2
-      memory: 2Gi
+      # Transcription is segmented (config.audio.transcribeSegmentMinutes) so
+      # worker RAM scales with one segment, not the whole session. 3Gi leaves
+      # comfortable headroom for a segment's PCM + WAV copy + Go runtime.
+      memory: 3Gi
     limits:
       cpu: "2"
-      memory: 2Gi
+      memory: 3Gi
   autoscaling:
     enabled: true
     minReplicas: 1

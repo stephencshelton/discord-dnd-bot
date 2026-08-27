@@ -150,9 +150,12 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 }
 
 // userAudio is one speaker's reassembled recording, ready for transcription.
+// It carries raw interleaved PCM (not a pre-encoded WAV) so transcribeTracks
+// can encode one bounded segment at a time — holding a whole multi-hour track's
+// WAV copy in memory is what OOM-killed the worker.
 type userAudio struct {
 	userID string
-	wav    []byte
+	pcm    []int16
 }
 
 // reassembleSessionAudio downloads the session's per-user PCM checkpoint chunks
@@ -225,11 +228,7 @@ func (w *Worker) reassembleSessionAudio(ctx context.Context, sess *db.Session) (
 		if len(pcm) == 0 {
 			continue // track was all silence
 		}
-		var buf bytes.Buffer
-		if err := audio.WriteWAV(&buf, pcm, audio.SampleRate, audio.Channels); err != nil {
-			return nil, fmt.Errorf("encode wav (user %s): %w", uid, err)
-		}
-		tracks = append(tracks, userAudio{userID: uid, wav: buf.Bytes()})
+		tracks = append(tracks, userAudio{userID: uid, pcm: pcm})
 	}
 	return tracks, nil
 }
@@ -239,10 +238,31 @@ func (w *Worker) reassembleSessionAudio(ctx context.Context, sess *db.Session) (
 // display name (falling back to the userID, or "Unknown speaker") so the notes
 // summarizer knows who said what. A single flat/legacy track (userID "") is
 // returned unlabeled. Uses the long-timeout transcribe client.
+//
+// Each track is split into <= cfg.Audio.TranscribeSegmentMinutes-long WAV
+// segments (encoded one at a time) so peak memory — worker AND STT backend —
+// scales with the segment length, not the whole (possibly multi-hour) session.
+// A few seconds of overlap between segments means a word spanning a boundary is
+// transcribed in both and not dropped. Processed tracks are freed as we go so
+// we never hold every speaker's audio at once.
 func (w *Worker) transcribeTracks(ctx context.Context, tracks []userAudio, names map[string]string) (string, error) {
+	// Segment window sizing (interleaved sample count across channels).
+	segMinutes := w.cfg.Audio.TranscribeSegmentMinutes
+	segSamples := 0
+	if segMinutes > 0 {
+		segSamples = segMinutes * 60 * audio.SampleRate * audio.Channels
+	}
+	// ~3s of overlap so a word straddling a segment boundary isn't lost.
+	overlapSamples := 3 * audio.SampleRate * audio.Channels
+
+	legacySingle := len(tracks) == 1 && tracks[0].userID == ""
+
 	var b strings.Builder
-	for _, t := range tracks {
-		text, err := w.transcribeAI.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", bytes.NewReader(t.wav))
+	for i := range tracks {
+		t := tracks[i]
+		text, err := w.transcribeOneTrack(ctx, t.pcm, segSamples, overlapSamples)
+		// Free this speaker's PCM before moving to the next track.
+		tracks[i].pcm = nil
 		if err != nil {
 			return "", fmt.Errorf("transcribe track %s: %w", t.userID, err)
 		}
@@ -251,7 +271,7 @@ func (w *Worker) transcribeTracks(ctx context.Context, tracks []userAudio, names
 			continue
 		}
 		// Legacy single unlabeled track: return the text as-is.
-		if t.userID == "" && len(tracks) == 1 {
+		if legacySingle {
 			return text, nil
 		}
 		label := names[t.userID]
@@ -266,6 +286,36 @@ func (w *Worker) transcribeTracks(ctx context.Context, tracks []userAudio, names
 			b.WriteString("\n\n")
 		}
 		fmt.Fprintf(&b, "=== %s ===\n%s", label, text)
+	}
+	return b.String(), nil
+}
+
+// transcribeOneTrack transcribes a single speaker's PCM track by splitting it
+// into bounded WAV segments and joining the per-segment text. Each segment's
+// WAV is encoded, sent, and discarded before the next is encoded, so worker
+// memory stays flat regardless of track length.
+func (w *Worker) transcribeOneTrack(ctx context.Context, pcm []int16, segSamples, overlapSamples int) (string, error) {
+	segments := audio.SegmentPCM(pcm, segSamples, overlapSamples)
+	var b strings.Builder
+	for _, seg := range segments {
+		var buf bytes.Buffer
+		if err := audio.WriteWAV(&buf, seg, audio.SampleRate, audio.Channels); err != nil {
+			return "", fmt.Errorf("encode wav segment: %w", err)
+		}
+		text, err := w.transcribeAI.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", &buf)
+		// Release the segment's WAV bytes promptly.
+		buf.Reset()
+		if err != nil {
+			return "", err
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(text)
 	}
 	return b.String(), nil
 }

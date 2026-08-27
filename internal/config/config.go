@@ -213,6 +213,15 @@ type AudioConfig struct {
 	// SilenceRMSThreshold is the per-frame RMS amplitude (0..32767) below which
 	// a frame is considered silence when SilenceTrim is enabled.
 	SilenceRMSThreshold int `envconfig:"AUDIO_SILENCE_RMS_THRESHOLD" default:"350"`
+	// TranscribeSegmentMinutes bounds how much of a speaker's track the worker
+	// buffers and transcribes at once. A long track is split into <= this many
+	// minutes per WAV segment (with a few seconds of overlap so a word spanning
+	// a boundary isn't lost), so the worker's peak RAM — and the STT backend's —
+	// scales with the segment length, NOT the (possibly multi-hour) session
+	// length. Without it, reassembling + WAV-encoding a whole track OOM-kills the
+	// worker (~11.5 MB/min of PCM per active speaker). 0 disables segmenting
+	// (transcribe the whole track in one request — only safe for short sessions).
+	TranscribeSegmentMinutes int `envconfig:"AUDIO_TRANSCRIBE_SEGMENT_MINUTES" default:"10"`
 	// MaxSessionMinutes hard-caps how long a recording stays in memory before
 	// auto-stopping. Audio is buffered per speaker and flushed to storage every
 	// ~30s (then freed), so gateway memory scales with CONCURRENT speech in a
