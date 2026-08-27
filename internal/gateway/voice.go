@@ -134,9 +134,24 @@ func (m *voiceManager) join(guildID, channelID, sessionID string, startSeq int) 
 	defer cancel()
 	openStart := time.Now()
 	if err := conn.Open(ctx, cid, true /*selfMute*/, false /*selfDeaf*/); err != nil {
+		// Inspect the voice gateway state to localize the stall. If the gateway
+		// reached Ready (SSRC assigned) but Open still timed out, the UDP media
+		// path never completed the IP-discovery/SessionDescription round-trip —
+		// almost always outbound voice UDP being blocked by cluster egress (NAT
+		// gateway / security group only allowing TCP 443 for the websocket). If
+		// the gateway never reached Ready, the voice websocket itself stalled.
+		var gwStatus voice.Status = -1
+		var ssrc uint32
+		if gw := conn.Gateway(); gw != nil {
+			gwStatus = gw.Status()
+			ssrc = gw.SSRC()
+		}
 		m.g.log.Error("voice conn open failed",
 			"guild", guildID, "channel", channelID, "session", sessionID,
-			"elapsed_ms", time.Since(openStart).Milliseconds(), "err", err)
+			"elapsed_ms", time.Since(openStart).Milliseconds(),
+			"voice_gateway_status", int(gwStatus), "ssrc", ssrc,
+			"hint", "if status=7 (Ready) & ssrc!=0 the voice websocket is fine but UDP media is blocked (check egress/UDP)",
+			"err", err)
 		// Tear down the half-open connection so it doesn't linger/retry.
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		conn.Close(closeCtx)

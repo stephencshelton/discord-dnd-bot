@@ -35,6 +35,15 @@ func (g *Gateway) handleSession(ctx context.Context, ic *ictx) error {
 
 func (g *Gateway) sessionStart(ctx context.Context, ic *ictx, guildID string) error {
 	log := logging.FromContext(ctx, g.log)
+
+	// Ack immediately (ephemeral) BEFORE any slow work. Joining voice can take
+	// many seconds (DAVE/UDP handshake), which blows Discord's 3s interaction
+	// window and yields "Unknown interaction" (10062) if we reply late. With a
+	// deferred ack we have ~15 minutes to follow up with the real result.
+	if err := ic.ack(true); err != nil {
+		return err
+	}
+
 	// Reject if already recording. A non-not-found error means the DB is
 	// unreachable — surface it rather than silently starting a second session.
 	switch existing, err := g.store.GetActiveSession(ctx, guildID); {
@@ -44,7 +53,7 @@ func (g *Gateway) sessionStart(ctx context.Context, ic *ictx, guildID string) er
 		// stale (pod restart, or a prior start whose voice handshake half-
 		// failed) — clear it so the user isn't wedged, then start fresh.
 		if g.voice.has(guildID) {
-			return ic.reply("A session is already recording. Use `/session stop` first.", true)
+			return ic.followup("A session is already recording. Use `/session stop` first.")
 		}
 		log.Warn("clearing stale recording session with no in-memory recording",
 			"guild", guildID, "session", existing.ID)
@@ -56,13 +65,13 @@ func (g *Gateway) sessionStart(ctx context.Context, ic *ictx, guildID string) er
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
-		return ic.reply(err.Error(), true)
+		return ic.followup(err.Error())
 	}
 
 	// Find the invoking user's voice channel.
 	vs, err := g.userVoiceChannel(guildID, ic.userID())
 	if err != nil {
-		return ic.reply("Join a voice channel first, then run `/session start`.", true)
+		return ic.followup("Join a voice channel first, then run `/session start`.")
 	}
 
 	sess, err := g.store.CreateSession(ctx, camp.ID, guildID, vs)
@@ -78,19 +87,25 @@ func (g *Gateway) sessionStart(ctx context.Context, ic *ictx, guildID string) er
 		logging.FromContext(ctx, g.log).Error("voice join failed",
 			"guild", guildID, "channel", vs, "err", err)
 		metrics.ComponentError("discord", "voice_join")
-		return ic.reply(
-			"⚠️ I couldn't join the voice channel to start recording. Please try again in a "+
-				"moment. Text commands (chat, `/ask`, `/recap`, etc.) still work.",
-			true)
+		return ic.followup(
+			"⚠️ I couldn't join the voice channel to start recording. Please try again in a " +
+				"moment. Text commands (chat, `/ask`, `/recap`, etc.) still work.")
 	}
-	return ic.reply("🔴 Recording started. Play on! Use `/session stop` when you're done.", false)
+	return ic.followup("🔴 Recording started. Play on! Use `/session stop` when you're done.")
 }
 
 func (g *Gateway) sessionStop(ctx context.Context, ic *ictx, guildID string) error {
 	log := logging.FromContext(ctx, g.log)
+
+	// Ack immediately (ephemeral) before the slow finalize/flush work so we
+	// never miss Discord's 3s window (see sessionStart).
+	if err := ic.ack(true); err != nil {
+		return err
+	}
+
 	sess, err := g.store.GetActiveSession(ctx, guildID)
 	if errors.Is(err, db.ErrNotFound) {
-		return ic.reply("No active session to stop.", true)
+		return ic.followup("No active session to stop.")
 	}
 	if err != nil {
 		return err
@@ -104,15 +119,10 @@ func (g *Gateway) sessionStop(ctx context.Context, ic *ictx, guildID string) err
 		log.Warn("stop with no in-memory recording; marking session failed",
 			"guild", guildID, "session", sess.ID)
 		_ = g.store.SetSessionResult(ctx, sess.ID, "", "", "failed")
-		return ic.reply(
-			"⚠️ I couldn't finalize that recording — I lost the live audio connection "+
-				"(the bot may have restarted or never fully joined). The session has been "+
-				"cleared; please run `/session start` again.",
-			true)
-	}
-
-	if err := ic.ack(false); err != nil {
-		return err
+		return ic.followup(
+			"⚠️ I couldn't finalize that recording — I lost the live audio connection " +
+				"(the bot may have restarted or never fully joined). The session has been " +
+				"cleared; please run `/session start` again.")
 	}
 
 	// Stop capture and flush the final tail chunk. The audio is stored as PCM

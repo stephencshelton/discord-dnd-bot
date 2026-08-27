@@ -22,6 +22,7 @@ import (
 	"github.com/disgoorg/disgo/events"
 	"github.com/disgoorg/disgo/gateway"
 	"github.com/disgoorg/disgo/voice"
+	"github.com/disgoorg/godave"
 	"github.com/disgoorg/snowflake/v2"
 	davesession "github.com/thomas-vilte/dave-go/session"
 
@@ -86,14 +87,21 @@ func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, 
 			cache.FlagChannels,
 		)),
 		// DAVE (E2EE voice) via the pure-Go dave-go backend. Required by Discord
-		// for all voice connections; without it voice fails with close 4017.
+		// for all voice connections; without it voice fails with close 4017. Can
+		// be disabled (falls back to the noop DAVE session, protocol v0) to
+		// isolate a stalling DAVE handshake — see DISCORD_DISABLE_DAVE.
 		bot.WithVoiceManagerConfigOpts(
-			voice.WithDaveSessionCreateFunc(davesession.CreateFunc()),
+			voice.WithDaveSessionCreateFunc(daveSessionCreateFunc(cfg.Discord.DisableDAVE)),
 		),
 		bot.WithEventListenerFunc(g.onReady),
 		bot.WithEventListenerFunc(g.onInteraction),
 		bot.WithEventListenerFunc(g.onAutocomplete),
 		bot.WithEventListenerFunc(g.onMessageCreate),
+		// Diagnostics for the voice handshake: these fire only when Discord sends
+		// the voice server/state for our bot, so their presence (or absence) in
+		// logs pinpoints where a /session voice join stalls.
+		bot.WithEventListenerFunc(g.onVoiceServerUpdate),
+		bot.WithEventListenerFunc(g.onVoiceStateUpdate),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create discord client: %w", err)
@@ -121,6 +129,18 @@ func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, 
 		}
 	}
 	return g, nil
+}
+
+// daveSessionCreateFunc returns the DAVE (E2EE voice) session factory: the real
+// pure-Go dave-go implementation (advertises DAVE protocol v1), or the noop
+// session (protocol v0, DAVE disabled) when disabled is true. Disabling is a
+// diagnostic/escape hatch for when the DAVE/MLS handshake stalls the voice
+// connection; note Discord may reject voice (close 4017) without DAVE.
+func daveSessionCreateFunc(disabled bool) godave.SessionCreateFunc {
+	if disabled {
+		return godave.NewNoopSession
+	}
+	return davesession.CreateFunc()
 }
 
 // Open connects to Discord and registers commands.
@@ -261,7 +281,35 @@ func (g *Gateway) dmRejectReason(userID string) string {
 }
 
 func (g *Gateway) onReady(_ *events.Ready) {
-	g.log.Info("discord ready")
+	g.log.Info("discord ready", "bot_id", g.client.ID().String())
+}
+
+// onVoiceServerUpdate logs the VOICE_SERVER_UPDATE that carries the voice
+// endpoint+token. disgo needs this to open the voice gateway; if a /session
+// join stalls and this never logs, Discord isn't sending it (or intents/routing
+// are wrong). Purely diagnostic — disgo's voice manager handles it internally.
+func (g *Gateway) onVoiceServerUpdate(e *events.VoiceServerUpdate) {
+	endpoint := ""
+	if e.Endpoint != nil {
+		endpoint = *e.Endpoint
+	}
+	g.log.Info("voice server update received",
+		"guild", e.GuildID.String(), "endpoint", endpoint, "has_token", e.Token != "")
+}
+
+// onVoiceStateUpdate logs our own bot's voice-state transitions (join/leave),
+// which carry the session_id disgo needs for the voice handshake.
+func (g *Gateway) onVoiceStateUpdate(e *events.GuildVoiceStateUpdate) {
+	if e.VoiceState.UserID != g.client.ID() {
+		return
+	}
+	ch := ""
+	if e.VoiceState.ChannelID != nil {
+		ch = e.VoiceState.ChannelID.String()
+	}
+	g.log.Info("bot voice state update",
+		"guild", e.VoiceState.GuildID.String(), "channel", ch,
+		"session_id_present", e.VoiceState.SessionID != "")
 }
 
 // displayName resolves a member's best display name (guild nick > global name >

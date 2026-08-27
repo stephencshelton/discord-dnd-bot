@@ -50,6 +50,12 @@ type DiscordConfig struct {
 	// enabled. Retained so existing env/values with DISCORD_ALLOW_DIRECT_MESSAGES
 	// still parse. Remove after the setting is dropped from deployments.
 	AllowDirectMessages bool `envconfig:"DISCORD_ALLOW_DIRECT_MESSAGES" default:"false"`
+	// DisableDAVE turns off Discord's DAVE end-to-end voice encryption handshake
+	// (advertises DAVE protocol version 0 / noop). DAVE is normally required, but
+	// if the pure-Go DAVE handshake stalls the voice connection ("context
+	// deadline exceeded" on /session start after the bot appears to join), this
+	// isolates whether DAVE is the cause. Default false (DAVE enabled).
+	DisableDAVE bool `envconfig:"DISCORD_DISABLE_DAVE" default:"false"`
 }
 
 // AllowedGuildIDs returns the configured command allowlist with empty and
