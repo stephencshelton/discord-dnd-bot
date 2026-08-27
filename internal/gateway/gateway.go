@@ -71,13 +71,21 @@ func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, 
 		// handshake) through our structured logger for diagnosability.
 		bot.WithLogger(log),
 		// Guild + voice-state intents for recording; message content for mention/DM.
-		bot.WithGatewayConfigOpts(gateway.WithIntents(
-			gateway.IntentGuilds,
-			gateway.IntentGuildVoiceStates,
-			gateway.IntentGuildMessages,
-			gateway.IntentDirectMessages,
-			gateway.IntentMessageContent,
-		)),
+		// Disable gateway stream compression: disgo master defaults to
+		// zstd-stream, whose decompressor can buffer events so the bot's own
+		// VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE arrive batched ~30s late,
+		// starving conn.Open of the events it waits on (voice never connects).
+		// Uncompressed delivers every event immediately.
+		bot.WithGatewayConfigOpts(
+			gateway.WithCompression(gateway.CompressionNone),
+			gateway.WithIntents(
+				gateway.IntentGuilds,
+				gateway.IntentGuildVoiceStates,
+				gateway.IntentGuildMessages,
+				gateway.IntentDirectMessages,
+				gateway.IntentMessageContent,
+			),
+		),
 		// Cache guilds, members and voice states so /session can resolve the
 		// caller's voice channel and voice recording can resolve display names.
 		bot.WithCacheConfigOpts(cache.WithCaches(
