@@ -151,4 +151,3 @@ func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 	}
 	return deleted, nil
 }
-
