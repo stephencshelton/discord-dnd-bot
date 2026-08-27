@@ -109,7 +109,6 @@ Configuration is loaded from environment variables. The same configuration is us
 | `LITELLM_EMBED_DIM` | No | `1536` | Embedding vector dimensionality; must match the embed model (sizes the pgvector column) |
 | `LITELLM_REQUEST_TIMEOUT` | No | `120s` | AI request timeout |
 | `LITELLM_UPLOAD_TIMEOUT` | No | `300s` | Timeout for multipart audio uploads |
-| `AUDIO_CHUNK_SECONDS` | No | `600` | Target seconds per transcription chunk (`0` = whole file) |
 | `AUDIO_SILENCE_TRIM` | No | `true` | Drop near-silent frames before upload to cut billed minutes |
 | `AUDIO_SILENCE_RMS_THRESHOLD` | No | `350` | Per-frame RMS (0–32767) treated as silence |
 | `AUDIO_MAX_SESSION_MINUTES` | No | `180` | Hard cap on a single recording's length to bound gateway memory (`0` = no cap) |
@@ -374,20 +373,6 @@ The bot is designed to scale gracefully in and out on Kubernetes:
   (via voice speaking events) into `session_participants`. Session notes are told
   *when* the session occurred and *who* was in the call, and `/session status`
   shows who has been heard so far.
-
-### Follow-up work (not yet implemented)
-
-These larger items are scoped but intentionally deferred; the code and schema
-are structured to accept them:
-
-- **Chunked parallel transcription** — split long recordings into
-  `AUDIO_CHUNK_SECONDS` segments transcribed as independent queue jobs across the
-  worker fleet, then merged. Config (`AUDIO_CHUNK_SECONDS`) is already wired.
-- **Grounded `/ask` (RAG)** — embed transcript chunks (`LITELLM_EMBED_MODEL`),
-  store vectors (pgvector migration `0004`), and answer campaign questions with
-  retrieved context. Config (`LITELLM_ASK_MODEL`, `LITELLM_EMBED_MODEL`) is wired.
-- **Per-SSRC capture** — record each speaker to a separate stream and stream to
-  object storage to bound gateway memory instead of buffering the whole session.
 
 ### Mapping logical routes to your LiteLLM inventory
 

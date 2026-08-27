@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/audio"
+	"github.com/stephencshelton/discord-dnd-bot/internal/config"
 )
 
 // newAnchoredRecording builds a recording with a single pre-anchored stream so
@@ -75,5 +76,63 @@ func TestFrameIndexHandlesTimestampWraparound(t *testing.T) {
 	// subtraction must still yield a delta of exactly one frame.
 	if got := r.frameIndexFor(ssrc, base+audio.FrameSize); got != 1001 {
 		t.Fatalf("post-wrap frame = %d, want 1001", got)
+	}
+}
+
+// newTrackRecording builds a recording ready to accept mixFrame calls, with an
+// empty per-user track map and a Gateway carrying a config (mixFrame reads the
+// session-length cap from it).
+func newTrackRecording() *recording {
+	return &recording{
+		tracks: map[string]*userTrack{},
+		g:      &Gateway{cfg: &config.Config{}},
+	}
+}
+
+func TestMixFrameSeparatesUsers(t *testing.T) {
+	r := newTrackRecording()
+	full := make([]int16, audio.FrameSize*audio.Channels)
+	for i := range full {
+		full[i] = 100
+	}
+
+	// Two users speak at overlapping absolute timeline slots. Each must land in
+	// its own track and NOT be summed together (that was the old bug — one mixed
+	// buffer meant Whisper couldn't tell speakers apart).
+	r.mixFrame("userA", 0, full)
+	r.mixFrame("userB", 0, full)
+	r.mixFrame("userA", 1, full)
+
+	if len(r.tracks) != 2 {
+		t.Fatalf("tracks = %d, want 2 (one per user)", len(r.tracks))
+	}
+	ta, tb := r.tracks["userA"], r.tracks["userB"]
+	if ta == nil || tb == nil {
+		t.Fatal("expected both userA and userB tracks")
+	}
+	if len(ta.frames) != 2 {
+		t.Fatalf("userA frames = %d, want 2", len(ta.frames))
+	}
+	if len(tb.frames) != 1 {
+		t.Fatalf("userB frames = %d, want 1", len(tb.frames))
+	}
+	// Each user's slot 0 holds its own single contribution (100), not the sum of
+	// both users (which would be 200 in the old mixed buffer).
+	if ta.frames[0][0] != 100 {
+		t.Errorf("userA slot0 = %d, want 100 (not summed with userB)", ta.frames[0][0])
+	}
+	if tb.frames[0][0] != 100 {
+		t.Errorf("userB slot0 = %d, want 100", tb.frames[0][0])
+	}
+}
+
+func TestMixFrameStartSeqOffsetsChunkNumbering(t *testing.T) {
+	r := newTrackRecording()
+	r.startSeq = 5 // resumed session already has chunks 1..5 in storage
+	frame := make([]int16, audio.FrameSize*audio.Channels)
+
+	r.mixFrame("userA", 0, frame)
+	if got := r.tracks["userA"].chunkSeq; got != 6 {
+		t.Fatalf("resumed track chunkSeq = %d, want 6 (startSeq+1)", got)
 	}
 }

@@ -61,6 +61,10 @@ type DiscordConfig struct {
 	// Set DISCORD_DISABLE_DAVE=true to fall back to the noop session (advertises
 	// DAVE v0): voice is then only transport-encrypted. Kept as an escape hatch.
 	DisableDAVE bool `envconfig:"DISCORD_DISABLE_DAVE" default:"false"`
+	// FeedbackDMUserID is the Discord user ID that receives a DM whenever someone
+	// submits /feedback. Feedback is always stored in the DB regardless; this is
+	// just a real-time notification. Empty disables the DM (DB-only).
+	FeedbackDMUserID string `envconfig:"DISCORD_FEEDBACK_DM_USER_ID" default:"396406966458515460"`
 }
 
 // AllowedGuildIDs returns the configured command allowlist with empty and
@@ -201,13 +205,8 @@ func firstNonEmpty(vals ...string) string {
 }
 
 // AudioConfig tunes recording/transcription behavior, letting a deployment
-// trade cost (silence trimming, chunk size) against latency without code
-// changes.
+// trade cost (silence trimming) against quality/latency without code changes.
 type AudioConfig struct {
-	// ChunkSeconds is the target length of each transcription segment; long
-	// sessions split into chunks transcribed as parallel queue jobs then merged.
-	// 0 disables chunking. Default 600s (10 min).
-	ChunkSeconds int `envconfig:"AUDIO_CHUNK_SECONDS" default:"600"`
 	// SilenceTrim enables dropping near-silent frames before upload to cut
 	// billed transcription minutes.
 	SilenceTrim bool `envconfig:"AUDIO_SILENCE_TRIM" default:"true"`
@@ -215,10 +214,20 @@ type AudioConfig struct {
 	// a frame is considered silence when SilenceTrim is enabled.
 	SilenceRMSThreshold int `envconfig:"AUDIO_SILENCE_RMS_THRESHOLD" default:"350"`
 	// MaxSessionMinutes hard-caps how long a recording stays in memory before
-	// auto-stopping. A mixed PCM buffer costs ~11.5 MB/minute, so this bounds a
-	// gateway pod's memory and stops a runaway recording from OOMing it. 0
-	// disables the cap. Default 180 (3h).
+	// auto-stopping. Audio is buffered per speaker and flushed to storage every
+	// ~30s (then freed), so gateway memory scales with CONCURRENT speech in a
+	// checkpoint window (~5.6 MB per simultaneously-talking user), not with
+	// session length. This caps total buffered frames across all speaker tracks
+	// so a runaway recording can't grow unbounded. 0 disables. Default 180 (3h).
 	MaxSessionMinutes int `envconfig:"AUDIO_MAX_SESSION_MINUTES" default:"180"`
+	// TranscribeSegmentMinutes bounds how much audio is sent in a single
+	// transcription request. Each speaker's (possibly multi-hour) track is split
+	// into segments of at most this many minutes; the STT backend's peak memory
+	// is then set by one segment, not the whole recording, so a long session no
+	// longer requires an oversized STT pod. Whisper transcribes in 30s windows
+	// internally so accuracy is unaffected by segmenting. 0 disables segmenting
+	// (send each track whole). Default 10.
+	TranscribeSegmentMinutes int `envconfig:"AUDIO_TRANSCRIBE_SEGMENT_MINUTES" default:"10"`
 }
 
 // WorkerConfig controls in-pod job concurrency. Combined with HPA on queue

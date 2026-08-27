@@ -74,6 +74,10 @@ config:
     # dave-go backend; requires the disgo RTP-padding decrypt fix (disgo #594).
     # Set true to fall back to transport-only encryption (noop DAVE session).
     disableDAVE: false
+    # Discord user ID that receives a DM whenever someone submits /feedback.
+    # Feedback is always stored in the DB regardless; this is just a real-time
+    # heads-up. Empty string disables the DM (DB-only).
+    feedbackDMUserID: "396406966458515460"
 
   database:
     # Connection is assembled from discrete parts so the password stays in the
@@ -161,17 +165,24 @@ config:
 
   # Recording / transcription tuning.
   audio:
-    # Target seconds per transcription chunk; long sessions are split into
-    # parallel jobs then merged. 0 disables chunking (single whole-file call).
-    chunkSeconds: 600
     # Drop near-silent frames before upload to cut billed transcription minutes.
     silenceTrim: true
     # Per-frame RMS amplitude (0..32767) below which a frame is treated as silence.
     silenceRMSThreshold: 350
-    # Hard cap on a single recording's length. A live mixed-PCM buffer costs
-    # ~11.5 MB/minute of gateway memory, so this bounds a pod's footprint and
-    # prevents one runaway session from OOMing it. 0 disables. Default 3h.
-    maxSessionMinutes: 180
+    # Hard cap on a single recording's length. Audio is buffered per speaker and
+    # flushed to storage every ~30s (then freed), so gateway memory scales with
+    # CONCURRENT speech in a checkpoint window (~5.6 MB per simultaneously-talking
+    # user), not with session length. This caps total buffered frames across all
+    # speaker tracks so one runaway session can't grow unbounded. 0 disables.
+    # Default 3h.
+    maxSessionMinutes: 300
+    # Bound how much audio is sent in a single transcription request. Each
+    # speaker's track is split into segments of at most this many minutes so the
+    # STT backend's peak memory is set by one segment, not the whole (possibly
+    # multi-hour) recording — a long session no longer needs an oversized STT
+    # pod. Whisper transcribes in 30s windows internally so accuracy is
+    # unaffected. 0 disables segmenting (send each track whole). Default 10.
+    transcribeSegmentMinutes: 10
 
   # In-pod job parallelism for worker replicas. Horizontal pod autoscaling on
   # queue depth handles scaling beyond a single pod.
@@ -308,10 +319,10 @@ gateway:
   resources:
     requests:
       cpu: "1"
-      memory: 512Mi
+      memory: 1Gi
     limits:
       cpu: "1"
-      memory: 512Mi
+      memory: 1Gi
   autoscaling:
     enabled: false
     minReplicas: 1
@@ -399,10 +410,10 @@ stt:
   resources:
     requests:
       cpu: "4"
-      memory: 6Gi
+      memory: 8Gi
     limits:
       cpu: "4"
-      memory: 6Gi
+      memory: 8Gi
   autoscaling:
     enabled: false
     minReplicas: 1

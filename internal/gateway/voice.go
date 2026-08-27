@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,8 +21,8 @@ import (
 )
 
 // voiceManager owns active voice recordings, one per guild. Opus packets are
-// tagged by SSRC (per speaker); each stream is decoded and time-aligned into
-// one mixed PCM buffer so transcription gets a single file.
+// tagged by SSRC (per speaker); each stream is decoded and time-aligned into a
+// PER-USER PCM track so transcription can attribute speech to the right player.
 //
 // With disgo the SSRC->user resolution is handled inside the voice connection,
 // so each received frame already carries the speaking user's ID.
@@ -46,35 +47,50 @@ type recording struct {
 	// read-only from the recording's perspective.
 	g *Gateway
 
-	// chunkPrefix is the object-storage prefix for this session's PCM checkpoints
-	// (chunkPrefix/chunk-000001.pcm, ...). chunkSeq is the next chunk number.
+	// chunkPrefix is the object-storage prefix for this session's PCM checkpoints.
+	// Per-user chunks live under chunkPrefix/<userID>/chunk-NNNNNN.pcm so each
+	// speaker's audio can be transcribed separately and merged with speaker labels.
 	chunkPrefix string
-	chunkSeq    int
+	// startSeq is the chunk number already present in storage per user at resume
+	// (0 for a fresh session); a resumed track's numbering continues after it.
+	startSeq int
 	// stop signals the checkpoint loop to exit; done is closed when it has.
 	stopCh chan struct{}
 	doneCh chan struct{}
 
 	mu       sync.Mutex
 	decoders map[uint32]*gopus.Decoder // per-SSRC Opus decoder
+	ssrcUser map[uint32]string         // SSRC -> speaking userID (for routing frames)
 	seen     map[string]bool           // userIDs already persisted this session
 	capped   bool
-	// frames is a SLIDING WINDOW of mixed stereo PCM, one 20ms slot per timeline
-	// index, holding only frames not yet checkpointed. frames[i] corresponds to
-	// absolute timeline index frameBase+i. After each checkpoint the flushed
-	// leading frames are dropped and frameBase advances, so memory stays bounded
-	// to ~one checkpoint interval regardless of session length (a 3h session no
-	// longer holds ~2GB in RAM). Packets are placed by RTP timestamp (see anchor)
-	// so concurrent speakers stay aligned and silence gaps leave empty slots.
-	frames [][]int16
-	// frameBase is the absolute timeline index of frames[0]. Everything before it
-	// has been uploaded to storage and freed. totalFrames is the absolute count
-	// of frames ever produced (frameBase+len(frames)); used for the session cap.
-	frameBase   int
-	totalFrames int
+	// tracks holds one sliding-window PCM buffer per speaking user, keyed by
+	// userID string. Each track only allocates frames for slots that user
+	// actually spoke, so total RAM scales with concurrent speech, not with the
+	// number of participants or session length. After each checkpoint the flushed
+	// leading frames of every track are dropped and its frameBase advances, so
+	// memory stays bounded to ~one checkpoint interval (preserves the earlier
+	// OOM fix, now per track).
+	tracks map[string]*userTrack
+	// totalFramesAll is the absolute count of frames ever produced across ALL
+	// tracks; used for the whole-session MaxSessionMinutes cap.
+	totalFramesAll int
 	// anchor maps each SSRC to its first packet's alignment: baseTS is that
 	// packet's RTP timestamp, baseFrame the ABSOLUTE timeline index (from
 	// wall-clock arrival). Later slots = baseFrame + (pkt.Timestamp-baseTS)/FrameSize.
+	// Kept per-SSRC (an SSRC belongs to one user) so each speaker's RTP clock is
+	// aligned to the shared session timeline independently.
 	anchor map[uint32]streamAnchor
+}
+
+// userTrack is one speaker's slice of the session timeline. frames[i] is the
+// mixed stereo PCM for absolute timeline index frameBase+i (only this user's
+// audio; a user's own rare overlapping packets are summed). chunkSeq is the next
+// per-user chunk number.
+type userTrack struct {
+	frames      [][]int16
+	frameBase   int
+	totalFrames int
+	chunkSeq    int
 }
 
 // streamAnchor ties one speaker's RTP clock to the shared session timeline.
@@ -121,11 +137,13 @@ func (m *voiceManager) join(guildID, channelID, sessionID string, startSeq int) 
 		started:     time.Now(),
 		g:           m.g,
 		chunkPrefix: chunkPrefixFor(guildID, sessionID),
-		chunkSeq:    startSeq + 1,
+		startSeq:    startSeq,
 		stopCh:      make(chan struct{}),
 		doneCh:      make(chan struct{}),
 		decoders:    make(map[uint32]*gopus.Decoder),
+		ssrcUser:    make(map[uint32]string),
 		seen:        make(map[string]bool),
+		tracks:      make(map[string]*userTrack),
 		anchor:      make(map[uint32]streamAnchor),
 	}
 
@@ -225,10 +243,36 @@ func chunkPrefixFor(guildID, sessionID string) string {
 	return fmt.Sprintf("sessions/%s/%s/chunks", guildID, sessionID)
 }
 
-// chunkKey returns the storage key for chunk number seq (zero-padded so lexical
-// order matches chronological order when the worker lists and stitches them).
+// userChunkPrefix returns the per-user sub-prefix under a session's chunk prefix.
+// Each speaker's PCM lives under its own userID directory so the worker can
+// transcribe tracks separately and merge them with speaker labels.
+func userChunkPrefix(prefix, userID string) string {
+	return fmt.Sprintf("%s/%s", prefix, userID)
+}
+
+// chunkKey returns the storage key for chunk number seq under a (per-user)
+// prefix, zero-padded so lexical order matches chronological order when the
+// worker lists and stitches them.
 func chunkKey(prefix string, seq int) string {
 	return fmt.Sprintf("%s/chunk-%06d.pcm", prefix, seq)
+}
+
+// maxChunkSeq returns the highest chunk sequence number embedded in a set of
+// chunk keys (chunk-NNNNNN.pcm), or 0 if none. Used at resume to continue
+// numbering after existing per-user chunks.
+func maxChunkSeq(keys []string) int {
+	max := 0
+	for _, k := range keys {
+		base := k
+		if i := strings.LastIndex(base, "/"); i >= 0 {
+			base = base[i+1:]
+		}
+		var seq int
+		if _, err := fmt.Sscanf(base, "chunk-%06d.pcm", &seq); err == nil && seq > max {
+			max = seq
+		}
+	}
+	return max
 }
 
 // mustSessionUUID parses a session ID string, returning the zero UUID on error
@@ -274,64 +318,92 @@ func (r *recording) checkpointLoop() {
 	}
 }
 
-// checkpoint uploads the frames accumulated since the last checkpoint as one
-// raw-PCM chunk and advances the flushed watermark. A no-op when nothing new.
+// checkpoint uploads each user's frames accumulated since the last checkpoint
+// as per-user raw-PCM chunks and advances the flushed watermark. A no-op when
+// nothing new.
 //
 // It holds back the most recent frames (holdbackFrames) from each periodic
 // flush so that late-arriving concurrent-speaker packets still land in the
 // in-memory slot before it's frozen into a chunk. The final flush at stop time
-// passes final=true to drain everything.
+// passes holdback=0 to drain everything.
 func (r *recording) checkpoint() error { return r.checkpointUpTo(holdbackFrames) }
 
 // holdbackFrames is ~1s of 20ms frames kept un-flushed on periodic checkpoints
 // so concurrent-speaker mixing settles before a slot is frozen.
 const holdbackFrames = 50
 
+// checkpointUpTo flushes every user track, holding back the most recent
+// `holdback` frames of each. Each track is uploaded to its own per-user chunk
+// key; on success the flushed frames are dropped from that track and its
+// frameBase advances (freeing RAM). Tracks are handled independently so one
+// user's failed upload doesn't stall another's.
 func (r *recording) checkpointUpTo(holdback int) error {
+	// Snapshot the per-track flush work under the lock.
+	type flushJob struct {
+		userID     string
+		seq        int
+		flushCount int
+		pcm        []int16
+	}
 	r.mu.Lock()
-	// Flush all but the last `holdback` frames in the live window.
-	flushCount := len(r.frames) - holdback
-	if flushCount <= 0 {
-		r.mu.Unlock()
-		return nil
+	jobs := make([]flushJob, 0, len(r.tracks))
+	for uid, t := range r.tracks {
+		flushCount := len(t.frames) - holdback
+		if flushCount <= 0 {
+			continue
+		}
+		pcm := make([]int16, 0, flushCount*audio.FrameSize*audio.Channels)
+		for _, f := range t.frames[:flushCount] {
+			pcm = append(pcm, f...)
+		}
+		jobs = append(jobs, flushJob{userID: uid, seq: t.chunkSeq, flushCount: flushCount, pcm: pcm})
 	}
-	// Copy the frames-to-flush out under the lock, then release it before the
-	// upload. We do NOT drop them from the window yet — only after a successful
-	// upload — so a failed PUT is retried with the same frames next tick.
-	toFlush := r.frames[:flushCount]
-	pcm := make([]int16, 0, len(toFlush)*audio.FrameSize*audio.Channels)
-	for _, f := range toFlush {
-		pcm = append(pcm, f...)
-	}
-	seq := r.chunkSeq
 	prefix := r.chunkPrefix
 	r.mu.Unlock()
 
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.LittleEndian, pcm); err != nil {
-		return fmt.Errorf("encode chunk: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	if _, err := r.g.storage.Put(ctx, chunkKey(prefix, seq), "application/octet-stream", buf); err != nil {
-		return fmt.Errorf("upload chunk %d: %w", seq, err)
+	if len(jobs) == 0 {
+		return nil
 	}
 
-	// Upload succeeded: drop the flushed frames from the front of the window and
-	// advance frameBase so their RAM is freed. Re-slice into a fresh backing
-	// array so the old (large) array can be GC'd rather than retained by the
-	// sub-slice's shared capacity.
-	r.mu.Lock()
-	remaining := r.frames[flushCount:]
-	kept := make([][]int16, len(remaining))
-	copy(kept, remaining)
-	r.frames = kept
-	r.frameBase += flushCount
-	r.chunkSeq++
-	r.mu.Unlock()
-	r.g.log.Info("checkpointed recording chunk",
-		"guild", r.guildID, "session", r.sessionID, "seq", seq, "frames", flushCount)
-	return nil
+	var firstErr error
+	for _, j := range jobs {
+		buf := new(bytes.Buffer)
+		if err := binary.Write(buf, binary.LittleEndian, j.pcm); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("encode chunk (user %s): %w", j.userID, err)
+			}
+			continue
+		}
+		key := chunkKey(userChunkPrefix(prefix, j.userID), j.seq)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		_, err := r.g.storage.Put(ctx, key, "application/octet-stream", buf)
+		cancel()
+		if err != nil {
+			// Leave this track's frames in place so the same chunk is retried
+			// next tick; don't advance its watermark.
+			if firstErr == nil {
+				firstErr = fmt.Errorf("upload chunk %d (user %s): %w", j.seq, j.userID, err)
+			}
+			continue
+		}
+
+		// Upload succeeded: drop the flushed frames from the front of this track
+		// and advance its frameBase so their RAM is freed. Re-slice into a fresh
+		// backing array so the old array can be GC'd.
+		r.mu.Lock()
+		if t := r.tracks[j.userID]; t != nil && t.chunkSeq == j.seq && len(t.frames) >= j.flushCount {
+			remaining := t.frames[j.flushCount:]
+			kept := make([][]int16, len(remaining))
+			copy(kept, remaining)
+			t.frames = kept
+			t.frameBase += j.flushCount
+			t.chunkSeq++
+		}
+		r.mu.Unlock()
+		r.g.log.Info("checkpointed recording chunk",
+			"guild", r.guildID, "session", r.sessionID, "user", j.userID, "seq", j.seq, "frames", j.flushCount)
+	}
+	return firstErr
 }
 
 // ReceiveOpusFrame is called by disgo for every received Opus frame with the
@@ -352,8 +424,9 @@ func (r *recording) ReceiveOpusFrame(userID snowflake.ID, pkt *voice.Packet) (er
 	}
 
 	// Persist the speaker the first time we see them (best effort, off-thread).
+	uid := ""
 	if userID != 0 {
-		uid := userID.String()
+		uid = userID.String()
 		r.mu.Lock()
 		firstSeen := !r.seen[uid]
 		if firstSeen {
@@ -366,7 +439,9 @@ func (r *recording) ReceiveOpusFrame(userID snowflake.ID, pkt *voice.Packet) (er
 		}
 	}
 
-	// Cap retained frames to bound memory (20ms/frame -> minutes*60*50).
+	// Cap retained frames to bound memory (20ms/frame -> minutes*60*50), counted
+	// across all per-user tracks so total RAM stays bounded regardless of party
+	// size.
 	maxFrames := 0
 	if m := r.g.cfg.Audio.MaxSessionMinutes; m > 0 {
 		maxFrames = m * 60 * 50
@@ -374,7 +449,7 @@ func (r *recording) ReceiveOpusFrame(userID snowflake.ID, pkt *voice.Packet) (er
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if maxFrames > 0 && r.totalFrames >= maxFrames {
+	if maxFrames > 0 && r.totalFramesAll >= maxFrames {
 		if !r.capped {
 			r.capped = true
 			r.g.log.Warn("recording hit max length; further audio dropped",
@@ -382,6 +457,18 @@ func (r *recording) ReceiveOpusFrame(userID snowflake.ID, pkt *voice.Packet) (er
 		}
 		return nil
 	}
+
+	// Route this SSRC to its speaking user so frames land in the right track.
+	// (disgo resolves SSRC->user; fall back to the SSRC itself if unknown so
+	// audio is never silently dropped.)
+	if uid == "" {
+		if u, ok := r.ssrcUser[pkt.SSRC]; ok {
+			uid = u
+		} else {
+			uid = fmt.Sprintf("ssrc-%d", pkt.SSRC)
+		}
+	}
+	r.ssrcUser[pkt.SSRC] = uid
 
 	dec, ok := r.decoders[pkt.SSRC]
 	if !ok {
@@ -403,7 +490,7 @@ func (r *recording) ReceiveOpusFrame(userID snowflake.ID, pkt *voice.Packet) (er
 	if derr != nil {
 		return nil
 	}
-	r.mixFrame(r.frameIndexFor(pkt.SSRC, pkt.Timestamp), pcm)
+	r.mixFrame(uid, r.frameIndexFor(pkt.SSRC, pkt.Timestamp), pcm)
 	return nil
 }
 
@@ -462,39 +549,50 @@ func (r *recording) frameIndexFor(ssrc uint32, ts uint32) int {
 	return idx
 }
 
-// mixFrame sums a decoded stereo frame into the timeline at ABSOLUTE index idx,
-// extending the sliding window as needed. Frames whose absolute index is below
-// frameBase have already been checkpointed and freed, so a late packet for one
-// is dropped. A corrupt/huge RTP-derived idx is clamped (dropped) rather than
-// allowed to force a giant allocation. Caller holds r.mu.
-func (r *recording) mixFrame(idx int, pcm []int16) {
+// mixFrame writes a decoded stereo frame into the given user's track at ABSOLUTE
+// timeline index idx, extending that track's sliding window as needed. Frames
+// whose absolute index is below the track's frameBase have already been
+// checkpointed and freed, so a late packet for one is dropped. A corrupt/huge
+// RTP-derived idx is clamped (dropped) rather than allowed to force a giant
+// allocation. A user's own overlapping packets for the same slot are summed.
+// Caller holds r.mu.
+func (r *recording) mixFrame(userID string, idx int, pcm []int16) {
 	if idx < 0 {
-		return
-	}
-	// Already flushed & freed — can't retroactively mix. Rare (only within the
-	// checkpoint holdback window); the frame is already durably uploaded.
-	if idx < r.frameBase {
-		return
-	}
-	local := idx - r.frameBase
-	// A legitimate gap is silence; more than ~1h ahead of the window tail
-	// indicates a bogus timestamp — drop it rather than allocate.
-	const maxGapFrames = 180000
-	if local > len(r.frames)+maxGapFrames {
 		return
 	}
 	// Respect the overall session cap (absolute).
 	if m := r.g.cfg.Audio.MaxSessionMinutes; m > 0 && idx >= m*60*50 {
 		return
 	}
-	for len(r.frames) <= local {
-		r.frames = append(r.frames, make([]int16, audio.FrameSize*audio.Channels))
+	t := r.tracks[userID]
+	if t == nil {
+		// New track. A resumed session already has startSeq chunks in storage for
+		// (potentially) this user, so continue numbering after them.
+		t = &userTrack{chunkSeq: r.startSeq + 1}
+		r.tracks[userID] = t
 	}
-	// Track the absolute high-water mark for the session cap.
-	if abs := r.frameBase + len(r.frames); abs > r.totalFrames {
-		r.totalFrames = abs
+	// Already flushed & freed — can't retroactively mix. Rare (only within the
+	// checkpoint holdback window); the frame is already durably uploaded.
+	if idx < t.frameBase {
+		return
 	}
-	dst := r.frames[local]
+	local := idx - t.frameBase
+	// A legitimate gap is silence; more than ~1h ahead of the window tail
+	// indicates a bogus timestamp — drop it rather than allocate.
+	const maxGapFrames = 180000
+	if local > len(t.frames)+maxGapFrames {
+		return
+	}
+	for len(t.frames) <= local {
+		t.frames = append(t.frames, make([]int16, audio.FrameSize*audio.Channels))
+	}
+	// Track the per-track high-water mark and the cross-track total for the cap.
+	if abs := t.frameBase + len(t.frames); abs > t.totalFrames {
+		delta := abs - t.totalFrames
+		t.totalFrames = abs
+		r.totalFramesAll += delta
+	}
+	dst := t.frames[local]
 	n := len(pcm)
 	if n > len(dst) {
 		n = len(dst)
@@ -612,14 +710,18 @@ func (m *voiceManager) resumeActive(ctx context.Context) {
 				"session", sess.ID, "guild", sess.GuildID)
 			continue
 		}
-		// Continue chunk numbering after whatever is already in storage.
+		// Continue chunk numbering after whatever is already in storage. Chunks
+		// are per-user (chunkPrefix/<userID>/chunk-NNN.pcm); use the highest chunk
+		// number seen across all users so a resumed track never overwrites its
+		// existing chunks (per-user numbering is independent, so the shared base
+		// is safe and simply leaves gaps).
 		prefix := sess.ChunkPrefix
 		if prefix == "" {
 			prefix = chunkPrefixFor(sess.GuildID, sess.ID.String())
 		}
 		lastSeq := 0
 		if keys, lerr := m.g.storage.List(ctx, prefix); lerr == nil {
-			lastSeq = len(keys)
+			lastSeq = maxChunkSeq(keys)
 		}
 		if err := m.join(sess.GuildID, sess.VoiceChannelID, sess.ID.String(), lastSeq); err != nil {
 			m.g.log.Warn("failed to resume recording; leaving for reaper",

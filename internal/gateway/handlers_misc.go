@@ -104,7 +104,43 @@ func (g *Gateway) handleFeedback(ctx context.Context, ic *ictx) error {
 	if err := g.store.AddFeedback(ctx, ic.guildID(), ic.userID(), msg); err != nil {
 		return err
 	}
+	// Best-effort real-time notification to the maintainer's DM. Storage above is
+	// the source of truth, so a delivery failure here must not fail the command.
+	g.notifyFeedback(ctx, ic.guildID(), ic.userID(), ic.displayName(), msg)
 	return ic.reply("🙏 Thank you! Your feedback was recorded.", true)
+}
+
+// notifyFeedback DMs the configured maintainer with a feedback submission. It
+// logs and swallows any error: feedback is already persisted, so the user's
+// command should still succeed even if the DM can't be delivered.
+func (g *Gateway) notifyFeedback(ctx context.Context, guildID, userID, displayName, msg string) {
+	targetID := g.cfg.Discord.FeedbackDMUserID
+	if strings.TrimSpace(targetID) == "" {
+		return
+	}
+	uid, err := snowflake.Parse(targetID)
+	if err != nil {
+		g.log.Error("parse feedback DM user id", "user", targetID, "err", err)
+		return
+	}
+	dm, err := g.client.Rest.CreateDMChannel(uid)
+	if err != nil {
+		g.log.Error("open feedback DM channel", "err", err)
+		return
+	}
+	from := displayName
+	if from == "" {
+		from = userID
+	}
+	guild := guildID
+	if guild == "" {
+		guild = "DM"
+	}
+	content := fmt.Sprintf("📝 **New feedback** from **%s** (`%s`) in guild `%s`:\n> %s",
+		from, userID, guild, msg)
+	if _, err := g.client.Rest.CreateMessage(dm.ID(), discord.MessageCreate{Content: content}); err != nil {
+		g.log.Error("send feedback DM", "err", err)
+	}
 }
 
 // handleDMServer lets a user who shares multiple servers with the bot choose
