@@ -176,13 +176,6 @@ config:
     # speaker tracks so one runaway session can't grow unbounded. 0 disables.
     # Default 3h.
     maxSessionMinutes: 300
-    # Bound how much audio is sent in a single transcription request. Each
-    # speaker's track is split into segments of at most this many minutes so the
-    # STT backend's peak memory is set by one segment, not the whole (possibly
-    # multi-hour) recording — a long session no longer needs an oversized STT
-    # pod. Whisper transcribes in 30s windows internally so accuracy is
-    # unaffected. 0 disables segmenting (send each track whole). Default 10.
-    transcribeSegmentMinutes: 10
 
   # In-pod job parallelism for worker replicas. Horizontal pod autoscaling on
   # queue depth handles scaling beyond a single pod.
@@ -319,10 +312,10 @@ gateway:
   resources:
     requests:
       cpu: "1"
-      memory: 1Gi
+      memory: 2Gi
     limits:
       cpu: "1"
-      memory: 1Gi
+      memory: 2Gi
   autoscaling:
     enabled: false
     minReplicas: 1
@@ -349,10 +342,10 @@ worker:
   resources:
     requests:
       cpu: 2
-      memory: 1Gi
+      memory: 2Gi
     limits:
       cpu: "2"
-      memory: 1Gi
+      memory: 2Gi
   autoscaling:
     enabled: true
     minReplicas: 1
@@ -523,7 +516,7 @@ redis:
   resources:
     requests:
       cpu: "500m"
-      memory: 256Mi
+      memory: 512Mi
     limits:
       cpu: "500m"
-      memory: 256Mi
+      memory: 512Mi
