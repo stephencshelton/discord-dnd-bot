@@ -33,6 +33,20 @@ var (
 		Help: "Jobs processed by the worker, by type and status.",
 	}, []string{"type", "status"})
 
+	// JobsRetried counts jobs the worker put back on the queue after a
+	// retryable failure, by type. High values indicate a flaky dependency.
+	JobsRetried = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "discord_dnd_bot_jobs_retried_total",
+		Help: "Jobs requeued by the worker after a retryable failure, by type.",
+	}, []string{"type"})
+
+	// JobsDropped counts jobs abandoned by the worker, by type and reason
+	// (max_retries_exceeded|permanent). These jobs will not run again.
+	JobsDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "discord_dnd_bot_jobs_dropped_total",
+		Help: "Jobs abandoned by the worker (no retry), by type and reason.",
+	}, []string{"type", "reason"})
+
 	// JobDuration observes job processing latency.
 	JobDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "discord_dnd_bot_job_duration_seconds",

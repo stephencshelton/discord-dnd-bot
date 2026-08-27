@@ -188,6 +188,11 @@ config:
     transcribeJobTimeout: 4h
     # Max time for non-transcribe jobs (art, reindex).
     jobTimeout: 15m
+    # How many times a job is requeued after a transient failure before it is
+    # abandoned. Attempt 0 is the first try, so maxRetries: 3 => at most 4 runs.
+    # Permanent failures (bad input, no audio) are never retried. 0 disables
+    # retries (a failed job is dropped immediately).
+    maxRetries: 3
 
 # -------------------------------------------------------------------------
 # Object-storage bucket provisioning via AWS Controllers for Kubernetes (ACK).

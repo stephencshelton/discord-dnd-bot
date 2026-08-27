@@ -23,14 +23,20 @@ import (
 // handleTranscribeSession downloads the recorded audio, transcribes it, writes
 // session notes with the chat model, persists both, and posts the notes to the
 // guild's configured notes channel.
-func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessage) error {
+//
+// lastAttempt is true when the worker will NOT retry this job again if it fails
+// (retries exhausted). Transient failures only surface a user-visible "failed"
+// message on the last attempt, so an intermittent LiteLLM/storage blip that
+// succeeds on retry stays invisible to players. Failures that can never succeed
+// on retry are wrapped with queue.Permanent so the worker drops them at once.
+func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessage, lastAttempt bool) error {
 	p, err := unmarshal[queue.TranscribeSessionPayload](raw)
 	if err != nil {
-		return fmt.Errorf("decode payload: %w", err)
+		return queue.Permanent(fmt.Errorf("decode payload: %w", err))
 	}
 	sessionID, err := uuid.Parse(p.SessionID)
 	if err != nil {
-		return fmt.Errorf("parse session id: %w", err)
+		return queue.Permanent(fmt.Errorf("parse session id: %w", err))
 	}
 
 	sess, err := w.store.GetSession(ctx, sessionID)
@@ -55,12 +61,17 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 	// crash only drops the downtime window, not the earlier audio.
 	tracks, err := w.reassembleSessionAudio(ctx, sess)
 	if err != nil {
-		w.markFailed(ctx, sessionID, p.GuildID, "I couldn't read the recording from storage.")
+		// Storage read failure is usually transient — only tell the players it
+		// failed once we've stopped retrying.
+		if lastAttempt {
+			w.markFailed(ctx, sessionID, p.GuildID, "I couldn't read the recording from storage.")
+		}
 		return fmt.Errorf("reassemble audio: %w", err)
 	}
 	if len(tracks) == 0 {
+		// No audio ever made it to storage — retrying can't conjure it.
 		w.markFailed(ctx, sessionID, p.GuildID, "No audio was captured for that session.")
-		return fmt.Errorf("session %s has no audio", sessionID)
+		return queue.Permanent(fmt.Errorf("session %s has no audio", sessionID))
 	}
 
 	// 2) Transcribe each speaker's track separately (provider-agnostic, via the
@@ -69,12 +80,15 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 	transcript, err := w.transcribeTracks(ctx, tracks, names)
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("transcribe", "error").Inc()
-		w.markFailed(ctx, sessionID, p.GuildID, "Transcription failed. Please try again later.")
+		if lastAttempt {
+			w.markFailed(ctx, sessionID, p.GuildID, "Transcription failed. Please try again later.")
+		}
 		return fmt.Errorf("transcribe: %w", err)
 	}
 	if strings.TrimSpace(transcript) == "" {
+		// The recording had no speech — a retry produces the same empty result.
 		w.markFailed(ctx, sessionID, p.GuildID, "The recording had no discernible speech to transcribe.")
-		return fmt.Errorf("session %s produced an empty transcript", sessionID)
+		return queue.Permanent(fmt.Errorf("session %s produced an empty transcript", sessionID))
 	}
 	metrics.AIRequests.WithLabelValues("transcribe", "ok").Inc()
 
@@ -100,9 +114,16 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 	}, 2000)
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("chat", "error").Inc()
-		// We still keep the transcript so nothing is lost.
-		_ = w.store.SetSessionResult(ctx, sessionID, transcript, "", "failed")
-		w.notify(p.GuildID, sess.VoiceChannelID, "I transcribed the session but couldn't write the notes. Your transcript is saved.")
+		// A chat failure is usually transient. Keep the transcript either way so
+		// nothing is lost, but only mark the session failed / notify players once
+		// retries are exhausted — a retry may well produce the notes. Saving the
+		// transcript with status "processing" lets a retry re-run summarization.
+		if lastAttempt {
+			_ = w.store.SetSessionResult(ctx, sessionID, transcript, "", "failed")
+			w.notify(p.GuildID, sess.VoiceChannelID, "I transcribed the session but couldn't write the notes. Your transcript is saved.")
+		} else {
+			_ = w.store.SetSessionResult(ctx, sessionID, transcript, "", "processing")
+		}
 		return fmt.Errorf("summarize: %w", err)
 	}
 	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
@@ -128,22 +149,19 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 	return nil
 }
 
-// userAudio is one speaker's reassembled recording as interleaved 48kHz stereo
-// int16 PCM. It is WAV-encoded per segment at transcription time so no single
-// full-track WAV copy is held in worker memory.
+// userAudio is one speaker's reassembled recording, ready for transcription.
 type userAudio struct {
 	userID string
-	pcm    []int16
+	wav    []byte
 }
 
 // reassembleSessionAudio downloads the session's per-user PCM checkpoint chunks
-// and reassembles one PCM track per speaker. Chunks live under
+// and reassembles one WAV per speaker. Chunks live under
 // sessions/<guild>/<session>/chunks/<userID>/chunk-NNNNNN.pcm; concatenating a
 // user's chunks in order reconstructs that speaker's track. If a pod crashed
 // mid-session, only the chunks that made it to storage are present — the
 // downtime gap is simply absent. Tracks are returned sorted by userID for a
-// stable transcript order. WAV encoding is deferred to transcription time (per
-// segment) so no full-track WAV copy is held here.
+// stable transcript order.
 //
 // Backward compatibility: a session recorded before per-user tracks stored a
 // single flat set of chunks directly under .../chunks/. Those are returned as
@@ -207,7 +225,11 @@ func (w *Worker) reassembleSessionAudio(ctx context.Context, sess *db.Session) (
 		if len(pcm) == 0 {
 			continue // track was all silence
 		}
-		tracks = append(tracks, userAudio{userID: uid, pcm: pcm})
+		var buf bytes.Buffer
+		if err := audio.WriteWAV(&buf, pcm, audio.SampleRate, audio.Channels); err != nil {
+			return nil, fmt.Errorf("encode wav (user %s): %w", uid, err)
+		}
+		tracks = append(tracks, userAudio{userID: uid, wav: buf.Bytes()})
 	}
 	return tracks, nil
 }
@@ -217,52 +239,20 @@ func (w *Worker) reassembleSessionAudio(ctx context.Context, sess *db.Session) (
 // display name (falling back to the userID, or "Unknown speaker") so the notes
 // summarizer knows who said what. A single flat/legacy track (userID "") is
 // returned unlabeled. Uses the long-timeout transcribe client.
-//
-// Each track is split into segments of at most cfg.Audio.TranscribeSegmentMinutes
-// (with a small overlap to avoid clipping words at a boundary) so the STT
-// backend's peak memory is bounded by one segment rather than a whole (possibly
-// multi-hour) recording. A track's segment transcripts are joined in order to
-// form that speaker's block.
 func (w *Worker) transcribeTracks(ctx context.Context, tracks []userAudio, names map[string]string) (string, error) {
-	// Segment sizing (in interleaved int16 samples). A frame is FrameSize*Channels
-	// samples of 20ms; keep segments frame-aligned. overlap ~= 3s of audio.
-	frameSamples := audio.FrameSize * audio.Channels
-	framesPerSec := audio.SampleRate / audio.FrameSize
-	segmentSamples := 0 // 0 => SegmentPCM returns the whole track (segmenting off)
-	if m := w.cfg.Audio.TranscribeSegmentMinutes; m > 0 {
-		segmentSamples = m * 60 * framesPerSec * frameSamples
-	}
-	overlapSamples := 3 * framesPerSec * frameSamples
-
 	var b strings.Builder
 	for _, t := range tracks {
-		segments := audio.SegmentPCM(t.pcm, segmentSamples, overlapSamples)
-		var text strings.Builder
-		for i, seg := range segments {
-			var buf bytes.Buffer
-			if err := audio.WriteWAV(&buf, seg, audio.SampleRate, audio.Channels); err != nil {
-				return "", fmt.Errorf("encode wav (user %s seg %d): %w", t.userID, i, err)
-			}
-			st, err := w.transcribeAI.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", bytes.NewReader(buf.Bytes()))
-			if err != nil {
-				return "", fmt.Errorf("transcribe track %s seg %d/%d: %w", t.userID, i+1, len(segments), err)
-			}
-			st = strings.TrimSpace(st)
-			if st == "" {
-				continue
-			}
-			if text.Len() > 0 {
-				text.WriteByte(' ')
-			}
-			text.WriteString(st)
+		text, err := w.transcribeAI.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", bytes.NewReader(t.wav))
+		if err != nil {
+			return "", fmt.Errorf("transcribe track %s: %w", t.userID, err)
 		}
-		trackText := strings.TrimSpace(text.String())
-		if trackText == "" {
+		text = strings.TrimSpace(text)
+		if text == "" {
 			continue
 		}
 		// Legacy single unlabeled track: return the text as-is.
 		if t.userID == "" && len(tracks) == 1 {
-			return trackText, nil
+			return text, nil
 		}
 		label := names[t.userID]
 		if label == "" {
@@ -275,7 +265,7 @@ func (w *Worker) transcribeTracks(ctx context.Context, tracks []userAudio, names
 		if b.Len() > 0 {
 			b.WriteString("\n\n")
 		}
-		fmt.Fprintf(&b, "=== %s ===\n%s", label, trackText)
+		fmt.Fprintf(&b, "=== %s ===\n%s", label, text)
 	}
 	return b.String(), nil
 }

@@ -220,14 +220,6 @@ type AudioConfig struct {
 	// session length. This caps total buffered frames across all speaker tracks
 	// so a runaway recording can't grow unbounded. 0 disables. Default 180 (3h).
 	MaxSessionMinutes int `envconfig:"AUDIO_MAX_SESSION_MINUTES" default:"180"`
-	// TranscribeSegmentMinutes bounds how much audio is sent in a single
-	// transcription request. Each speaker's (possibly multi-hour) track is split
-	// into segments of at most this many minutes; the STT backend's peak memory
-	// is then set by one segment, not the whole recording, so a long session no
-	// longer requires an oversized STT pod. Whisper transcribes in 30s windows
-	// internally so accuracy is unaffected by segmenting. 0 disables segmenting
-	// (send each track whole). Default 10.
-	TranscribeSegmentMinutes int `envconfig:"AUDIO_TRANSCRIBE_SEGMENT_MINUTES" default:"10"`
 }
 
 // WorkerConfig controls in-pod job concurrency. Combined with HPA on queue
@@ -243,6 +235,12 @@ type WorkerConfig struct {
 	TranscribeJobTimeout time.Duration `envconfig:"WORKER_TRANSCRIBE_JOB_TIMEOUT" default:"4h"`
 	// JobTimeout bounds non-transcribe jobs (art, reindex).
 	JobTimeout time.Duration `envconfig:"WORKER_JOB_TIMEOUT" default:"15m"`
+	// MaxRetries is how many times a job is requeued after a transient failure
+	// before it is abandoned. Attempt 0 is the first try, so with MaxRetries=3 a
+	// job runs at most 4 times total. Permanent failures (bad input, no audio)
+	// are never retried regardless of this setting. 0 disables retries entirely
+	// (a failed job is dropped immediately, the pre-retry behavior).
+	MaxRetries int `envconfig:"WORKER_MAX_RETRIES" default:"3"`
 }
 
 // Load reads configuration from the environment. It returns an error only for

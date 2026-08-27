@@ -139,6 +139,38 @@ func (s *Store) GetSession(ctx context.Context, id uuid.UUID) (*Session, error) 
 	return &sess, err
 }
 
+// ListSessionsByStatusForGuild returns a guild's most-recent sessions in the
+// given status, newest first. Used by the admin `/session list` command to show
+// stuck/failed recordings that may need requeuing. A limit <= 0 defaults to 10
+// and is capped at 25 (Discord embed-field friendly).
+func (s *Store) ListSessionsByStatusForGuild(ctx context.Context, guildID, status string, limit int) ([]Session, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 25 {
+		limit = 25
+	}
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT id, campaign_id, guild_id, COALESCE(voice_channel_id,''), status,
+		        COALESCE(chunk_prefix,''), started_at
+		 FROM sessions WHERE guild_id=$1 AND status=$2
+		 ORDER BY started_at DESC LIMIT $3`, guildID, status, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Session
+	for rows.Next() {
+		var sess Session
+		if err := rows.Scan(&sess.ID, &sess.CampaignID, &sess.GuildID, &sess.VoiceChannelID,
+			&sess.Status, &sess.ChunkPrefix, &sess.StartedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, sess)
+	}
+	return out, rows.Err()
+}
+
 // RecentCompletedNotes returns up to `limit` most-recent completed session notes
 // for a campaign, oldest first (so a recap reads chronologically).
 func (s *Store) RecentCompletedNotes(ctx context.Context, campaignID uuid.UUID, limit int) ([]string, error) {

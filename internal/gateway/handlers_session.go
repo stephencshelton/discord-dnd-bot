@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/disgoorg/snowflake/v2"
+	"github.com/google/uuid"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
 	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
@@ -29,6 +30,10 @@ func (g *Gateway) handleSession(ctx context.Context, ic *ictx) error {
 		return g.sessionStop(ctx, ic, guildID)
 	case "status":
 		return g.sessionStatus(ctx, ic, guildID)
+	case "list":
+		return g.sessionList(ctx, ic, guildID)
+	case "requeue":
+		return g.sessionRequeue(ctx, ic, guildID)
 	}
 	return fmt.Errorf("unknown session subcommand %q", ic.subcommand())
 }
@@ -165,6 +170,78 @@ func (g *Gateway) sessionStatus(ctx context.Context, ic *ictx, guildID string) e
 		msg += "\n**Heard so far:** " + strings.Join(names, ", ")
 	}
 	return ic.reply(msg, true)
+}
+
+// sessionList shows a guild's recent sessions in a given status (default
+// "failed") so anyone can spot stuck/failed recordings and grab their IDs for
+// `/session requeue`.
+func (g *Gateway) sessionList(ctx context.Context, ic *ictx, guildID string) error {
+	status := ic.optString("status")
+	if status == "" {
+		status = "failed"
+	}
+	sessions, err := g.store.ListSessionsByStatusForGuild(ctx, guildID, status, 15)
+	if err != nil {
+		return err
+	}
+	if len(sessions) == 0 {
+		return ic.reply(fmt.Sprintf("No sessions with status **%s**.", status), true)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Sessions — status `%s`** (newest first):\n", status)
+	for _, s := range sessions {
+		fmt.Fprintf(&b, "• `%s` — started <t:%d:f>\n", s.ID, s.StartedAt.Unix())
+	}
+	if status == "failed" || status == "processing" {
+		b.WriteString("\nRe-run one with `/session requeue session_id:<id>`.")
+	}
+	return ic.reply(b.String(), true)
+}
+
+// sessionRequeue re-enqueues the transcribe+notes job for an existing session,
+// letting anyone recover a recording whose worker job failed or was lost
+// (e.g. a crash before automatic retries were added, or after retries were
+// exhausted). The audio chunks still live in object storage, so reprocessing
+// rebuilds the transcript and notes from scratch.
+func (g *Gateway) sessionRequeue(ctx context.Context, ic *ictx, guildID string) error {
+	log := logging.FromContext(ctx, g.log)
+
+	id, err := uuid.Parse(strings.TrimSpace(ic.optString("session_id")))
+	if err != nil {
+		return ic.reply("That doesn't look like a valid session ID. Copy one from `/session list`.", true)
+	}
+
+	sess, err := g.store.GetSession(ctx, id)
+	if errors.Is(err, db.ErrNotFound) {
+		return ic.reply("No session with that ID.", true)
+	}
+	if err != nil {
+		return err
+	}
+	// Guard against cross-guild requeues: only act on this server's sessions.
+	if sess.GuildID != guildID {
+		return ic.reply("That session belongs to a different server.", true)
+	}
+	// A still-recording session hasn't been finalized, so there's nothing to
+	// transcribe yet — don't let a requeue race the live recorder.
+	if sess.Status == "recording" {
+		return ic.reply("That session is still recording. Stop it with `/session stop` first.", true)
+	}
+
+	// Move it back to processing so `/session list` reflects the retry and a
+	// concurrent requeue is less likely to double up.
+	if err := g.store.SetSessionResult(ctx, sess.ID, sess.Transcript, sess.Notes, "processing"); err != nil {
+		return err
+	}
+	if err := g.queue.Enqueue(ctx, queue.JobTranscribeSession, queue.TranscribeSessionPayload{
+		SessionID: sess.ID.String(),
+		GuildID:   guildID,
+	}); err != nil {
+		return err
+	}
+	metrics.JobsEnqueued.WithLabelValues(string(queue.JobTranscribeSession)).Inc()
+	log.Info("session requeued by admin", "session", sess.ID, "user", ic.userID())
+	return ic.reply(fmt.Sprintf("🔁 Requeued session `%s`. I'll post the notes when they're ready.", sess.ID), true)
 }
 
 // userVoiceChannel returns the voice channel ID the user is currently in.

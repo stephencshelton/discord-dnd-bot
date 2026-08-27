@@ -6,7 +6,6 @@ import (
 
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/rest"
-	"github.com/disgoorg/omit"
 	"github.com/disgoorg/snowflake/v2"
 )
 
@@ -84,8 +83,6 @@ func allCommandDefs() []discord.SlashCommandCreate {
 // allCommandSpecs is the single source of truth for every slash command and
 // whether it is DM-capable.
 func allCommandSpecs() []commandSpec {
-	adminPerm := discord.PermissionManageGuild
-
 	return []commandSpec{
 		{dm: true, def: discord.SlashCommandCreate{
 			Name:        "campaign",
@@ -174,6 +171,29 @@ func allCommandSpecs() []commandSpec {
 				discord.ApplicationCommandOptionSubCommand{Name: "start", Description: "Join your voice channel and start recording"},
 				discord.ApplicationCommandOptionSubCommand{Name: "stop", Description: "Stop recording and generate session notes"},
 				discord.ApplicationCommandOptionSubCommand{Name: "status", Description: "Show the current/last session status"},
+				discord.ApplicationCommandOptionSubCommand{
+					Name:        "list",
+					Description: "List recent sessions and their status",
+					Options: []discord.ApplicationCommandOption{
+						discord.ApplicationCommandOptionString{
+							Name:        "status",
+							Description: "Filter by status (default: failed)",
+							Choices: []discord.ApplicationCommandOptionChoiceString{
+								{Name: "failed", Value: "failed"},
+								{Name: "processing", Value: "processing"},
+								{Name: "recording", Value: "recording"},
+								{Name: "complete", Value: "complete"},
+							},
+						},
+					},
+				},
+				discord.ApplicationCommandOptionSubCommand{
+					Name:        "requeue",
+					Description: "Re-run transcription/notes for a session",
+					Options: []discord.ApplicationCommandOption{
+						discord.ApplicationCommandOptionString{Name: "session_id", Description: "Session ID from /session list", Required: true},
+					},
+				},
 			},
 		}},
 
@@ -241,18 +261,16 @@ func allCommandSpecs() []commandSpec {
 		}},
 
 		{dm: false, def: discord.SlashCommandCreate{
-			Name:                     "notes-channel",
-			Description:              "Set the channel where session notes are posted (admin)",
-			DefaultMemberPermissions: omit.NewPtr(adminPerm),
+			Name:        "notes-channel",
+			Description: "Set the channel where session notes are posted",
 			Options: []discord.ApplicationCommandOption{
 				discord.ApplicationCommandOptionChannel{Name: "channel", Description: "Target channel", Required: true, ChannelTypes: []discord.ChannelType{discord.ChannelTypeGuildText}},
 			},
 		}},
 
 		{dm: false, def: discord.SlashCommandCreate{
-			Name:                     "reindex",
-			Description:              "Rebuild /ask search memory from all completed sessions (admin)",
-			DefaultMemberPermissions: omit.NewPtr(adminPerm),
+			Name:        "reindex",
+			Description: "Rebuild /ask search memory from all completed sessions",
 		}},
 
 		{dm: true, def: discord.SlashCommandCreate{

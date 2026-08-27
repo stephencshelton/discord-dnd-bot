@@ -7,6 +7,7 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -37,6 +38,11 @@ type Job struct {
 	// CorrelationID ties this job back to the gateway interaction that enqueued
 	// it, so logs across gateway -> queue -> worker can be joined. Optional.
 	CorrelationID string `json:"correlation_id,omitempty"`
+	// Attempt counts how many times this job has been dequeued for processing.
+	// It starts at 0 on first enqueue and is incremented each time the worker
+	// requeues the job after a retryable failure. It bounds retries so a job
+	// that keeps failing can't loop forever.
+	Attempt int `json:"attempt,omitempty"`
 }
 
 // TranscribeSessionPayload carries the session to process.
@@ -62,6 +68,28 @@ type ReindexCampaignPayload struct {
 }
 
 const queueKey = "discord-dnd-bot:jobs"
+
+// ErrPermanent wraps a job failure that must NOT be retried — the input is
+// fundamentally bad (unparseable payload, missing session, no audio captured,
+// empty transcript) so re-running the job would only fail again. Handlers wrap
+// such errors with Permanent(); the worker checks with errors.Is and skips the
+// requeue. Everything else (transient LiteLLM/storage/network errors) is treated
+// as retryable.
+var ErrPermanent = errors.New("permanent job failure")
+
+// Permanent marks err as a non-retryable failure. It returns nil when err is nil
+// so it can wrap a call site cheaply. Use it in a job handler for failures where
+// retrying is pointless (bad input, missing data).
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrPermanent, err)
+}
+
+// IsPermanent reports whether err (or anything it wraps) is a permanent,
+// non-retryable failure.
+func IsPermanent(err error) bool { return errors.Is(err, ErrPermanent) }
 
 // Queue wraps a Redis client.
 type Queue struct {
@@ -110,6 +138,26 @@ func (q *Queue) Enqueue(ctx context.Context, jobType JobType, payload any) error
 		return err
 	}
 	metrics.JobsEnqueued.WithLabelValues(string(jobType)).Inc()
+	return nil
+}
+
+// Requeue pushes a previously-dequeued job back onto the queue with its Attempt
+// counter incremented, so a transient failure (a LiteLLM/storage blip, a pod
+// crash mid-job) can be retried rather than lost. Because Dequeue uses BRPOP —
+// which atomically removes the job from Redis — a failed job would otherwise
+// vanish; Requeue is how the worker puts it back. The job goes to the head
+// (LPush, same as Enqueue) so it will be picked up again promptly.
+func (q *Queue) Requeue(ctx context.Context, job *Job) error {
+	job.Attempt++
+	body, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+	if err := q.rdb.LPush(ctx, queueKey, body).Err(); err != nil {
+		metrics.ComponentError("redis", "requeue")
+		return err
+	}
+	metrics.JobsRetried.WithLabelValues(string(job.Type)).Inc()
 	return nil
 }
 

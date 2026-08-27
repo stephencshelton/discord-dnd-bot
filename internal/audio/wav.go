@@ -89,56 +89,6 @@ func WriteWAV(w io.Writer, pcm []int16, sampleRate, channels int) error {
 	return binary.Write(w, binary.LittleEndian, pcm)
 }
 
-// SegmentPCM splits interleaved PCM into consecutive segments of at most
-// segmentSamples int16 values each, with each segment after the first prefixed
-// by overlapSamples int16 values copied from the tail of the previous segment.
-//
-// Segmenting bounds the size of any single transcription request so the STT
-// backend's peak memory is set by one segment (e.g. ~10 minutes) rather than
-// the whole (possibly multi-hour) recording. The small overlap avoids clipping
-// a word straddling a segment boundary; a rare duplicated word at the seam is
-// harmless once the transcript is summarized.
-//
-// Both segmentSamples and overlapSamples should be a whole number of frames
-// (multiples of FrameSize*Channels) so segments start on a frame boundary.
-// segmentSamples <= 0 returns the whole input as a single segment. overlap is
-// clamped to [0, segmentSamples). The returned segments reference the input
-// backing array (no copy); callers must not mutate them.
-func SegmentPCM(pcm []int16, segmentSamples, overlapSamples int) [][]int16 {
-	if len(pcm) == 0 {
-		return nil
-	}
-	if segmentSamples <= 0 || len(pcm) <= segmentSamples {
-		return [][]int16{pcm}
-	}
-	if overlapSamples < 0 {
-		overlapSamples = 0
-	}
-	if overlapSamples >= segmentSamples {
-		overlapSamples = segmentSamples - 1
-	}
-	var segs [][]int16
-	// step is how far the window advances each iteration. The overlap is taken
-	// from the *end* of the prior window, so the window start regresses by
-	// overlapSamples relative to a non-overlapping split.
-	step := segmentSamples - overlapSamples
-	for start := 0; start < len(pcm); start += step {
-		lo := start - overlapSamples
-		if lo < 0 || len(segs) == 0 {
-			lo = start
-		}
-		end := start + segmentSamples
-		if end > len(pcm) {
-			end = len(pcm)
-		}
-		segs = append(segs, pcm[lo:end])
-		if end == len(pcm) {
-			break
-		}
-	}
-	return segs
-}
-
 // TrimSilence drops near-silent 20ms frames from interleaved PCM to cut billed
 // transcription duration. A frame is dropped when its RMS amplitude is below
 // rmsThreshold (0..32767); non-silent audio is left bit-for-bit unchanged.

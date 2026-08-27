@@ -178,7 +178,7 @@ func (w *Worker) process(ctx context.Context, job *queue.Job) {
 	var err error
 	switch job.Type {
 	case queue.JobTranscribeSession:
-		err = w.handleTranscribeSession(jobCtx, job.Payload)
+		err = w.handleTranscribeSession(jobCtx, job.Payload, w.isLastAttempt(job))
 	case queue.JobGenerateArt:
 		err = w.handleGenerateArt(jobCtx, job.Payload)
 	case queue.JobReindexCampaign:
@@ -190,7 +190,54 @@ func (w *Worker) process(ctx context.Context, job *queue.Job) {
 	if err != nil {
 		status = "error"
 		log.Error("job failed", "err", err)
+		w.maybeRequeue(ctx, job, log, err)
 	}
+}
+
+// isLastAttempt reports whether a retryable failure on this job would be its
+// final one (retries already exhausted). Handlers use it to decide whether to
+// surface a user-visible "failed" message now versus staying quiet while a
+// retry is still coming.
+func (w *Worker) isLastAttempt(job *queue.Job) bool {
+	return job.Attempt >= w.cfg.Worker.MaxRetries
+}
+
+// maybeRequeue decides what to do with a failed job. Permanent failures (bad
+// input, missing data — flagged with queue.Permanent) are dropped immediately
+// since a retry would only fail again. Transient failures are requeued with an
+// incremented attempt count until cfg.Worker.MaxRetries is exhausted, after
+// which the job is dropped. Requeuing uses the worker's run context (not the
+// per-job timeout context, which may already be cancelled).
+func (w *Worker) maybeRequeue(ctx context.Context, job *queue.Job, log *slog.Logger, jobErr error) {
+	if queue.IsPermanent(jobErr) {
+		log.Warn("job failed permanently; not retrying", "attempt", job.Attempt)
+		metrics.JobsDropped.WithLabelValues(string(job.Type), "permanent").Inc()
+		return
+	}
+	if job.Attempt >= w.cfg.Worker.MaxRetries {
+		log.Error("job exhausted retries; dropping",
+			"attempt", job.Attempt, "max_retries", w.cfg.Worker.MaxRetries)
+		metrics.JobsDropped.WithLabelValues(string(job.Type), "max_retries_exceeded").Inc()
+		return
+	}
+	// Don't try to requeue while shutting down — the enqueue would race the
+	// drain and likely fail; the job stays lost but that's the shutdown case.
+	if ctx.Err() != nil {
+		log.Warn("worker shutting down; not requeuing failed job", "attempt", job.Attempt)
+		metrics.JobsDropped.WithLabelValues(string(job.Type), "shutdown").Inc()
+		return
+	}
+	// Give the requeue a short, independent deadline so a slow/broken Redis
+	// can't wedge the worker loop.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := w.queue.Requeue(rctx, job); err != nil {
+		log.Error("failed to requeue job; it is lost", "attempt", job.Attempt, "err", err)
+		metrics.JobsDropped.WithLabelValues(string(job.Type), "requeue_failed").Inc()
+		return
+	}
+	log.Warn("requeued failed job for retry",
+		"next_attempt", job.Attempt, "max_retries", w.cfg.Worker.MaxRetries)
 }
 
 // unmarshal is a tiny helper to decode a job payload.
