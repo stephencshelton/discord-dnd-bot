@@ -28,26 +28,34 @@ import (
 
 // Worker holds the dependencies needed to process jobs.
 type Worker struct {
-	cfg     *config.Config
-	log     *slog.Logger
-	queue   *queue.Queue
-	store   *db.Store
-	ai      *litellm.Client
-	storage *storage.Store
-	discord rest.Rest // REST-only client for posting results (never a gateway)
+	cfg   *config.Config
+	log   *slog.Logger
+	queue *queue.Queue
+	store *db.Store
+	ai    *litellm.Client
+	// transcribeAI is a litellm client with a long HTTP timeout for audio
+	// transcription. The shared `ai` client uses the short RequestTimeout that's
+	// right for chat/embed but would abort a multi-hour Whisper transcription.
+	transcribeAI *litellm.Client
+	storage      *storage.Store
+	discord      rest.Rest // REST-only client for posting results (never a gateway)
 }
 
 // New builds a worker. The discord client is used only for REST calls
 // (posting messages / uploading files); it is never opened as a gateway.
 func New(cfg *config.Config, log *slog.Logger, q *queue.Queue, store *db.Store, ai *litellm.Client, st *storage.Store) (*Worker, error) {
+	// A separate client for transcription: its HTTP timeout must cover a whole
+	// (possibly multi-hour) recording, so it tracks the transcribe job timeout.
+	transcribeAI := litellm.New(cfg.LiteLLM.BaseURL, cfg.LiteLLM.APIKey, cfg.Worker.TranscribeJobTimeout, litellm.WithLogger(log))
 	return &Worker{
-		cfg:     cfg,
-		log:     log,
-		queue:   q,
-		store:   store,
-		ai:      ai,
-		storage: st,
-		discord: rest.New(rest.NewClient(cfg.Discord.Token)),
+		cfg:          cfg,
+		log:          log,
+		queue:        q,
+		store:        store,
+		ai:           ai,
+		transcribeAI: transcribeAI,
+		storage:      st,
+		discord:      rest.New(rest.NewClient(cfg.Discord.Token)),
 	}, nil
 }
 
@@ -141,7 +149,13 @@ func (w *Worker) process(ctx context.Context, job *queue.Job) {
 	)
 	ctx = logging.WithLogger(logging.WithCorrelationID(ctx, w.log, corrID), log)
 
-	jobCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	// Transcription of a long recording can take much longer than other jobs
+	// (CPU Whisper runs below realtime), so give it its own generous timeout.
+	timeout := w.cfg.Worker.JobTimeout
+	if job.Type == queue.JobTranscribeSession {
+		timeout = w.cfg.Worker.TranscribeJobTimeout
+	}
+	jobCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	status := "ok"

@@ -227,6 +227,13 @@ type WorkerConfig struct {
 	// Concurrency is jobs processed in parallel per pod, bounded so memory
 	// (each job buffers audio) stays predictable. Default 4.
 	Concurrency int `envconfig:"WORKER_CONCURRENCY" default:"4"`
+	// TranscribeJobTimeout bounds a single transcribe+summarize job. Whisper on
+	// CPU runs well below realtime, so a multi-hour recording can take tens of
+	// minutes; the default is generous so long sessions complete rather than
+	// being cancelled mid-transcription. Other job types use JobTimeout.
+	TranscribeJobTimeout time.Duration `envconfig:"WORKER_TRANSCRIBE_JOB_TIMEOUT" default:"4h"`
+	// JobTimeout bounds non-transcribe jobs (art, reindex).
+	JobTimeout time.Duration `envconfig:"WORKER_JOB_TIMEOUT" default:"15m"`
 }
 
 // Load reads configuration from the environment. It returns an error only for

@@ -50,8 +50,9 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 		return fmt.Errorf("session %s has no audio", sessionID)
 	}
 
-	// 2) Transcribe via LiteLLM (provider-agnostic).
-	transcript, err := w.ai.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", bytes.NewReader(audioBytes))
+	// 2) Transcribe via LiteLLM (provider-agnostic). Uses the transcribe client
+	// whose HTTP timeout covers a full (possibly multi-hour) recording.
+	transcript, err := w.transcribeAI.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", bytes.NewReader(audioBytes))
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("transcribe", "error").Inc()
 		w.markFailed(ctx, sessionID, p.GuildID, "Transcription failed. Please try again later.")

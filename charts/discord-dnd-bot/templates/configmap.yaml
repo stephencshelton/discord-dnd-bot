@@ -63,3 +63,5 @@ data:
   AUDIO_MAX_SESSION_MINUTES: {{ .Values.config.audio.maxSessionMinutes | quote }}
 
   WORKER_CONCURRENCY: {{ .Values.config.worker.concurrency | quote }}
+  WORKER_TRANSCRIBE_JOB_TIMEOUT: {{ .Values.config.worker.transcribeJobTimeout | quote }}
+  WORKER_JOB_TIMEOUT: {{ .Values.config.worker.jobTimeout | quote }}

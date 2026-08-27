@@ -177,6 +177,13 @@ config:
   # queue depth handles scaling beyond a single pod.
   worker:
     concurrency: 4
+    # Max time for a single transcribe+summarize job. CPU Whisper runs below
+    # realtime, so a multi-hour recording can take tens of minutes; keep this
+    # generous so long sessions finish instead of being cancelled. Must be >=
+    # the worst-case transcription time for your longest session.
+    transcribeJobTimeout: 4h
+    # Max time for non-transcribe jobs (art, reindex).
+    jobTimeout: 15m
 
 # -------------------------------------------------------------------------
 # Object-storage bucket provisioning via AWS Controllers for Kubernetes (ACK).
