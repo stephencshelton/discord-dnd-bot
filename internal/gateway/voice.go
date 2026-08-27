@@ -109,28 +109,7 @@ func (m *voiceManager) join(guildID, channelID, sessionID string, startSeq int) 
 		return fmt.Errorf("invalid channel id %q: %w", channelID, err)
 	}
 
-	// Clear any lingering/ghost voice session before joining. A prior attempt
-	// (or a crashed pod) can leave Discord believing the bot is still connected
-	// to a voice channel in this guild; when that happens the new join op is
-	// accepted but Discord withholds VOICE_SERVER_UPDATE/VOICE_STATE_UPDATE until
-	// something forces a reconciliation, so conn.Open hangs the full 30s and then
-	// only gets the events once our timeout sends the leave. To avoid that, send
-	// an explicit leave (channel_id=null) first, drop any stale disgo conn, and
-	// give Discord a moment to settle before the real join.
-	resetCtx, resetCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if verr := m.g.client.UpdateVoiceState(resetCtx, gid, nil, false, false); verr != nil {
-		m.g.log.Debug("pre-join voice-state reset failed (continuing)",
-			"guild", guildID, "err", verr)
-	}
-	resetCancel()
-	m.g.client.VoiceManager.RemoveConn(gid)
-	// Brief settle so Discord drops the old voice session before we re-join.
-	time.Sleep(1 * time.Second)
-
-	conn := m.g.client.VoiceManager.CreateConn(gid)
-
 	r := &recording{
-		conn:        conn,
 		sessionID:   sessionID,
 		guildID:     guildID,
 		channelID:   channelID,
@@ -145,40 +124,65 @@ func (m *voiceManager) join(guildID, channelID, sessionID string, startSeq int) 
 		anchor:      make(map[uint32]streamAnchor),
 	}
 
-	// Open the connection: self-mute (we never speak) but NOT self-deaf (we must
-	// hear). disgo negotiates the DAVE/E2EE handshake as part of Open, and only
-	// returns once the voice UDP + encryption (incl. DAVE) handshake completes.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	openStart := time.Now()
-	if err := conn.Open(ctx, cid, true /*selfMute*/, false /*selfDeaf*/); err != nil {
-		// Inspect the voice gateway state to localize the stall. If the gateway
-		// reached Ready (SSRC assigned) but Open still timed out, the UDP media
-		// path never completed the IP-discovery/SessionDescription round-trip —
-		// almost always outbound voice UDP being blocked by cluster egress (NAT
-		// gateway / security group only allowing TCP 443 for the websocket). If
-		// the gateway never reached Ready, the voice websocket itself stalled.
+	// Connect to the voice gateway, retrying on timeout. Discord sometimes
+	// withholds VOICE_SERVER_UPDATE/VOICE_STATE_UPDATE in response to the first
+	// join op-4 (leaving conn.Open waiting on both events, disgo #580) — often
+	// after a reconnect or a prior half-open attempt. Each failed attempt's
+	// conn.Close sends a leave op-4, which reliably prods Discord to deliver the
+	// events, so a subsequent attempt with a fresh conn succeeds. We recreate the
+	// conn per attempt (RemoveConn+CreateConn) so no stale state carries over.
+	const (
+		maxAttempts    = 3
+		perAttemptOpen = 12 * time.Second
+	)
+	var conn voice.Conn
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		m.g.client.VoiceManager.RemoveConn(gid)
+		conn = m.g.client.VoiceManager.CreateConn(gid)
+		r.conn = conn
+
+		ctx, cancel := context.WithTimeout(context.Background(), perAttemptOpen)
+		openStart := time.Now()
+		err := conn.Open(ctx, cid, true /*selfMute*/, false /*selfDeaf*/)
+		cancel()
+		if err == nil {
+			m.g.log.Info("voice conn opened",
+				"guild", guildID, "channel", channelID, "session", sessionID,
+				"attempt", attempt, "elapsed_ms", time.Since(openStart).Milliseconds())
+			lastErr = nil
+			break
+		}
+		lastErr = err
+
 		var gwStatus voice.Status = -1
 		var ssrc uint32
 		if gw := conn.Gateway(); gw != nil {
 			gwStatus = gw.Status()
 			ssrc = gw.SSRC()
 		}
-		m.g.log.Error("voice conn open failed",
+		m.g.log.Warn("voice conn open attempt failed",
 			"guild", guildID, "channel", channelID, "session", sessionID,
+			"attempt", attempt, "max_attempts", maxAttempts,
 			"elapsed_ms", time.Since(openStart).Milliseconds(),
-			"voice_gateway_status", int(gwStatus), "ssrc", ssrc,
-			"hint", "if status=7 (Ready) & ssrc!=0 the voice websocket is fine but UDP media is blocked (check egress/UDP)",
-			"err", err)
-		// Tear down the half-open connection so it doesn't linger/retry.
+			"voice_gateway_status", int(gwStatus), "ssrc", ssrc, "err", err)
+
+		// Tear down the half-open conn. Close sends a leave op-4, which nudges
+		// Discord to send the voice events for the next attempt.
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		conn.Close(closeCtx)
 		closeCancel()
-		return err
+		m.g.client.VoiceManager.RemoveConn(gid)
+		if attempt < maxAttempts {
+			time.Sleep(1500 * time.Millisecond)
+		}
 	}
-	m.g.log.Info("voice conn opened",
-		"guild", guildID, "channel", channelID, "session", sessionID,
-		"elapsed_ms", time.Since(openStart).Milliseconds())
+	if lastErr != nil {
+		m.g.log.Error("voice conn open failed after retries",
+			"guild", guildID, "channel", channelID, "session", sessionID,
+			"attempts", maxAttempts, "err", lastErr)
+		return lastErr
+	}
 
 	// Attach our receiver AFTER Open: SetOpusFrameReceiver immediately starts a
 	// goroutine that calls conn.UDP().ReadPacket(); the UDP socket is only dialed
