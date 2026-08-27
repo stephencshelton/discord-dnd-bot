@@ -112,6 +112,14 @@ func allCommandSpecs() []commandSpec {
 						discord.ApplicationCommandOptionString{Name: "name", Description: "Campaign name", Required: true, Autocomplete: true},
 					},
 				},
+				discord.ApplicationCommandOptionSubCommand{
+					Name:        "delete",
+					Description: "Permanently delete a campaign and all its sessions, notes, and audio",
+					Options: []discord.ApplicationCommandOption{
+						discord.ApplicationCommandOptionString{Name: "name", Description: "Campaign name", Required: true, Autocomplete: true},
+						discord.ApplicationCommandOptionString{Name: "confirm", Description: "Type the campaign name again to confirm deletion", Required: true},
+					},
+				},
 			},
 		}},
 

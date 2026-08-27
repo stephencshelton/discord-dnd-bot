@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
+	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
 )
 
 // activeCampaign resolves the guild's active campaign or returns a user-facing
@@ -90,8 +91,65 @@ func (g *Gateway) handleCampaign(ctx context.Context, ic *ictx) error {
 			return err
 		}
 		return ic.reply(fmt.Sprintf("🗄️ Archived **%s**.", c.Name), false)
+
+	case "delete":
+		return g.campaignDelete(ctx, ic, guildID)
 	}
 	return fmt.Errorf("unknown campaign subcommand")
+}
+
+// campaignDelete permanently removes a campaign and everything under it. The DB
+// cascade (ON DELETE CASCADE on campaign_id) handles sessions, notes,
+// embeddings, participants, characters, world entities, reminders, and the
+// active-campaign pointer. Raw session audio in object storage is NOT part of
+// that cascade, so we purge each session's chunk prefix from S3 first. Requires
+// the caller to retype the campaign name in `confirm` as a guard against
+// accidental, irreversible deletion.
+func (g *Gateway) campaignDelete(ctx context.Context, ic *ictx, guildID string) error {
+	name := ic.optString("name")
+	confirm := ic.optString("confirm")
+	c, err := g.findCampaignByName(ctx, guildID, name)
+	if err != nil {
+		return ic.reply(err.Error(), true)
+	}
+	if !strings.EqualFold(strings.TrimSpace(confirm), c.Name) {
+		return ic.reply(fmt.Sprintf(
+			"⚠️ This permanently deletes **%s** and ALL its sessions, transcripts, notes, characters, world entries, and recorded audio — this can't be undone.\n"+
+				"Re-run with `confirm` set to the exact campaign name (`%s`) to proceed.", c.Name, c.Name), true)
+	}
+
+	// Purging audio from S3 can take a moment; ack first (ephemeral).
+	if err := ic.ack(true); err != nil {
+		return err
+	}
+
+	// 1) Purge raw audio chunks from object storage (not covered by DB cascade).
+	prefixes, perr := g.store.ListSessionChunkPrefixes(ctx, c.ID)
+	if perr != nil {
+		return ic.followup("I couldn't read the session list to clean up audio. Nothing was deleted; please try again.")
+	}
+	audioDeleted := 0
+	for _, prefix := range prefixes {
+		if g.storage == nil || prefix == "" {
+			continue
+		}
+		n, derr := g.storage.DeletePrefix(ctx, prefix)
+		audioDeleted += n
+		if derr != nil {
+			// Don't leave the campaign half-deleted: stop before the DB delete so
+			// the operator can retry rather than orphan audio silently.
+			logging.FromContext(ctx, g.log).Error("campaign delete: purge audio", "campaign", c.ID, "prefix", prefix, "err", derr)
+			return ic.followup("I couldn't fully delete the recorded audio, so I stopped before removing the campaign. Please try again.")
+		}
+	}
+
+	// 2) Delete the campaign row; the DB cascade removes all dependent data.
+	if err := g.store.DeleteCampaign(ctx, c.ID); err != nil {
+		return ic.followup("I purged the audio but couldn't delete the campaign record. Please try again.")
+	}
+	logging.FromContext(ctx, g.log).Info("campaign deleted",
+		"campaign", c.ID, "name", c.Name, "guild", guildID, "audio_objects_deleted", audioDeleted, "user", ic.userID())
+	return ic.followup(fmt.Sprintf("🗑️ Deleted **%s** and all its data (%d audio file(s) purged).", c.Name, audioDeleted))
 }
 
 // findCampaignByName does a case-insensitive lookup within a guild.

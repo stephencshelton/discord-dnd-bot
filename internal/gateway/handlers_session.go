@@ -172,23 +172,28 @@ func (g *Gateway) sessionStatus(ctx context.Context, ic *ictx, guildID string) e
 	return ic.reply(msg, true)
 }
 
-// sessionList shows a guild's recent sessions in a given status (default
-// "failed") so anyone can spot stuck/failed recordings and grab their IDs for
-// `/session requeue`.
+// sessionList shows the ACTIVE campaign's recent sessions in a given status
+// (default "failed") so anyone can spot stuck/failed recordings and grab their
+// IDs for `/session requeue`. Scoped to the active campaign so sessions from
+// other campaigns in the same server aren't mixed in.
 func (g *Gateway) sessionList(ctx context.Context, ic *ictx, guildID string) error {
+	camp, err := g.activeCampaign(ctx, guildID)
+	if err != nil {
+		return ic.reply(err.Error(), true)
+	}
 	status := ic.optString("status")
 	if status == "" {
 		status = "failed"
 	}
-	sessions, err := g.store.ListSessionsByStatusForGuild(ctx, guildID, status, 15)
+	sessions, err := g.store.ListSessionsByStatusForCampaign(ctx, camp.ID, status, 15)
 	if err != nil {
 		return err
 	}
 	if len(sessions) == 0 {
-		return ic.reply(fmt.Sprintf("No sessions with status **%s**.", status), true)
+		return ic.reply(fmt.Sprintf("No **%s** sessions in **%s**.", status, camp.Name), true)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "**Sessions — status `%s`** (newest first):\n", status)
+	fmt.Fprintf(&b, "**%s — sessions with status `%s`** (newest first):\n", camp.Name, status)
 	for _, s := range sessions {
 		fmt.Fprintf(&b, "• `%s` — started <t:%d:f>\n", s.ID, s.StartedAt.Unix())
 	}

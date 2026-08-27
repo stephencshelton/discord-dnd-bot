@@ -139,11 +139,11 @@ func (s *Store) GetSession(ctx context.Context, id uuid.UUID) (*Session, error) 
 	return &sess, err
 }
 
-// ListSessionsByStatusForGuild returns a guild's most-recent sessions in the
-// given status, newest first. Used by the admin `/session list` command to show
-// stuck/failed recordings that may need requeuing. A limit <= 0 defaults to 10
-// and is capped at 25 (Discord embed-field friendly).
-func (s *Store) ListSessionsByStatusForGuild(ctx context.Context, guildID, status string, limit int) ([]Session, error) {
+// ListSessionsByStatusForCampaign returns a campaign's most-recent sessions in
+// the given status, newest first. This is the campaign-scoped view behind
+// `/session list` so it doesn't leak sessions from other campaigns in the same
+// guild. limit <= 0 defaults to 10 and is capped at 25.
+func (s *Store) ListSessionsByStatusForCampaign(ctx context.Context, campaignID uuid.UUID, status string, limit int) ([]Session, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -153,8 +153,8 @@ func (s *Store) ListSessionsByStatusForGuild(ctx context.Context, guildID, statu
 	rows, err := s.db.Pool.Query(ctx,
 		`SELECT id, campaign_id, guild_id, COALESCE(voice_channel_id,''), status,
 		        COALESCE(chunk_prefix,''), started_at
-		 FROM sessions WHERE guild_id=$1 AND status=$2
-		 ORDER BY started_at DESC LIMIT $3`, guildID, status, limit)
+		 FROM sessions WHERE campaign_id=$1 AND status=$2
+		 ORDER BY started_at DESC LIMIT $3`, campaignID, status, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +167,29 @@ func (s *Store) ListSessionsByStatusForGuild(ctx context.Context, guildID, statu
 			return nil, err
 		}
 		out = append(out, sess)
+	}
+	return out, rows.Err()
+}
+
+// ListSessionChunkPrefixes returns the object-storage chunk prefixes for every
+// session in a campaign (skipping empty ones). Callers use these to purge raw
+// audio from S3 before deleting the campaign, since audio chunks are NOT part of
+// the database ON DELETE CASCADE.
+func (s *Store) ListSessionChunkPrefixes(ctx context.Context, campaignID uuid.UUID) ([]string, error) {
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT chunk_prefix FROM sessions
+		 WHERE campaign_id=$1 AND chunk_prefix IS NOT NULL AND chunk_prefix <> ''`, campaignID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }

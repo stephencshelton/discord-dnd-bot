@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	appcfg "github.com/stephencshelton/discord-dnd-bot/internal/config"
 )
@@ -111,3 +112,43 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 	}
 	return keys, nil
 }
+
+// DeletePrefix removes every object under prefix and returns how many were
+// deleted. Used to purge a session's/campaign's raw audio chunks, which live in
+// object storage and are NOT covered by the database's ON DELETE CASCADE. It
+// pages through the listing and batch-deletes up to 1000 keys per request. A
+// missing prefix (nothing to delete) is a no-op, not an error.
+func (s *Store) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	if prefix == "" {
+		return 0, fmt.Errorf("refusing to delete empty prefix")
+	}
+	keys, err := s.List(ctx, prefix)
+	if err != nil {
+		return 0, err
+	}
+	deleted := 0
+	for start := 0; start < len(keys); start += 1000 {
+		end := start + 1000
+		if end > len(keys) {
+			end = len(keys)
+		}
+		objs := make([]s3types.ObjectIdentifier, 0, end-start)
+		for _, k := range keys[start:end] {
+			objs = append(objs, s3types.ObjectIdentifier{Key: aws.String(k)})
+		}
+		out, derr := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucket),
+			Delete: &s3types.Delete{Objects: objs, Quiet: aws.Bool(true)},
+		})
+		if derr != nil {
+			return deleted, fmt.Errorf("delete objects under %s: %w", prefix, derr)
+		}
+		deleted += len(objs) - len(out.Errors)
+		if len(out.Errors) > 0 {
+			msg := aws.ToString(out.Errors[0].Message)
+			return deleted, fmt.Errorf("delete objects under %s: %d failed (first: %s)", prefix, len(out.Errors), msg)
+		}
+	}
+	return deleted, nil
+}
+
