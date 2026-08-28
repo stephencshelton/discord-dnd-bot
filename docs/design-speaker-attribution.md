@@ -55,8 +55,6 @@ hands us ground-truth identity.
   chunk** to `chunks/<userID>/chunk-NNNNNN.pcm`. Chunk numbering per user.
   Heartbeat/holdback/resume logic is otherwise unchanged.
 - Resume (`resumeActive`) and the reaper count chunks under the per-user prefixes.
-- The session cap (`MaxSessionMinutes`) becomes a cap on **total retained frames
-  across all tracks** so overall RAM stays bounded (see resource section).
 
 ### 2. Worker transcription (`internal/worker/transcribe.go`)
 
@@ -116,9 +114,9 @@ headers + anchor entry per SSRC — negligible (a handful of users = well under
 
 **Net memory increase: single-digit to low-tens of MB at peak**, and only while
 multiple people talk simultaneously within a 30s window. Against a 512Mi limit
-this is comfortably safe. To keep the hard cap bounded regardless of party size,
-`MaxSessionMinutes` becomes a *total-frames-across-tracks* cap (same ceiling as
-today, just shared).
+this is comfortably safe. RAM stays bounded regardless of session length or party
+size because each track's flushed frames are freed after every checkpoint (there
+is no session-length cap; see resource section).
 
 > We can also cut the peak by shortening `checkpointInterval` (e.g. 30s→15s)
 > which halves the live window at the cost of ~2× S3 PUT rate. Not needed at these
@@ -193,9 +191,8 @@ capture-side work. No feature flag (app not yet live).
   chunkSeq}`. `mixFrame(userID, absIdx, pcm)` writes into that user's track (no
   cross-user summing). `ssrcUser map[uint32]string` routes SSRC→user (falls back
   to `ssrc-<n>` if unresolved so audio is never dropped). Per-user sliding-window
-  free-after-upload preserved (OOM fix, now per track). Session cap =
-  `totalFramesAll` across all tracks. `startSeq` is the shared resume base;
-  `mixFrame` seeds a new track's `chunkSeq = startSeq+1`.
+  free-after-upload preserved (OOM fix, now per track). `startSeq` is the shared
+  resume base; `mixFrame` seeds a new track's `chunkSeq = startSeq+1`.
 - **Checkpoint**: `checkpointUpTo(holdback)` loops every track, uploads each to
   `chunkPrefix/<userID>/chunk-NNNNNN.pcm`, drops+advances that track on success;
   a failed per-user PUT is retried next tick without stalling others.

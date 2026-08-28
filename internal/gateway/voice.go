@@ -62,7 +62,6 @@ type recording struct {
 	decoders map[uint32]*gopus.Decoder // per-SSRC Opus decoder
 	ssrcUser map[uint32]string         // SSRC -> speaking userID (for routing frames)
 	seen     map[string]bool           // userIDs already persisted this session
-	capped   bool
 	// tracks holds one sliding-window PCM buffer per speaking user, keyed by
 	// userID string. Each track only allocates frames for slots that user
 	// actually spoke, so total RAM scales with concurrent speech, not with the
@@ -71,9 +70,6 @@ type recording struct {
 	// memory stays bounded to ~one checkpoint interval (preserves the earlier
 	// OOM fix, now per track).
 	tracks map[string]*userTrack
-	// totalFramesAll is the absolute count of frames ever produced across ALL
-	// tracks; used for the whole-session MaxSessionMinutes cap.
-	totalFramesAll int
 	// anchor maps each SSRC to its first packet's alignment: baseTS is that
 	// packet's RTP timestamp, baseFrame the ABSOLUTE timeline index (from
 	// wall-clock arrival). Later slots = baseFrame + (pkt.Timestamp-baseTS)/FrameSize.
@@ -439,28 +435,11 @@ func (r *recording) ReceiveOpusFrame(userID snowflake.ID, pkt *voice.Packet) (er
 		}
 	}
 
-	// Cap retained frames to bound memory (20ms/frame -> minutes*60*50), counted
-	// across all per-user tracks so total RAM stays bounded regardless of party
-	// size.
-	maxFrames := 0
-	if m := r.g.cfg.Audio.MaxSessionMinutes; m > 0 {
-		maxFrames = m * 60 * 50
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if maxFrames > 0 && r.totalFramesAll >= maxFrames {
-		if !r.capped {
-			r.capped = true
-			r.g.log.Warn("recording hit max length; further audio dropped",
-				"guild", r.guildID, "session", r.sessionID, "maxMinutes", r.g.cfg.Audio.MaxSessionMinutes)
-		}
-		return nil
-	}
-
 	// Route this SSRC to its speaking user so frames land in the right track.
 	// (disgo resolves SSRC->user; fall back to the SSRC itself if unknown so
 	// audio is never silently dropped.)
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if uid == "" {
 		if u, ok := r.ssrcUser[pkt.SSRC]; ok {
 			uid = u
@@ -560,10 +539,6 @@ func (r *recording) mixFrame(userID string, idx int, pcm []int16) {
 	if idx < 0 {
 		return
 	}
-	// Respect the overall session cap (absolute).
-	if m := r.g.cfg.Audio.MaxSessionMinutes; m > 0 && idx >= m*60*50 {
-		return
-	}
 	t := r.tracks[userID]
 	if t == nil {
 		// New track. A resumed session already has startSeq chunks in storage for
@@ -586,11 +561,9 @@ func (r *recording) mixFrame(userID string, idx int, pcm []int16) {
 	for len(t.frames) <= local {
 		t.frames = append(t.frames, make([]int16, audio.FrameSize*audio.Channels))
 	}
-	// Track the per-track high-water mark and the cross-track total for the cap.
+	// Track the per-track high-water mark (used for resume/chunk numbering).
 	if abs := t.frameBase + len(t.frames); abs > t.totalFrames {
-		delta := abs - t.totalFrames
 		t.totalFrames = abs
-		r.totalFramesAll += delta
 	}
 	dst := t.frames[local]
 	n := len(pcm)

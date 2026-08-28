@@ -223,13 +223,6 @@ type AudioConfig struct {
 	// (faster-whisper-medium OOMs on ~10-min segments at 8Gi; 3 min is safe). 0
 	// disables segmenting (whole track in one request — only safe for short sessions).
 	TranscribeSegmentMinutes int `envconfig:"AUDIO_TRANSCRIBE_SEGMENT_MINUTES" default:"3"`
-	// MaxSessionMinutes hard-caps how long a recording stays in memory before
-	// auto-stopping. Audio is buffered per speaker and flushed to storage every
-	// ~30s (then freed), so gateway memory scales with CONCURRENT speech in a
-	// checkpoint window (~5.6 MB per simultaneously-talking user), not with
-	// session length. This caps total buffered frames across all speaker tracks
-	// so a runaway recording can't grow unbounded. 0 disables. Default 180 (3h).
-	MaxSessionMinutes int `envconfig:"AUDIO_MAX_SESSION_MINUTES" default:"180"`
 }
 
 // WorkerConfig controls in-pod job concurrency. Combined with HPA on queue

@@ -118,7 +118,6 @@ Configuration is loaded from environment variables. The same configuration is us
 | `AUDIO_SILENCE_TRIM` | No | `true` | Drop near-silent frames before upload to cut billed minutes |
 | `AUDIO_SILENCE_RMS_THRESHOLD` | No | `350` | Per-frame RMS (0–32767) treated as silence |
 | `AUDIO_TRANSCRIBE_SEGMENT_MINUTES` | No | `3` | Split each speaker's track into ≤ this many minutes per WAV segment (downmixed to mono) when transcribing, bounding worker and STT memory (`0` = whole track in one request) |
-| `AUDIO_MAX_SESSION_MINUTES` | No | `180` | Hard cap on a single recording's length to bound gateway memory (`0` = no cap) |
 | `WORKER_CONCURRENCY` | No | `4` | Jobs processed in parallel per worker pod |
 | `WORKER_TRANSCRIBE_JOB_TIMEOUT` | No | `4h` | Max time for a single transcribe+summarize job (CPU Whisper runs below realtime) |
 | `WORKER_JOB_TIMEOUT` | No | `15m` | Max time for non-transcribe jobs (art, reindex) |
