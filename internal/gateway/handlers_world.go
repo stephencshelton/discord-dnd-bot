@@ -179,22 +179,11 @@ func (g *Gateway) handleCharacter(ctx context.Context, ic *ictx) error {
 
 	switch ic.subcommand() {
 	case "add":
-		pc := db.PlayerCharacter{
-			CampaignID:    camp.ID,
-			DiscordUserID: userID,
-			Name:          ic.optString("name"),
-			Class:         ic.optString("class"),
-			Race:          ic.optString("race"),
-			Level:         ic.optInt("level"),
-			Notes:         ic.optString("notes"),
-		}
-		if pc.Level == 0 {
-			pc.Level = 1
-		}
-		if _, err := g.store.CreatePC(ctx, pc); err != nil {
-			return err
-		}
-		return ic.reply(fmt.Sprintf("🗡️ Saved **%s** (Lv %d %s %s).", pc.Name, pc.Level, pc.Race, pc.Class), false)
+		// Open a structured form (modal). Prefill it with the user's existing
+		// character so /character add doubles as an edit. The modal's submit
+		// (handleCharacterAddModalSubmit) persists the result.
+		existing, _ := g.userCharacter(ctx, camp.ID, userID)
+		return ic.e.Modal(characterAddModal(existing))
 
 	case "list":
 		pcs, err := g.store.ListPCs(ctx, camp.ID)
@@ -223,6 +212,8 @@ func (g *Gateway) handleCharacter(ctx context.Context, ic *ictx) error {
 		if err := g.store.DeletePC(ctx, pc.ID); err != nil {
 			return err
 		}
+		// Drop it from /ask retrieval too (best-effort).
+		_ = g.store.DeleteCanonEmbedding(ctx, db.CanonSourceCharacter, pc.ID)
 		return ic.reply(fmt.Sprintf("Removed **%s**.", pc.Name), false)
 	}
 	return fmt.Errorf("unknown character subcommand")
@@ -240,16 +231,15 @@ func (g *Gateway) handleWorld(ctx context.Context, ic *ictx) error {
 
 	switch ic.subcommand() {
 	case "add":
-		e := db.WorldEntity{
-			CampaignID:  camp.ID,
-			Kind:        db.WorldEntityKind(ic.optString("kind")),
-			Name:        ic.optString("name"),
-			Description: ic.optString("description"),
+		// Open the kind-specific structured form (modal). The submit handler
+		// (handleWorldAddModalSubmit) persists the entity + metadata.
+		kind := db.WorldEntityKind(ic.optString("kind"))
+		switch kind {
+		case db.KindNPC, db.KindLocation, db.KindFaction, db.KindQuest:
+			return ic.e.Modal(worldAddModal(kind))
+		default:
+			return ic.reply("Pick a valid kind (NPC, Location, Faction, or Quest).", true)
 		}
-		if _, err := g.store.CreateWorldEntity(ctx, e); err != nil {
-			return err
-		}
-		return ic.reply(fmt.Sprintf("🌍 Added %s **%s**.", e.Kind, e.Name), false)
 
 	case "list":
 		kind := db.WorldEntityKind(ic.optString("kind"))
@@ -267,9 +257,35 @@ func (g *Gateway) handleWorld(ctx context.Context, ic *ictx) error {
 			if e.Description != "" {
 				line += " — " + e.Description
 			}
+			if summary := worldMetaSummary(e); summary != "" {
+				line += " _(" + summary + ")_"
+			}
 			b.WriteString(line + "\n")
 		}
 		return ic.reply(b.String(), true)
 	}
 	return fmt.Errorf("unknown world subcommand")
+}
+
+// worldMetaSummary renders a short "key: value" summary of an entity's
+// structured metadata for the /world list view (e.g. a quest's status). It's
+// intentionally compact — the full detail lives in the entity record.
+func worldMetaSummary(e db.WorldEntity) string {
+	if len(e.Metadata) == 0 {
+		return ""
+	}
+	// Show the most useful field per kind first, then any status.
+	order := map[db.WorldEntityKind][]string{
+		db.KindNPC:      {"role", "status"},
+		db.KindLocation: {"region"},
+		db.KindFaction:  {"status", "goals"},
+		db.KindQuest:    {"status", "objective"},
+	}
+	var parts []string
+	for _, k := range order[e.Kind] {
+		if v, ok := e.Metadata[k].(string); ok && strings.TrimSpace(v) != "" {
+			parts = append(parts, k+": "+v)
+		}
+	}
+	return strings.Join(parts, "; ")
 }

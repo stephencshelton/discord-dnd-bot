@@ -108,6 +108,21 @@ var (
 		Name: "discord_dnd_bot_db_pool_connections",
 		Help: "pgx pool connection counts, by state (total|acquired|idle).",
 	}, []string{"state"})
+
+	// StateProposalsCreated counts campaign-state proposals produced by the
+	// post-session extraction step. A run that produces zero (nothing meaningful
+	// changed) still succeeds; this tracks how much the extractor is surfacing.
+	StateProposalsCreated = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "discord_dnd_bot_state_proposals_created_total",
+		Help: "Campaign-state proposals created by post-session extraction.",
+	})
+
+	// StateProposalsReviewed counts proposals decided by a DM, by outcome
+	// (approved|rejected). Idempotent no-ops (double-clicks) are not counted.
+	StateProposalsReviewed = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "discord_dnd_bot_state_proposals_reviewed_total",
+		Help: "Campaign-state proposals reviewed by a DM, by outcome (approved|rejected).",
+	}, []string{"outcome"})
 )
 
 // ComponentError is a small convenience wrapper that increments ComponentErrors.

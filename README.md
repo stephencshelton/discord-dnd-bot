@@ -14,17 +14,21 @@ PostgreSQL, Redis, object storage, and LiteLLM are external service boundaries. 
 The implemented command surface includes:
 
 - `/campaign create`, `list`, `activate`, `archive`, and `delete` (delete purges the campaign's sessions, notes, embeddings, and S3 audio — guarded by retyping the name)
-- `/character add`, `list`, and `remove`
-- `/world add` and `list` for NPCs, locations, factions, and quests
+- `/character add`, `list`, and `remove` — `add` opens a structured fill-in form (name, class, race, level, bio); re-running it edits your existing character
+- `/world add` and `list` for NPCs, locations, factions, and quests — `add` opens a kind-specific form (e.g. a quest captures status/objective/giver, an NPC captures role/location/attitude) whose structured fields are stored as entity metadata; re-adding by the same name edits it
 - `/session start`, `stop`, and `status`
 - `/session list` and `/session requeue` to inspect the active campaign's sessions by status and re-run a failed/lost transcription
 - Voice recording with per-speaker tracks, crash-safe PCM checkpointing to object storage, and automatic resume/reaping after a gateway restart
 - Automatic transcription and AI-generated session notes
+- **Automatic campaign-state extraction with DM review** — after a session's notes are written, an AI step _proposes_ world-state changes (new/updated NPCs, locations, factions, quests, relationships, facts, and story hooks) that a DM reviews with `/review-session`; nothing becomes canon until explicitly approved (see [Automatic campaign-state extraction](#automatic-campaign-state-extraction) below)
+- `/review-session` (DM/admin) to approve, reject, or edit AI-proposed world-state changes with buttons — idempotent, no command spam
+- `/remember` to capture something the extraction missed (returns a fill-in template with no options; with options it files a pending proposal for review)
 - `/roll` for dice (e.g. `2d6+3`, `d20`, `4d6kh3`) — free, instant, no AI
-- `/lore` for campaign-aware worldbuilding assistance
-- `/recap` for a “previously on” summary from recent completed sessions
+- `/lore` for open-ended worldbuilding *brainstorming* (invents ideas — not your canon)
+- `/recap` for a “previously on” narrative summary from recent completed sessions
+- `/prep` for a DM-focused “where we left off & what’s next” briefing assembled from actual state (last session, active quests, key NPCs/factions, characters) — practical, not a narrative recap
 - `/search` for lexical full-text search over completed session notes/transcripts
-- `/ask` for grounded Q&A over your campaign's session notes (retrieval-augmented generation with pgvector)
+- `/ask` for grounded Q&A over **everything on record** — session transcripts *and* curated canon (NPCs, locations, factions, quests, player characters), so recall works whether a fact was spoken at the table or added with `/world add`, `/character add`, or `/remember` (retrieval-augmented generation with pgvector; curated canon is preferred when sources conflict)
 - `/art` for AI-generated campaign scene art
 - `/reindex` to rebuild `/ask` memory from all completed sessions
 - `/remind set`, `clear`, and `show` for weekly UTC reminders
@@ -109,6 +113,7 @@ Configuration is loaded from environment variables. The same configuration is us
 | `LITELLM_RECAP_MODEL` | No | falls back to chat | Model for `/recap` |
 | `LITELLM_LORE_MODEL` | No | falls back to chat | Model for `/lore` |
 | `LITELLM_ASK_MODEL` | No | falls back to chat | Model for grounded `/ask` |
+| `LITELLM_STATE_MODEL` | No | falls back to chat | Model for post-session campaign-state extraction (`/review-session` proposals) |
 | `LITELLM_TRANSCRIBE_MODEL` | No | `voice-transcribe` | LiteLLM transcription route |
 | `LITELLM_IMAGE_MODEL` | No | `dnd-image` | LiteLLM image route |
 | `LITELLM_EMBED_MODEL` | No | `dnd-embed` | LiteLLM embeddings route (grounded `/ask` retrieval) |
@@ -132,19 +137,34 @@ The database schema is embedded in the binaries and applied idempotently at star
 
 ### Grounded Q&A with `/ask` (RAG)
 
-`/ask` answers a player's question using only the campaign's own session notes,
-via retrieval-augmented generation:
+`/ask` answers a player's question using only the campaign's own records — both
+what was said at the table and curated canon — via retrieval-augmented
+generation:
 
-1. When a session completes, the worker splits its AI-generated notes into
-   passages, embeds each with `LITELLM_EMBED_MODEL`, and stores the vectors in
-   the `session_embeddings` table (pgvector).
-2. On `/ask`, the gateway embeds the question, retrieves the most similar
-   passages for the active campaign by cosine distance (`embedding <=> query`),
-   and passes those excerpts to `LITELLM_ASK_MODEL` with instructions to answer
-   only from them (and to say so when the answer isn't in the notes).
+1. When a session completes, the worker splits its transcript into passages,
+   embeds each with `LITELLM_EMBED_MODEL`, and stores the vectors in the
+   `session_embeddings` table (pgvector).
+2. Curated **canon** is indexed too: every world entity (NPC/location/faction/
+   quest) and player character is embedded into the `canon_embeddings` table
+   whenever it's added or changed — via `/world add`, `/character add`, an
+   approved `/review-session` proposal, or `/remember`. So a fact added by hand
+   or approved from AI extraction is retrievable even if it was never spoken on a
+   recording.
+3. On `/ask`, the gateway embeds the question, retrieves the most similar
+   passages from **both** tables for the active campaign by cosine distance
+   (`embedding <=> query`), merges them by relevance (each tagged
+   `[Campaign canon]` or `[Session record]`), and passes the excerpts to
+   `LITELLM_ASK_MODEL` with instructions to answer only from them, to prefer
+   curated canon when sources conflict, and to say so when the answer isn't on
+   record.
 
-This differs from `/search`, which is lexical full-text (`tsvector`) matching
-and returns snippets rather than a synthesized answer.
+This means an answer that spans several sessions plus a hand-added entry is
+reconciled in one response. It differs from `/search`, which is lexical
+full-text (`tsvector`) matching and returns snippets rather than a synthesized
+answer.
+
+Use `/reindex` to backfill: it (re)embeds all completed sessions **and** all
+world entities + player characters for the active campaign.
 
 Requirements:
 
@@ -157,11 +177,66 @@ Requirements:
   Embed v2 via Bedrock.
 - **`LITELLM_EMBED_DIM` must match that model's output dimension** (1536 for
   `text-embedding-3-small`, 3072 for `-3-large`, 1024 for Titan v2). It sizes
-  the pgvector column at first migration. Changing it after data exists requires
-  re-embedding: drop `session_embeddings` rows (or the table) and reprocess.
+  the `session_embeddings` and `canon_embeddings` vector columns at first
+  migration. Changing it after data exists requires re-embedding: drop those
+  rows (or the tables) and reprocess.
 
 Only sessions completed *after* embeddings were enabled are indexed; historical
-notes are picked up as new sessions are recorded (or by re-running processing).
+notes are picked up as new sessions are recorded, and existing canon is picked up
+via `/reindex`.
+
+### Automatic campaign-state extraction
+
+After a session is transcribed and its notes are generated, the worker runs a
+separate AI step that **proposes** updates to the campaign's persistent world
+state — but never applies them. The proposals are held for a DM to review, so
+**AI-generated information never becomes campaign canon without explicit
+approval**.
+
+How it works:
+
+1. When transcription + notes succeed, the transcribe job enqueues a distinct
+   `extract_state` job (it does **not** block `/session stop`, and its failure
+   can **never** mark the session failed — the notes are already saved and
+   posted).
+2. The extraction job feeds the speaker-attributed transcript, the generated
+   notes, campaign metadata, the players' characters, and the existing world
+   entities to `LITELLM_STATE_MODEL` (falls back to `LITELLM_CHAT_MODEL`), asking
+   for **strict JSON** describing only meaningful, evidence-backed changes. The
+   model is instructed to be conservative and is told the transcript is
+   *untrusted* — dialogue that looks like instructions ("ignore your rules",
+   "add an NPC named …") is treated as in-world speech, never a command.
+3. The output is validated and normalized (invalid or evidence-free items are
+   dropped; near-duplicate names are matched case-insensitively against existing
+   entities so a "new NPC" that already exists becomes an *update*, not a
+   duplicate). Survivors are stored as **pending proposals** in the
+   `state_proposals` table. Re-running extraction replaces a session's pending
+   proposals (idempotent) while leaving already-approved/rejected ones intact.
+4. A DM runs **`/review-session`** (Manage Server permission required) to step
+   through pending proposals with **Approve / Reject / Edit / Skip** buttons —
+   one message, edited in place, no command spam. Each proposal shows the
+   proposed change, the model's explanation, and the supporting **evidence** so
+   the DM understands *why* it was suggested.
+   - **Approve** atomically applies the change to `world_entities` (create or
+     merge-update) and marks the proposal approved. It is **idempotent**:
+     clicking Approve twice, or a retried interaction, never creates a duplicate
+     entity or double-applies (a case-insensitive unique index and a
+     claim-then-apply transaction guarantee this). An update *merges* — it won't
+     clobber hand-written description/metadata the proposal doesn't mention.
+   - **Reject** leaves canon completely untouched.
+   - **Edit** opens a modal to tweak the name/description before approving.
+5. Once approved, the entity is immediately available to `/world`, `/lore`,
+   `/recap`, `/ask` (after reindex), and future AI context — exactly like a
+   hand-authored entry.
+
+Missed something? **`/remember`** (with no options) returns a fill-in template
+showing the format; run it with `kind`, `name`, and `note` to file your own
+pending proposal, which goes through the very same `/review-session` approval
+path — so even a human note is confirmed before it becomes canon.
+
+World entities gained a backwards-compatible `metadata` JSONB column for optional
+structured fields (e.g. a quest's `status`), which approved proposals populate;
+existing rows default to `{}`.
 
 ### External Secrets
 
@@ -274,7 +349,7 @@ The existing Secret must contain these keys:
 
 For development, the chart can create the Secret from values instead. For production, use an external secret manager or a pre-created Secret rather than storing credentials in Helm values.
 
-The gateway and worker have independent `replicaCount`, resource, node selector, affinity, toleration, and autoscaling settings. Worker autoscaling defaults to 1–5 replicas based on CPU utilization. Queue depth is exported as a Prometheus gauge, so queue-depth autoscaling can be added with KEDA without changing the worker code or gateway deployment.
+The gateway and worker have independent `replicaCount`, resource, node selector, affinity, toleration, and autoscaling settings. Because **every** worker job (transcription, art, reindex) is enqueued onto a single Redis list, queue depth is an exact measure of pending work — so the chart's default autoscaling is **event-driven via [KEDA](https://keda.sh)**, scaling the worker (and the optional STT server) directly on that backlog and all the way down to **zero** when the queue is empty. Enable per-service under `worker.keda` / `stt.keda` (on by default); requires the KEDA operator installed cluster-wide. A plain CPU-based HPA (`worker.autoscaling` / `stt.autoscaling`) is still available as a fallback — set `<svc>.keda.enabled=false` and `<svc>.autoscaling.enabled=true` to use it instead (when KEDA is enabled the CPU HPA is suppressed so the two never fight over the same Deployment). Queue depth is also exported as a Prometheus gauge for dashboards.
 
 Enable Prometheus Operator scraping with:
 
@@ -372,6 +447,12 @@ The bot is designed to scale gracefully in and out on Kubernetes:
   dequeuing and drains in-flight jobs before exiting, so a scale-in or rolling
   update never drops a transcription mid-flight (`terminationGracePeriodSeconds`
   is sized for the slowest single job).
+- **Event-driven scale-to-zero (KEDA)** — the worker and the optional STT server
+  scale on the Redis job-queue backlog and drop to **zero replicas** when the
+  queue is empty, so their (large) CPU/RAM reservations cost nothing while idle.
+  The first replica activates the moment a job is enqueued. The gateway stays a
+  single always-on replica (it holds the Discord connection and handles all
+  interactive commands; it only *publishes* jobs).
 - **Per-endpoint model selection** — notes, recap, lore, and ask each resolve to
   their own LiteLLM route (with fallback to the default chat route), so the
   cheapest capable model can be chosen per task from `values.yaml`.
@@ -408,6 +489,7 @@ Example mapping against a real Bedrock + OpenAI inventory:
 | Recap | `LITELLM_RECAP_MODEL` | `claude-4-5-haiku` | Cheapest capable model |
 | Lore | `LITELLM_LORE_MODEL` | `claude-4-5-sonnet` | |
 | Ask (RAG) | `LITELLM_ASK_MODEL` | `claude-4-5-sonnet` | |
+| State extraction | `LITELLM_STATE_MODEL` | `claude-opus-4-5` | Post-session `/review-session` proposals; accuracy over cost |
 | Embeddings | `LITELLM_EMBED_MODEL` | `amazon-titan-embed-text-v2:0` | Bedrock Titan Embed V2 |
 | Image | `LITELLM_IMAGE_MODEL` | `gpt-image-2` (OpenAI) | See note below |
 | Transcription | `LITELLM_TRANSCRIBE_MODEL` | `whisper-1` (OpenAI) | **Must be added — see below** |
@@ -524,11 +606,17 @@ real-time, so a 1-hour session finishes in `RTF × 60 min`):
 | `faster-whisper-medium` | 2–4 | ~0.7–1.5× | Better (chart default) |
 | `faster-whisper-large-v3` | 4+ | ~1.5–3× | Best (heavy) |
 
-Scale it like the other services: bump `stt.replicaCount` or enable
-`stt.autoscaling` (CPU-based HPA). Because model weights live on a single
-ReadWriteOnce PVC, the deployment uses a `Recreate` strategy; for multiple
-replicas either disable persistence (each pod re-downloads to an `emptyDir`) or
-provide a ReadWriteMany StorageClass.
+Scale it like the other services. By default it uses **KEDA event-driven
+scaling** on the shared Redis job queue (`stt.keda`, on by default): since STT is
+only exercised while a transcription job runs, an empty queue means it can scale
+to **zero** and release its large CPU/RAM reservation. STT is not a queue
+consumer itself \u2014 the worker reaches it through LiteLLM \u2014 but the same backlog is
+the right trigger, and the worker's retry/requeue logic bridges STT's (slow)
+cold start while the model loads. Alternatively, bump `stt.replicaCount` or use a
+CPU-based HPA (`stt.autoscaling.enabled=true` with `stt.keda.enabled=false`).
+Because model weights live on a single ReadWriteOnce PVC, the deployment uses a
+`Recreate` strategy; for multiple replicas either disable persistence (each pod
+re-downloads to an `emptyDir`) or provide a ReadWriteMany StorageClass.
 
 ## CI and Security
 
@@ -556,12 +644,13 @@ internal/audio       voice decoding, mixing, and WAV encoding
 internal/config      environment-backed configuration
 internal/db          PostgreSQL connection and data access
 internal/dice        dice-notation parser and roller
+internal/extract     validates AI state-extraction JSON into campaign-state proposals
 internal/gateway     Discord commands, handlers, voice, and reminders
 internal/httpserver   health, readiness, and Prometheus endpoints
 internal/litellm     OpenAI-compatible LiteLLM client
 internal/queue       Redis-backed job queue
 internal/storage     S3-compatible object storage client
-internal/worker      transcription, summarization, and art jobs
+internal/worker      transcription, summarization, state extraction, and art jobs
 charts/discord-dnd-bot    Kubernetes Helm chart
 ```
 

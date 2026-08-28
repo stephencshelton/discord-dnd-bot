@@ -133,6 +133,11 @@ config:
     recapModel: "claude-4-5-haiku"  # /recap — cheap, runs often
     loreModel: "claude-4-5-sonnet"  # /lore
     askModel: "claude-4-5-sonnet"   # /ask grounded Q&A
+    # Post-session campaign-state extraction (proposes world-state changes for
+    # DM review via /review-session). A stronger, careful reasoner pays off here
+    # because it must be conservative and emit strict JSON. Empty falls back to
+    # chatModel, exactly like the other task-specific routes above.
+    stateModel: "claude-opus-4-5"   # state extraction — accuracy over cost
     # NOTE: no speech-to-text route exists in the LiteLLM inventory, and Bedrock
     # cannot serve one via LiteLLM. This deployment enables the self-hosted `stt`
     # service (below) and expects a matching LiteLLM route named "voice-transcribe":
@@ -354,11 +359,33 @@ worker:
     limits:
       cpu: "2"
       memory: 3Gi
+  # CPU-based HorizontalPodAutoscaler. Simpler but laggy and cannot scale to
+  # zero. Prefer `keda` (below) for event-driven scale-to-zero on queue backlog.
+  # When keda.enabled is true this CPU HPA is NOT rendered (KEDA owns the HPA).
   autoscaling:
-    enabled: true
+    enabled: false
     minReplicas: 1
     maxReplicas: 5
     targetCPUUtilizationPercentage: 70
+  # Event-driven autoscaling via KEDA (https://keda.sh), scaling directly on the
+  # Redis job-queue backlog. Because ALL worker jobs (transcribe/art/reindex) are
+  # enqueued onto a single Redis list, an empty list means there is genuinely
+  # nothing to do, so the worker can safely scale to ZERO. KEDA activates the
+  # first replica when >= activationListLength jobs are waiting, then targets
+  # listLength jobs per replica. Requires the KEDA operator installed cluster-wide.
+  keda:
+    enabled: true
+    minReplicaCount: 0
+    maxReplicaCount: 1
+    # Backlog per replica KEDA targets when scaling (desired = ceil(depth/listLength)).
+    listLength: 1
+    # Queue depth at/above which KEDA activates the FIRST replica from zero.
+    activationListLength: 1
+    pollingInterval: 15
+    # Seconds to wait after the queue empties before scaling back toward zero.
+    # Comfortably longer than the longest single job would take to start; the
+    # worker's own terminationGracePeriodSeconds still protects in-flight jobs.
+    cooldownPeriod: 300
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -420,6 +447,22 @@ stt:
     minReplicas: 1
     maxReplicas: 4
     targetCPUUtilizationPercentage: 70
+  # Event-driven autoscaling via KEDA. STT is NOT a queue consumer itself — the
+  # worker calls it through LiteLLM during transcribe_session jobs — but the same
+  # Redis queue backlog is the right signal: if jobs are waiting, transcription
+  # (and therefore STT) is imminent. Scaling STT to zero when the queue is empty
+  # frees its large CPU/RAM reservation. NOTE: STT cold start is slow (model
+  # download/load, see startupProbe); the worker's retry/requeue logic bridges
+  # the gap, so early transcribe attempts may fail-and-retry until STT is Ready.
+  # Give a longer cooldown than the worker so STT does not thrash on brief lulls.
+  keda:
+    enabled: true
+    minReplicaCount: 0
+    maxReplicaCount: 1
+    listLength: 1
+    activationListLength: 1
+    pollingInterval: 15
+    cooldownPeriod: 600
   # Model download + load on cold start can take a while; give it slack.
   startupProbe:
     initialDelaySeconds: 10

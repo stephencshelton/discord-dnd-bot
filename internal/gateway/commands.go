@@ -6,6 +6,7 @@ import (
 
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/rest"
+	"github.com/disgoorg/omit"
 	"github.com/disgoorg/snowflake/v2"
 )
 
@@ -127,17 +128,7 @@ func allCommandSpecs() []commandSpec {
 			Name:        "character",
 			Description: "Manage player characters",
 			Options: []discord.ApplicationCommandOption{
-				discord.ApplicationCommandOptionSubCommand{
-					Name:        "add",
-					Description: "Add or update your character",
-					Options: []discord.ApplicationCommandOption{
-						discord.ApplicationCommandOptionString{Name: "name", Description: "Character name", Required: true},
-						discord.ApplicationCommandOptionString{Name: "class", Description: "Class"},
-						discord.ApplicationCommandOptionString{Name: "race", Description: "Race/ancestry"},
-						discord.ApplicationCommandOptionInt{Name: "level", Description: "Level"},
-						discord.ApplicationCommandOptionString{Name: "notes", Description: "Short bio/notes"},
-					},
-				},
+				discord.ApplicationCommandOptionSubCommand{Name: "add", Description: "Add or update your character (opens a form)"},
 				discord.ApplicationCommandOptionSubCommand{Name: "list", Description: "List characters in the active campaign"},
 				discord.ApplicationCommandOptionSubCommand{
 					Name:        "remove",
@@ -155,11 +146,9 @@ func allCommandSpecs() []commandSpec {
 			Options: []discord.ApplicationCommandOption{
 				discord.ApplicationCommandOptionSubCommand{
 					Name:        "add",
-					Description: "Add a world entry",
+					Description: "Add or update a world entry (opens a form)",
 					Options: []discord.ApplicationCommandOption{
 						discord.ApplicationCommandOptionString{Name: "kind", Description: "Type of entry", Required: true, Choices: worldKindChoices()},
-						discord.ApplicationCommandOptionString{Name: "name", Description: "Name", Required: true},
-						discord.ApplicationCommandOptionString{Name: "description", Description: "Description"},
 					},
 				},
 				discord.ApplicationCommandOptionSubCommand{
@@ -228,6 +217,11 @@ func allCommandSpecs() []commandSpec {
 		}},
 
 		{dm: true, def: discord.SlashCommandCreate{
+			Name:        "prep",
+			Description: "Get a 'where we left off & what's next' briefing to start the next session",
+		}},
+
+		{dm: true, def: discord.SlashCommandCreate{
 			Name:        "search",
 			Description: "Search completed session notes and transcripts",
 			Options: []discord.ApplicationCommandOption{
@@ -279,6 +273,25 @@ func allCommandSpecs() []commandSpec {
 		{dm: false, def: discord.SlashCommandCreate{
 			Name:        "reindex",
 			Description: "Rebuild /ask search memory from all completed sessions",
+		}},
+
+		{dm: false, def: discord.SlashCommandCreate{
+			Name:                     "review-session",
+			Description:              "Review AI-proposed campaign-world changes and approve/reject them (DM/admin)",
+			DefaultMemberPermissions: omit.NewPtr(discord.PermissionManageGuild),
+			Options: []discord.ApplicationCommandOption{
+				discord.ApplicationCommandOptionString{Name: "session_id", Description: "Review a specific session's proposals (leave empty for all pending)", Autocomplete: true},
+			},
+		}},
+
+		{dm: true, def: discord.SlashCommandCreate{
+			Name:        "remember",
+			Description: "Add something to campaign memory the AI missed (proposed for DM approval)",
+			Options: []discord.ApplicationCommandOption{
+				discord.ApplicationCommandOptionString{Name: "kind", Description: "Type of entry", Choices: worldKindChoices()},
+				discord.ApplicationCommandOptionString{Name: "name", Description: "Name of the NPC/location/faction/quest"},
+				discord.ApplicationCommandOptionString{Name: "note", Description: "What should the campaign remember?"},
+			},
 		}},
 
 		{dm: true, def: discord.SlashCommandCreate{

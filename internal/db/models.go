@@ -57,8 +57,13 @@ type WorldEntity struct {
 	Kind        WorldEntityKind
 	Name        string
 	Description string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// Metadata holds optional structured, kind-specific fields beyond the
+	// freeform Description (e.g. a quest's status, an NPC's role). Stored as a
+	// JSONB object; nil/empty means no extra metadata. Approved AI state
+	// proposals merge their structured patch data here.
+	Metadata  map[string]any
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Session is one recorded game session and its derived artifacts.
@@ -101,4 +106,55 @@ type Reminder struct {
 	Schedule   string
 	NextRun    time.Time
 	CreatedAt  time.Time
+}
+
+// ProposalAction enumerates what an approved state proposal does to canon.
+type ProposalAction string
+
+const (
+	// ActionCreateEntity creates a new world entity from the proposal.
+	ActionCreateEntity ProposalAction = "create_entity"
+	// ActionUpdateEntity updates an existing world entity from the proposal.
+	ActionUpdateEntity ProposalAction = "update_entity"
+)
+
+// Proposal status values.
+const (
+	ProposalPending  = "pending"
+	ProposalApproved = "approved"
+	ProposalRejected = "rejected"
+)
+
+// StateProposal is an AI- or human-suggested change to the persistent campaign
+// world, awaiting DM review. It is NEVER canon until approved: approving
+// atomically applies Patch to world_entities and marks the row approved;
+// rejecting leaves canon untouched. This is the guardrail that keeps AI-derived
+// information from silently becoming campaign truth.
+type StateProposal struct {
+	ID          uuid.UUID
+	CampaignID  uuid.UUID
+	SessionID   *uuid.UUID // nil for manually-authored (/remember) proposals
+	Action      ProposalAction
+	EntityKind  WorldEntityKind
+	EntityID    *uuid.UUID // set for update_entity; nil for create_entity
+	EntityName  string
+	Patch       map[string]any // structured proposed data (description + metadata)
+	Explanation string
+	Evidence    string
+	Confidence  float64
+	Status      string
+	ReviewedBy  *string
+	CreatedAt   time.Time
+	ReviewedAt  *time.Time
+}
+
+// Description extracts the proposed description string from Patch, if present.
+func (p StateProposal) Description() string {
+	if p.Patch == nil {
+		return ""
+	}
+	if d, ok := p.Patch["description"].(string); ok {
+		return d
+	}
+	return ""
 }

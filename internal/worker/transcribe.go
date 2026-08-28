@@ -139,6 +139,19 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 	// channel the session was recorded in).
 	channelID := w.notesChannel(ctx, p.GuildID, sess.VoiceChannelID)
 	w.postNotes(channelID, campName, notes)
+
+	// 6) Kick off campaign-state extraction as a SEPARATE job so it never
+	// blocks or fails this (already successful) transcription: the transcript
+	// and notes are saved and posted regardless. A failure to enqueue is logged
+	// but not fatal for the same reason. The extract job proposes world-state
+	// changes for the DM to review via /review-session.
+	if err := w.queue.Enqueue(ctx, queue.JobExtractState, queue.ExtractStatePayload{
+		SessionID: sessionID.String(),
+		GuildID:   p.GuildID,
+		Notify:    true,
+	}); err != nil {
+		w.log.Warn("enqueue state extraction", "session", sessionID, "err", err)
+	}
 	return nil
 }
 

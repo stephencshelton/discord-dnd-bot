@@ -165,6 +165,11 @@ type LiteLLMConfig struct {
 	RecapModel string `envconfig:"LITELLM_RECAP_MODEL"`
 	LoreModel  string `envconfig:"LITELLM_LORE_MODEL"`
 	AskModel   string `envconfig:"LITELLM_ASK_MODEL"`
+	// StateModel powers the post-session campaign-state extraction step, which
+	// proposes (never applies) world-state changes for DM review. Empty falls
+	// back to ChatModel, exactly like the other task-specific routes, so a
+	// single-model deployment keeps working with no extra configuration.
+	StateModel string `envconfig:"LITELLM_STATE_MODEL"`
 
 	TranscribeModel string `envconfig:"LITELLM_TRANSCRIBE_MODEL" default:"voice-transcribe"`
 	ImageModel      string `envconfig:"LITELLM_IMAGE_MODEL" default:"dnd-image"`
@@ -194,6 +199,10 @@ func (c LiteLLMConfig) Lore() string { return firstNonEmpty(c.LoreModel, c.ChatM
 
 // Ask returns the model for the grounded /ask command, falling back to ChatModel.
 func (c LiteLLMConfig) Ask() string { return firstNonEmpty(c.AskModel, c.ChatModel) }
+
+// State returns the model for post-session campaign-state extraction, falling
+// back to ChatModel (same pattern as the other task-specific routes).
+func (c LiteLLMConfig) State() string { return firstNonEmpty(c.StateModel, c.ChatModel) }
 
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {

@@ -51,6 +51,9 @@ data:
   {{- with .Values.config.litellm.askModel }}
   LITELLM_ASK_MODEL: {{ . | quote }}
   {{- end }}
+  {{- with .Values.config.litellm.stateModel }}
+  LITELLM_STATE_MODEL: {{ . | quote }}
+  {{- end }}
   LITELLM_TRANSCRIBE_MODEL: {{ .Values.config.litellm.transcribeModel | quote }}
   LITELLM_IMAGE_MODEL: {{ .Values.config.litellm.imageModel | quote }}
   LITELLM_EMBED_MODEL: {{ .Values.config.litellm.embedModel | quote }}

@@ -1,0 +1,103 @@
+{{/*
+Event-driven autoscaling via KEDA (https://keda.sh).
+
+Both the worker and the (optional) STT deployment scale on the SAME Redis job
+queue backlog. Every asynchronous job the worker performs — transcribe_session,
+generate_art, reindex_campaign — is enqueued by the gateway onto a single Redis
+list ("discord-dnd-bot:jobs"). So the list length is an exact measure of pending
+work: when it is empty there is nothing to do and both deployments can scale to
+ZERO, eliminating their idle CPU/RAM reservations (the worker's 2cpu/3Gi and the
+STT server's multi-cpu/multi-Gi in particular).
+
+STT is not a queue consumer itself (the worker reaches it through LiteLLM during
+transcribe_session jobs), but the same backlog signal drives it: pending jobs
+imply imminent transcription. The worker's retry/requeue logic tolerates STT's
+slow cold start.
+
+Requires the KEDA operator installed cluster-wide. When a service's keda.enabled
+is true, its plain CPU HorizontalPodAutoscaler in hpa.yaml is suppressed (KEDA
+creates and owns the HPA), so the two never fight over the same Deployment.
+*/}}
+{{- $redisAuth := and .Values.redis.enabled .Values.redis.auth.enabled -}}
+
+{{- if $redisAuth }}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "discord-dnd-bot.fullname" . }}-redis
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: {{ include "discord-dnd-bot.secretName" . }}
+      key: REDIS_PASSWORD
+{{- end }}
+
+{{- if and .Values.worker.enabled .Values.worker.keda.enabled }}
+{{- if $redisAuth }}
+---
+{{- end }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "discord-dnd-bot.fullname" . }}-worker
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "discord-dnd-bot.fullname" . }}-worker
+  minReplicaCount: {{ .Values.worker.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.worker.keda.maxReplicaCount }}
+  pollingInterval: {{ .Values.worker.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.worker.keda.cooldownPeriod }}
+  triggers:
+    - type: redis
+      metadata:
+        address: {{ include "discord-dnd-bot.redisAddr" . | quote }}
+        listName: "discord-dnd-bot:jobs"
+        listLength: {{ .Values.worker.keda.listLength | quote }}
+        activationListLength: {{ .Values.worker.keda.activationListLength | quote }}
+        databaseIndex: {{ .Values.config.redis.db | quote }}
+        enableTLS: "false"
+      {{- if $redisAuth }}
+      authenticationRef:
+        name: {{ include "discord-dnd-bot.fullname" . }}-redis
+      {{- end }}
+{{- end }}
+
+{{- if and .Values.stt.enabled .Values.stt.keda.enabled }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "discord-dnd-bot.fullname" . }}-stt
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stt
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "discord-dnd-bot.fullname" . }}-stt
+  minReplicaCount: {{ .Values.stt.keda.minReplicaCount }}
+  maxReplicaCount: {{ .Values.stt.keda.maxReplicaCount }}
+  pollingInterval: {{ .Values.stt.keda.pollingInterval }}
+  cooldownPeriod: {{ .Values.stt.keda.cooldownPeriod }}
+  triggers:
+    - type: redis
+      metadata:
+        address: {{ include "discord-dnd-bot.redisAddr" . | quote }}
+        listName: "discord-dnd-bot:jobs"
+        listLength: {{ .Values.stt.keda.listLength | quote }}
+        activationListLength: {{ .Values.stt.keda.activationListLength | quote }}
+        databaseIndex: {{ .Values.config.redis.db | quote }}
+        enableTLS: "false"
+      {{- if $redisAuth }}
+      authenticationRef:
+        name: {{ include "discord-dnd-bot.fullname" . }}-redis
+      {{- end }}
+{{- end }}

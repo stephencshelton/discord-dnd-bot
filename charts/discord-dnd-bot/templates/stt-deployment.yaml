@@ -7,7 +7,7 @@ metadata:
     {{- include "discord-dnd-bot.labels" . | nindent 4 }}
     app.kubernetes.io/component: stt
 spec:
-  {{- if not .Values.stt.autoscaling.enabled }}
+  {{- if and (not .Values.stt.autoscaling.enabled) (not .Values.stt.keda.enabled) }}
   replicas: {{ .Values.stt.replicaCount }}
   {{- end }}
   # Model weights live on a single RWO PVC; avoid two pods mounting it at once.

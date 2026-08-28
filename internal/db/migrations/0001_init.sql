@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS session_participants (
 CREATE INDEX IF NOT EXISTS idx_session_participants_session
     ON session_participants (session_id);
 
+
 -- Vector embeddings over completed session notes for grounded /ask retrieval
 -- (RAG). One row per chunk. The embedding dimension is templated at migration
 -- time from LITELLM_EMBED_DIM (see internal/db.Migrate) so the schema matches

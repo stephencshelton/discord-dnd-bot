@@ -103,6 +103,8 @@ func New(cfg *config.Config, log *slog.Logger, store *db.Store, q *queue.Queue, 
 		),
 		bot.WithEventListenerFunc(g.onReady),
 		bot.WithEventListenerFunc(g.onInteraction),
+		bot.WithEventListenerFunc(g.onComponentInteraction),
+		bot.WithEventListenerFunc(g.onModalSubmit),
 		bot.WithEventListenerFunc(g.onAutocomplete),
 		bot.WithEventListenerFunc(g.onMessageCreate),
 		// Diagnostics for the voice handshake: these fire only when Discord sends

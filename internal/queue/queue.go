@@ -29,6 +29,16 @@ const (
 	// JobReindexCampaign: (re)embed all completed session notes for a campaign
 	// so grounded /ask retrieval works over historical sessions.
 	JobReindexCampaign JobType = "reindex_campaign"
+	// JobExtractState: after a session's notes are generated, propose campaign
+	// world-state changes for DM review. Runs as its own job (decoupled from
+	// transcription) so a failure here never fails the session and it can be
+	// retried/reprocessed independently.
+	JobExtractState JobType = "extract_state"
+	// JobEmbedCanon: (re)embed a single canon record (a world entity or player
+	// character) so grounded /ask retrieval can surface curated campaign facts
+	// alongside session transcripts. Enqueued whenever such a record is created
+	// or updated; a delete removes the embedding directly (no AI call needed).
+	JobEmbedCanon JobType = "embed_canon"
 )
 
 // Job is a unit of asynchronous work. Payload is type-specific JSON.
@@ -65,6 +75,26 @@ type ReindexCampaignPayload struct {
 	CampaignID string `json:"campaign_id"`
 	GuildID    string `json:"guild_id"`
 	ChannelID  string `json:"channel_id"` // where to post a completion notice
+}
+
+// ExtractStatePayload carries a request to extract proposed campaign-state
+// changes from a completed session's transcript + notes.
+type ExtractStatePayload struct {
+	SessionID string `json:"session_id"`
+	GuildID   string `json:"guild_id"`
+	// Notify, when true, posts a short DM/channel nudge that proposals are ready
+	// to review. Set for the automatic post-session run; a manual reprocess can
+	// leave it false.
+	Notify bool `json:"notify,omitempty"`
+}
+
+// EmbedCanonPayload carries a request to (re)embed a single canon record for
+// grounded /ask retrieval.
+type EmbedCanonPayload struct {
+	CampaignID string `json:"campaign_id"`
+	// SourceKind is "entity" (world_entities) or "character" (player_characters).
+	SourceKind string `json:"source_kind"`
+	SourceID   string `json:"source_id"`
 }
 
 const queueKey = "discord-dnd-bot:jobs"

@@ -277,6 +277,8 @@ func (g *Gateway) handleAutocomplete(e *events.AutocompleteInteractionCreate) {
 				break
 			}
 		}
+	case "review-session":
+		g.reviewSessionAutocomplete(ctx, guildID, userID, add)
 	}
 	if err := e.AutocompleteResult(choices); err != nil {
 		g.log.Debug("autocomplete result failed", "err", err, "command", data.CommandName)

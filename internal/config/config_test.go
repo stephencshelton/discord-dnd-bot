@@ -74,6 +74,7 @@ func TestLiteLLMModelResolvers(t *testing.T) {
 			"Recap": c.Recap(),
 			"Lore":  c.Lore(),
 			"Ask":   c.Ask(),
+			"State": c.State(),
 		} {
 			if got != "dnd-chat" {
 				t.Errorf("%s() = %q, want fallback %q", name, got, "dnd-chat")
@@ -88,12 +89,14 @@ func TestLiteLLMModelResolvers(t *testing.T) {
 			RecapModel: "dnd-recap",
 			LoreModel:  "dnd-lore",
 			AskModel:   "dnd-ask",
+			StateModel: "dnd-state",
 		}
 		cases := map[string]struct{ got, want string }{
 			"Notes": {c.Notes(), "dnd-notes"},
 			"Recap": {c.Recap(), "dnd-recap"},
 			"Lore":  {c.Lore(), "dnd-lore"},
 			"Ask":   {c.Ask(), "dnd-ask"},
+			"State": {c.State(), "dnd-state"},
 		}
 		for name, tc := range cases {
 			if tc.got != tc.want {

@@ -76,6 +76,7 @@ kubectl apply -f deploy/argocd-application.yaml
 | --- | --- |
 | chat / `/lore` / `/ask` | `claude-4-5-sonnet` |
 | `/session` notes | `claude-opus-4-5` |
+| state extraction (`/review-session`) | `claude-opus-4-5` |
 | `/recap` | `claude-4-5-haiku` |
 | embeddings (`/ask` retrieval) | `amazon-titan-embed-text-v2:0` (dim **1024**) |
 | `/art` | `gpt-image-2` |

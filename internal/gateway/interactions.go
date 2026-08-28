@@ -235,6 +235,8 @@ func (g *Gateway) routeCommand(ic *ictx) {
 		err = g.handleLore(ctx, ic)
 	case "recap":
 		err = g.handleRecap(ctx, ic)
+	case "prep":
+		err = g.handlePrep(ctx, ic)
 	case "search":
 		err = g.handleSearch(ctx, ic)
 	case "ask":
@@ -247,6 +249,10 @@ func (g *Gateway) routeCommand(ic *ictx) {
 		err = g.handleNotesChannel(ctx, ic)
 	case "reindex":
 		err = g.handleReindex(ctx, ic)
+	case "review-session":
+		err = g.handleReviewSession(ctx, ic)
+	case "remember":
+		err = g.handleRemember(ctx, ic)
 	case "feedback":
 		err = g.handleFeedback(ctx, ic)
 	case "help":

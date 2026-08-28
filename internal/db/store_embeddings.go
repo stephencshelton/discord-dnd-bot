@@ -107,12 +107,87 @@ func (s *Store) SearchSimilarNotes(ctx context.Context, campaignID uuid.UUID, qu
 func (s *Store) HasEmbeddings(ctx context.Context, campaignID uuid.UUID) (bool, error) {
 	var exists bool
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM session_embeddings WHERE campaign_id=$1)`, campaignID).
+		`SELECT EXISTS (
+		    SELECT 1 FROM session_embeddings WHERE campaign_id=$1
+		    UNION ALL
+		    SELECT 1 FROM canon_embeddings WHERE campaign_id=$1
+		 )`, campaignID).
 		Scan(&exists)
 	if err != nil && err != pgx.ErrNoRows {
 		return false, err
 	}
 	return exists, nil
+}
+
+// --- Canon embeddings (world entities + player characters, for /ask) ---
+
+// CanonSourceKind distinguishes what a canon embedding describes.
+const (
+	CanonSourceEntity    = "entity"
+	CanonSourceCharacter = "character"
+)
+
+// UpsertCanonEmbedding stores (or replaces) the embedding for a single canon
+// record (world entity or player character), keyed by (source_kind, source_id)
+// so re-embedding an updated record replaces its one row rather than
+// duplicating. An empty vector or content is treated as a delete so a record
+// that loses all its text stops polluting /ask.
+func (s *Store) UpsertCanonEmbedding(ctx context.Context, campaignID uuid.UUID, sourceKind string, sourceID uuid.UUID, content string, embedding []float32) error {
+	if strings.TrimSpace(content) == "" || len(embedding) == 0 {
+		return s.DeleteCanonEmbedding(ctx, sourceKind, sourceID)
+	}
+	_, err := s.db.Pool.Exec(ctx,
+		`INSERT INTO canon_embeddings (campaign_id, source_kind, source_id, content, embedding, updated_at)
+		 VALUES ($1,$2,$3,$4,$5, now())
+		 ON CONFLICT (source_kind, source_id) DO UPDATE
+		   SET campaign_id = EXCLUDED.campaign_id,
+		       content     = EXCLUDED.content,
+		       embedding   = EXCLUDED.embedding,
+		       updated_at  = now()`,
+		campaignID, sourceKind, sourceID, content, vectorLiteral(embedding))
+	return err
+}
+
+// DeleteCanonEmbedding removes a canon record's embedding (e.g. when the entity
+// or character is deleted). Idempotent.
+func (s *Store) DeleteCanonEmbedding(ctx context.Context, sourceKind string, sourceID uuid.UUID) error {
+	_, err := s.db.Pool.Exec(ctx,
+		`DELETE FROM canon_embeddings WHERE source_kind=$1 AND source_id=$2`, sourceKind, sourceID)
+	return err
+}
+
+// SearchSimilarCanon returns the top-k canon passages (entities/PCs) in a
+// campaign most similar to the query embedding, closest first.
+func (s *Store) SearchSimilarCanon(ctx context.Context, campaignID uuid.UUID, query []float32, k int) ([]RetrievedChunk, error) {
+	if k < 1 {
+		k = 5
+	}
+	if k > 20 {
+		k = 20
+	}
+	if len(query) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT content, embedding <=> $2 AS distance
+		   FROM canon_embeddings
+		  WHERE campaign_id=$1
+		  ORDER BY embedding <=> $2
+		  LIMIT $3`,
+		campaignID, vectorLiteral(query), k)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RetrievedChunk
+	for rows.Next() {
+		var rc RetrievedChunk
+		if err := rows.Scan(&rc.Content, &rc.Distance); err != nil {
+			return nil, err
+		}
+		out = append(out, rc)
+	}
+	return out, rows.Err()
 }
 
 // CompletedSessionNote is a completed session's text, used for backfilling
