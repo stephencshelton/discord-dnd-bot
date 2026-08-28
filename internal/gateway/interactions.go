@@ -251,8 +251,6 @@ func (g *Gateway) routeCommand(ic *ictx) {
 		err = g.handleReindex(ctx, ic)
 	case "review-session":
 		err = g.handleReviewSession(ctx, ic)
-	case "remember":
-		err = g.handleRemember(ctx, ic)
 	case "feedback":
 		err = g.handleFeedback(ctx, ic)
 	case "help":

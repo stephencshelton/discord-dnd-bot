@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/disgoorg/disgo/discord"
@@ -139,32 +138,5 @@ func TestReviewSessionCommandIsRegisteredAndAdminGated(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("review-session command not registered")
-	}
-}
-
-// TestRememberCommandRegistered ensures /remember exists and is DM-capable.
-func TestRememberCommandRegistered(t *testing.T) {
-	var found, dm bool
-	for _, sp := range allCommandSpecs() {
-		if sp.def.Name == "remember" {
-			found = true
-			dm = sp.dm
-		}
-	}
-	if !found {
-		t.Fatal("remember command not registered")
-	}
-	if !dm {
-		t.Error("remember should be DM-capable (dm=true)")
-	}
-}
-
-// TestRememberTemplateMentionsReview keeps the help template pointing users at
-// the review flow (so the safety story stays coherent) and shows the format.
-func TestRememberTemplateMentionsReview(t *testing.T) {
-	for _, want := range []string{"/review-session", "/remember", "npc", "location", "faction", "quest"} {
-		if !strings.Contains(rememberTemplate, want) {
-			t.Errorf("rememberTemplate missing %q", want)
-		}
 	}
 }

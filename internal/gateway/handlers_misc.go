@@ -279,6 +279,22 @@ func (g *Gateway) handleAutocomplete(e *events.AutocompleteInteractionCreate) {
 		}
 	case "review-session":
 		g.reviewSessionAutocomplete(ctx, guildID, userID, add)
+	case "world":
+		// Suggest existing entry names for the selected kind (used by /world edit).
+		gid, _ := g.resolveGuild(ctx, guildID, userID)
+		if camp, err := g.store.GetActiveCampaign(ctx, gid); err == nil {
+			kind := db.WorldEntityKind(data.String("kind"))
+			entries, _ := g.store.ListWorldEntities(ctx, camp.ID, kind)
+			partial := strings.ToLower(data.String("name"))
+			for _, ent := range entries {
+				if partial != "" && !strings.Contains(strings.ToLower(ent.Name), partial) {
+					continue
+				}
+				if !add(ent.Name, ent.Name) {
+					break
+				}
+			}
+		}
 	}
 	if err := e.AutocompleteResult(choices); err != nil {
 		g.log.Debug("autocomplete result failed", "err", err, "command", data.CommandName)

@@ -50,12 +50,23 @@ type ExistingEntity struct {
 	Name string
 }
 
-// validKinds is the set of world-entity kinds a proposal may target.
+// ExistingCharacter is the minimal player-character context the extractor needs
+// to attach recorded deeds/facts to a known PC (extraction can only UPDATE
+// characters, never create them — a PC needs a Discord owner).
+type ExistingCharacter struct {
+	ID   uuid.UUID
+	Name string
+}
+
+// validKinds is the set of world-entity kinds a proposal may target. Player
+// characters (db.KindCharacter) are handled separately in normalize since they
+// resolve against existing PCs and are update-only.
 var validKinds = map[db.WorldEntityKind]bool{
 	db.KindNPC:      true,
 	db.KindLocation: true,
 	db.KindFaction:  true,
 	db.KindQuest:    true,
+	db.KindHook:     true,
 }
 
 // entityKey identifies an entity for dedup/resolution: kind + case-folded name.
@@ -82,8 +93,10 @@ type entityKey struct {
 //     kind+name) are merged, keeping the highest confidence.
 //
 // sessionID may be uuid.Nil for manually-authored proposals; callers pass a
-// pointer through to the DB.
-func Parse(raw string, campaignID uuid.UUID, sessionID *uuid.UUID, existing []ExistingEntity) ([]db.StateProposal, error) {
+// pointer through to the DB. `characters` lets the extractor attach recorded
+// deeds/facts to an existing player character (update-only; a character
+// proposal that names no known PC is dropped).
+func Parse(raw string, campaignID uuid.UUID, sessionID *uuid.UUID, existing []ExistingEntity, characters []ExistingCharacter) ([]db.StateProposal, error) {
 	body, err := extractJSONObject(raw)
 	if err != nil {
 		return nil, err
@@ -99,6 +112,11 @@ func Parse(raw string, campaignID uuid.UUID, sessionID *uuid.UUID, existing []Ex
 	for _, e := range existing {
 		byName[entityKey{e.Kind, strings.ToLower(strings.TrimSpace(e.Name))}] = e
 	}
+	// Index existing player characters by case-folded name.
+	byCharName := make(map[string]ExistingCharacter, len(characters))
+	for _, c := range characters {
+		byCharName[strings.ToLower(strings.TrimSpace(c.Name))] = c
+	}
 
 	// Merge duplicate proposals within the batch by (kind, lower(name)).
 	merged := map[entityKey]db.StateProposal{}
@@ -108,7 +126,7 @@ func Parse(raw string, campaignID uuid.UUID, sessionID *uuid.UUID, existing []Ex
 		if len(merged) >= maxProposals {
 			break
 		}
-		p, ok := normalize(rp, campaignID, sessionID, byName)
+		p, ok := normalize(rp, campaignID, sessionID, byName, byCharName)
 		if !ok {
 			continue
 		}
@@ -130,14 +148,16 @@ func Parse(raw string, campaignID uuid.UUID, sessionID *uuid.UUID, existing []Ex
 
 // normalize validates and canonicalizes a single raw proposal. It returns
 // (proposal, true) if the proposal is usable, or (_, false) to drop it.
-func normalize(rp rawProposal, campaignID uuid.UUID, sessionID *uuid.UUID, byName map[entityKey]ExistingEntity) (db.StateProposal, bool) {
+func normalize(rp rawProposal, campaignID uuid.UUID, sessionID *uuid.UUID, byName map[entityKey]ExistingEntity, byCharName map[string]ExistingCharacter) (db.StateProposal, bool) {
 	name := strings.TrimSpace(rp.EntityName)
 	kind := db.WorldEntityKind(strings.ToLower(strings.TrimSpace(rp.EntityKind)))
 	evidence := strings.TrimSpace(rp.Evidence)
 
-	// Hard requirements: a valid kind, a name, and supporting evidence. The
-	// evidence rule enforces the "conservative, justified" contract in the prompt.
-	if !validKinds[kind] || name == "" || evidence == "" {
+	// A name and supporting evidence are always required (the evidence rule
+	// enforces the "conservative, justified" contract). The kind must be a valid
+	// world kind OR the special character target.
+	isCharacter := kind == db.KindCharacter
+	if (!validKinds[kind] && !isCharacter) || name == "" || evidence == "" {
 		return db.StateProposal{}, false
 	}
 
@@ -171,6 +191,21 @@ func normalize(rp rawProposal, campaignID uuid.UUID, sessionID *uuid.UUID, byNam
 		Evidence:    evidence,
 		Confidence:  conf,
 		Status:      db.ProposalPending,
+	}
+
+	// Player-character target: attach recorded deeds/facts to an EXISTING PC.
+	// Extraction never creates a character (needs a Discord owner), so drop the
+	// proposal if it names no known PC. Always an update action.
+	if isCharacter {
+		pc, ok := byCharName[strings.ToLower(name)]
+		if !ok {
+			return db.StateProposal{}, false
+		}
+		p.Action = db.ActionUpdateEntity
+		idCopy := pc.ID
+		p.EntityID = &idCopy
+		p.EntityName = pc.Name // canonical casing
+		return p, true
 	}
 
 	// Resolve create-vs-update against existing entities (case-insensitive).

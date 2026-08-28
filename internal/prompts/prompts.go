@@ -121,14 +121,14 @@ briefly rather than guessing.
 
 Output these Markdown sections, omitting any that have no content:
 ## Where we left off (2-4 sentences: the party's current situation & location)
-## Open threads & cliffhangers (bullets — unresolved hooks to address)
+## Open threads & hooks (bullets — unresolved threads/cliffhangers to address)
 ## Active quests (bullets — name: current objective/status)
 ## Key NPCs & factions in play (bullets — name: one-line why they matter now)
 ## Likely next steps (2-4 bullets: what the party may do; framed as options, not railroad)
 Keep it tight and usable at a glance.`
 
 // PrepUser assembles the prep briefing input from concrete campaign state.
-func PrepUser(campaignName, system, lastSessionDate, lastSessionNotes string, activeQuests, keyEntities, characters []string) string {
+func PrepUser(campaignName, system, lastSessionDate, lastSessionNotes string, activeQuests, openHooks, keyEntities, characters []string) string {
 	var b strings.Builder
 	b.WriteString("Campaign: ")
 	b.WriteString(nonEmpty(campaignName, "Untitled Campaign"))
@@ -163,6 +163,7 @@ func PrepUser(campaignName, system, lastSessionDate, lastSessionNotes string, ac
 		}
 	}
 	writeList("Active quests", activeQuests)
+	writeList("Open story hooks / threads", openHooks)
 	writeList("Key world entities (NPCs, locations, factions)", keyEntities)
 	writeList("Player characters", characters)
 
@@ -224,12 +225,12 @@ const StateExtractionSchema = `Return a JSON object with this exact shape:
   "proposals": [
     {
       "action": "create_entity" | "update_entity",
-      "entity_kind": "npc" | "location" | "faction" | "quest",
+      "entity_kind": "npc" | "location" | "faction" | "quest" | "hook" | "character",
       "existing_entity_id": "<uuid of the entity being updated, or null for create_entity>",
-      "entity_name": "<canonical name of the NPC/location/faction/quest>",
+      "entity_name": "<canonical name of the subject>",
       "patch": {
         "description": "<the new or updated description text>",
-        "...": "<optional extra structured fields, e.g. \"status\":\"completed\" for a quest>"
+        "...": "<optional structured fields for this kind — see the field guide below>"
       },
       "explanation": "<one short sentence summarizing the change>",
       "evidence": "<short quote/paraphrase from the session supporting this>",
@@ -238,15 +239,30 @@ const StateExtractionSchema = `Return a JSON object with this exact shape:
   ]
 }
 
-Entity-kind guidance (map everything onto these four kinds):
-- npc: a character (new NPC discovered, or new info about an existing one). Important
-  NPC/party relationship changes and meaningful character facts also go here, on the
-  relevant NPC, via description/patch.
-- location: a place discovered or whose details changed.
-- faction: an organization/group discovered or whose details changed.
-- quest: a quest, objective, unresolved story hook, or important item/clue/fact worth
-  remembering. For a quest status change, put e.g. "status":"completed" in patch and say
-  so in the description/explanation.
+Entity-kind guidance and the structured "patch" fields to use for each (all
+optional, but prefer filling them so entries are consistent with hand-authored
+ones). Put freeform prose in "description" and specifics in these keys:
+- npc: a character (new NPC discovered, or new info about an existing one).
+  Fields: "role" (title/role), "location" (where usually found), "status"
+  (attitude: ally/hostile/missing/...). Relationship changes with the party go
+  here on the relevant NPC.
+- location: a place discovered or changed.
+  Fields: "region" (larger area), "features" (notable features).
+- faction: an organization/group discovered or changed.
+  Fields: "goals", "members" (key figures), "status" (allied/hostile/unknown).
+- quest: a quest or objective with a clear goal.
+  Fields: "status" (active/completed/failed), "objective" (what to do),
+  "giver" (who assigned it). For a status change set "status" accordingly.
+- hook: an UNRESOLVED story thread the party could pursue (a mysterious letter,
+  an unanswered summons) that isn't yet a full quest.
+  Fields: "status" (open/being pursued/dropped), "related" (NPC/location/faction
+  it connects to).
+- character: a PLAYER character. Use ONLY to record something a player character
+  DID or a fact established about them this session (append to their record).
+  Only propose this for a name in the "Player characters" list above; never
+  invent a new player character. entity_name must match that PC's name.
+
+Rules for items/loot: do NOT propose those — they're tracked elsewhere.
 
 If nothing meaningful changed, return {"proposals": []}.`
 
@@ -295,5 +311,38 @@ func StateExtractionUser(campaignName, system, premise string, characters, exist
 	b.WriteString("\nTRANSCRIPT>>>\n\n")
 
 	b.WriteString(StateExtractionSchema)
+	return b.String()
+}
+
+// CriticSystem instructs the model to act as a strict editor that keeps only
+// GENUINELY noteworthy campaign-state proposals, so a human DM isn't bugged with
+// trivia. It emits strict JSON referencing candidates by their given index.
+const CriticSystem = `You are a discerning tabletop-RPG campaign editor.
+You are given a numbered list of CANDIDATE campaign-state changes another AI proposed from a
+session. Your job is to keep ONLY the ones a Dungeon Master would genuinely want recorded —
+things with lasting significance to the campaign world or story — and discard trivia,
+one-off color, routine actions, and anything too vague to be useful.
+
+Keep: newly-named NPCs/locations/factions the party actually engaged with; quest starts,
+completions, or status changes; meaningful relationship shifts; durable facts/discoveries;
+unresolved hooks worth following up; notable character deeds with lasting weight.
+Discard: passing scenery, routine travel/rests, combat blow-by-blow, restated known facts,
+speculation, and anything a DM wouldn't bother writing in their campaign notes.
+
+Output STRICT JSON only, no prose: {"keep": [<index>, ...]} listing the indices (as given) of
+the candidates worth keeping. Keep an empty array if none qualify. Be selective — when in
+doubt, leave it out.`
+
+// CriticUser renders the candidate proposals as a numbered list for the critic.
+// Each candidate is summarized compactly (kind, name, explanation/description,
+// evidence, confidence) so the editor can judge significance. Indices are
+// 0-based and stable with the caller's slice order.
+func CriticUser(candidates []string) string {
+	var b strings.Builder
+	b.WriteString("Candidate campaign-state changes:\n")
+	for i, c := range candidates {
+		fmt.Fprintf(&b, "\n[%d] %s\n", i, strings.TrimSpace(c))
+	}
+	b.WriteString("\nReturn {\"keep\": [...]} with the indices worth recording.")
 	return b.String()
 }

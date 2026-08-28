@@ -118,7 +118,7 @@ func (g *Gateway) handleAsk(ctx context.Context, ic *ictx) error {
 	// session transcripts AND curated canon (world entities + player characters),
 	// then merge by similarity. This lets /ask answer from what was said at the
 	// table (transcripts) and from DM-authored / AI-approved facts (canon) — e.g.
-	// an NPC added via /world add, or a fact from /remember — in one answer.
+	// an NPC added via /world add, or a character deed via /character edit — in one answer.
 	transcriptChunks, err := g.store.SearchSimilarNotes(ctx, camp.ID, qvecs[0], 12)
 	if err != nil {
 		return err
@@ -176,16 +176,22 @@ func (g *Gateway) handlePrep(ctx context.Context, ic *ictx) error {
 		}
 	}
 
-	// Current world state: active quests, key NPCs/locations/factions, and PCs.
-	var activeQuests, keyEntities []string
+	// Current world state: active quests, open story hooks, key NPCs/locations/
+	// factions, and PCs.
+	var activeQuests, openHooks, keyEntities []string
 	if entities, eerr := g.store.ListAllWorldEntities(ctx, camp.ID); eerr == nil {
 		for _, ent := range entities {
 			line := entityPrepLine(ent)
-			if ent.Kind == db.KindQuest && isActiveQuest(ent) {
-				activeQuests = append(activeQuests, line)
-				continue
-			}
-			if ent.Kind != db.KindQuest {
+			switch ent.Kind {
+			case db.KindQuest:
+				if isActiveQuest(ent) {
+					activeQuests = append(activeQuests, line)
+				}
+			case db.KindHook:
+				if isOpenHook(ent) {
+					openHooks = append(openHooks, line)
+				}
+			default:
 				keyEntities = append(keyEntities, line)
 			}
 		}
@@ -198,18 +204,21 @@ func (g *Gateway) handlePrep(ctx context.Context, ic *ictx) error {
 			if descr != "" {
 				line += " — " + descr
 			}
+			if strings.TrimSpace(pc.Notes) != "" {
+				line += " — " + pc.Notes
+			}
 			characters = append(characters, line)
 		}
 	}
 
 	// If there's genuinely nothing to work from, say so instead of an empty sheet.
-	if lastNotes == "" && len(activeQuests) == 0 && len(keyEntities) == 0 && len(characters) == 0 {
+	if lastNotes == "" && len(activeQuests) == 0 && len(openHooks) == 0 && len(keyEntities) == 0 && len(characters) == 0 {
 		return ic.followup("There's nothing to prep from yet — record a session with `/session start`, or add quests/NPCs/characters with `/world add` and `/character add`.")
 	}
 
 	msgs := []litellm.Message{
 		{Role: "system", Content: prompts.PrepSystem},
-		{Role: "user", Content: prompts.PrepUser(camp.Name, camp.System, lastDate, lastNotes, activeQuests, keyEntities, characters)},
+		{Role: "user", Content: prompts.PrepUser(camp.Name, camp.System, lastDate, lastNotes, activeQuests, openHooks, keyEntities, characters)},
 	}
 	briefing, err := g.ai.Chat(ctx, g.cfg.LiteLLM.Recap(), msgs, 900)
 	if err != nil {
@@ -246,6 +255,18 @@ func isActiveQuest(e db.WorldEntity) bool {
 	status, _ := e.Metadata["status"].(string)
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "completed", "complete", "done", "failed", "resolved", "closed", "abandoned":
+		return false
+	default:
+		return true
+	}
+}
+
+// isOpenHook reports whether a story hook is still dangling. A hook with no
+// status is treated as open; only an explicit terminal status excludes it.
+func isOpenHook(e db.WorldEntity) bool {
+	status, _ := e.Metadata["status"].(string)
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "dropped", "resolved", "closed", "done", "abandoned", "completed":
 		return false
 	default:
 		return true

@@ -25,6 +25,19 @@ func modalFieldIDs(m discord.ModalCreate) []string {
 	return ids
 }
 
+// modalFieldValues maps each text-input custom ID to its prefilled value.
+func modalFieldValues(m discord.ModalCreate) map[string]string {
+	out := map[string]string{}
+	for _, c := range m.Components {
+		if label, ok := c.(discord.LabelComponent); ok {
+			if ti, ok := label.Component.(discord.TextInputComponent); ok {
+				out[ti.GetCustomID()] = ti.Value
+			}
+		}
+	}
+	return out
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {
@@ -43,6 +56,7 @@ func TestWorldAddModalKindFields(t *testing.T) {
 		db.KindLocation: {"name", "region", "features", "description"},
 		db.KindFaction:  {"name", "goals", "members", "status", "description"},
 		db.KindQuest:    {"name", "status", "objective", "giver", "description"},
+		db.KindHook:     {"name", "status", "related", "description"},
 	}
 	for kind, want := range cases {
 		m := worldAddModal(kind)
@@ -66,6 +80,82 @@ func TestWorldAddModalKindFields(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestWorldEditModalPrefillsAndReplacePrefix verifies the edit form uses the
+// we: prefix (replace semantics) and prefills name/description/metadata.
+func TestWorldEditModalPrefillsAndReplacePrefix(t *testing.T) {
+	existing := &db.WorldEntity{
+		Kind: db.KindNPC, Name: "Captain Varek",
+		Description: "Commander of the Eastwatch guard.",
+		Metadata:    map[string]any{"role": "commander", "status": "ally"},
+	}
+	m := worldEntityModal(db.KindNPC, existing, true)
+	if m.CustomID != worldEditModalPrefix+":"+string(db.KindNPC) {
+		t.Errorf("edit modal custom id = %q, want we: prefix", m.CustomID)
+	}
+	vals := modalFieldValues(m)
+	if vals["name"] != "Captain Varek" {
+		t.Errorf("name not prefilled: %q", vals["name"])
+	}
+	if vals["description"] != "Commander of the Eastwatch guard." {
+		t.Errorf("description not prefilled: %q", vals["description"])
+	}
+	if vals["role"] != "commander" || vals["status"] != "ally" {
+		t.Errorf("metadata not prefilled: %+v", vals)
+	}
+}
+
+// TestWorldAddModalBlankNoPrefill verifies the add form is blank (append flow).
+func TestWorldAddModalBlankNoPrefill(t *testing.T) {
+	m := worldAddModal(db.KindNPC)
+	for _, v := range modalFieldValues(m) {
+		if v != "" {
+			t.Errorf("add modal should have no prefilled values, got %q", v)
+		}
+	}
+}
+
+// TestWorldCommandSubcommands verifies /world exposes add, edit, list, and
+// delete — so every world kind (incl. story hooks) can be created, edited,
+// listed, and deleted.
+func TestWorldCommandSubcommands(t *testing.T) {
+	subs := subcommandNames(t, "world")
+	for _, want := range []string{"add", "edit", "list", "delete"} {
+		if !contains(subs, want) {
+			t.Errorf("/world missing %q subcommand (have %v)", want, subs)
+		}
+	}
+}
+
+// TestCharacterCommandSubcommands verifies /character exposes add, edit, list,
+// and delete.
+func TestCharacterCommandSubcommands(t *testing.T) {
+	subs := subcommandNames(t, "character")
+	for _, want := range []string{"add", "edit", "list", "delete"} {
+		if !contains(subs, want) {
+			t.Errorf("/character missing %q subcommand (have %v)", want, subs)
+		}
+	}
+}
+
+// subcommandNames returns the subcommand names of a registered top-level command.
+func subcommandNames(t *testing.T, command string) []string {
+	t.Helper()
+	for _, sp := range allCommandSpecs() {
+		if sp.def.Name != command {
+			continue
+		}
+		var out []string
+		for _, o := range sp.def.Options {
+			if sub, ok := o.(discord.ApplicationCommandOptionSubCommand); ok {
+				out = append(out, sub.Name)
+			}
+		}
+		return out
+	}
+	t.Fatalf("command %q not registered", command)
+	return nil
 }
 
 // TestWorldAddModalUnknownKind falls back to a plain description-only form.

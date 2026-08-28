@@ -29,80 +29,129 @@ import (
 //   - character: "ca"        (single form)
 
 const (
-	worldAddModalPrefix = "wa"
-	characterAddModalID = "ca"
+	worldAddModalPrefix  = "wa"
+	worldEditModalPrefix = "we"
+	characterAddModalID  = "ca"
 )
 
-// --- /world add ---
-
-// worldAddModal builds the kind-specific structured form for a world entity.
-// Every kind collects a Name and a free Description/Notes; the middle fields are
-// the structured, kind-appropriate metadata that make the entry useful later.
-func worldAddModal(kind db.WorldEntityKind) discord.ModalCreate {
-	name := discord.NewShortTextInput("name").WithRequired(true).WithPlaceholder("Name")
-
-	m := discord.NewModalCreate(worldAddModalPrefix+":"+string(kind), "Add "+entityKindLabel(kind)).
-		AddLabel("Name", name)
-
-	// Kind-specific structured fields (all optional so a quick stub still works).
-	switch kind {
-	case db.KindNPC:
-		m = m.
-			AddLabel("Role / Title", discord.NewShortTextInput("role").WithRequired(false).WithPlaceholder("e.g. Commander of the Eastwatch guard")).
-			AddLabel("Location", discord.NewShortTextInput("location").WithRequired(false).WithPlaceholder("Where are they usually found?")).
-			AddLabel("Attitude / Status", discord.NewShortTextInput("status").WithRequired(false).WithPlaceholder("e.g. ally, hostile, missing")).
-			AddLabel("Description", discord.NewParagraphTextInput("description").WithRequired(false).WithPlaceholder("Who are they? What should we remember?"))
-	case db.KindLocation:
-		m = m.
-			AddLabel("Region", discord.NewShortTextInput("region").WithRequired(false).WithPlaceholder("What larger area is this in?")).
-			AddLabel("Notable features", discord.NewShortTextInput("features").WithRequired(false).WithPlaceholder("e.g. fortified border town, gateway to the pass")).
-			AddLabel("Description", discord.NewParagraphTextInput("description").WithRequired(false).WithPlaceholder("What is this place? What happened here?"))
-	case db.KindFaction:
-		m = m.
-			AddLabel("Goals", discord.NewShortTextInput("goals").WithRequired(false).WithPlaceholder("What do they want?")).
-			AddLabel("Notable members", discord.NewShortTextInput("members").WithRequired(false).WithPlaceholder("Leaders / key figures")).
-			AddLabel("Attitude / Status", discord.NewShortTextInput("status").WithRequired(false).WithPlaceholder("e.g. allied, hostile, unknown")).
-			AddLabel("Description", discord.NewParagraphTextInput("description").WithRequired(false).WithPlaceholder("Who are they? What should we remember?"))
-	case db.KindQuest:
-		m = m.
-			AddLabel("Status", discord.NewShortTextInput("status").WithRequired(false).WithPlaceholder("e.g. active, completed, failed")).
-			AddLabel("Objective", discord.NewShortTextInput("objective").WithRequired(false).WithPlaceholder("What must the party do?")).
-			AddLabel("Quest giver", discord.NewShortTextInput("giver").WithRequired(false).WithPlaceholder("Who assigned it?")).
-			AddLabel("Description", discord.NewParagraphTextInput("description").WithRequired(false).WithPlaceholder("Details, stakes, complications"))
-	default:
-		m = m.AddLabel("Description", discord.NewParagraphTextInput("description").WithRequired(false))
-	}
-	return m
+// appendDetail returns existing with addition appended on its own line, so an
+// entity that "comes back up" accumulates detail rather than overwriting it.
+// Delegates to db.AppendDetail so the ADD/accrue semantics match the proposal
+// apply path exactly (dedup-aware; deliberate replacement is done by /world edit).
+func appendDetail(existing, addition string) string {
+	return db.AppendDetail(existing, addition)
 }
 
-// worldMetadataFields lists, per kind, the modal text-input custom IDs that map
-// to structured metadata (everything except name/description). Keeping this in
-// one place keeps the modal builder and submit handler in sync.
-func worldMetadataFields(kind db.WorldEntityKind) []string {
+// worldFieldLabels maps a metadata field custom-ID to its human label +
+// placeholder, per kind. Order matters (it's the modal layout). The special
+// "description" field is always appended last by the builder.
+type worldField struct{ id, label, placeholder string }
+
+func worldFields(kind db.WorldEntityKind) []worldField {
 	switch kind {
 	case db.KindNPC:
-		return []string{"role", "location", "status"}
+		return []worldField{
+			{"role", "Role / Title", "e.g. Commander of the Eastwatch guard"},
+			{"location", "Location", "Where are they usually found?"},
+			{"status", "Attitude / Status", "e.g. ally, hostile, missing"},
+		}
 	case db.KindLocation:
-		return []string{"region", "features"}
+		return []worldField{
+			{"region", "Region", "What larger area is this in?"},
+			{"features", "Notable features", "e.g. fortified border town, gateway to the pass"},
+		}
 	case db.KindFaction:
-		return []string{"goals", "members", "status"}
+		return []worldField{
+			{"goals", "Goals", "What do they want?"},
+			{"members", "Notable members", "Leaders / key figures"},
+			{"status", "Attitude / Status", "e.g. allied, hostile, unknown"},
+		}
 	case db.KindQuest:
-		return []string{"status", "objective", "giver"}
+		return []worldField{
+			{"status", "Status", "e.g. active, completed, failed"},
+			{"objective", "Objective", "What must the party do?"},
+			{"giver", "Quest giver", "Who assigned it?"},
+		}
+	case db.KindHook:
+		return []worldField{
+			{"status", "Status", "e.g. open, being pursued, dropped"},
+			{"related", "Tied to", "NPC/location/faction it connects to"},
+		}
 	default:
 		return nil
 	}
 }
 
-// handleWorldAddModalSubmit persists the world entity from a submitted modal. It
-// upserts by (kind, case-insensitive name): a matching existing entity is
-// updated (merging the structured metadata and refreshing the description),
-// otherwise a new one is created. Structured fields go into metadata JSONB; a
-// display description is stored in the description column.
-func (g *Gateway) handleWorldAddModalSubmit(ctx context.Context, e *events.ModalSubmitInteractionCreate) {
-	kind := db.WorldEntityKind(strings.TrimPrefix(e.Data.CustomID, worldAddModalPrefix+":"))
-	switch kind {
-	case db.KindNPC, db.KindLocation, db.KindFaction, db.KindQuest:
-	default:
+// --- /world add & /world edit ---
+
+// worldEntityModal builds the kind-specific structured form. When edit is false
+// (the /world add flow) the form is blank and the submit APPENDS to any existing
+// entity of the same name. When edit is true (/world edit) it is prefilled from
+// `existing` and the submit REPLACES that entity's fields. The custom ID encodes
+// which flow it is (wa:<kind> vs we:<kind>) and, for edit, the entity name.
+func worldEntityModal(kind db.WorldEntityKind, existing *db.WorldEntity, edit bool) discord.ModalCreate {
+	name := discord.NewShortTextInput("name").WithRequired(true).WithPlaceholder("Name")
+	desc := discord.NewParagraphTextInput("description").WithRequired(false)
+
+	customID := worldAddModalPrefix + ":" + string(kind)
+	title := "Add " + entityKindLabel(kind)
+	if edit {
+		customID = worldEditModalPrefix + ":" + string(kind)
+		title = "Edit " + entityKindLabel(kind)
+		desc = desc.WithPlaceholder("Replaces the current description")
+	} else {
+		desc = desc.WithPlaceholder("What should we remember? (added to any existing notes)")
+	}
+
+	fields := worldFields(kind)
+	// Prefill from the existing entity on edit.
+	if edit && existing != nil {
+		name = name.WithValue(existing.Name)
+		desc = desc.WithValue(existing.Description)
+	}
+
+	m := discord.NewModalCreate(customID, title).AddLabel("Name", name)
+	for _, f := range fields {
+		in := discord.NewShortTextInput(f.id).WithRequired(false).WithPlaceholder(f.placeholder)
+		if edit && existing != nil {
+			if v, ok := existing.Metadata[f.id].(string); ok {
+				in = in.WithValue(v)
+			}
+		}
+		m = m.AddLabel(f.label, in)
+	}
+	m = m.AddLabel("Description", desc)
+	return m
+}
+
+// worldAddModal is the blank add form (append semantics).
+func worldAddModal(kind db.WorldEntityKind) discord.ModalCreate {
+	return worldEntityModal(kind, nil, false)
+}
+
+// worldMetadataFields lists, per kind, the modal text-input custom IDs that map
+// to structured metadata (everything except name/description). Derived from
+// worldFields so the builder and submit handler can't drift.
+func worldMetadataFields(kind db.WorldEntityKind) []string {
+	fs := worldFields(kind)
+	out := make([]string, 0, len(fs))
+	for _, f := range fs {
+		out = append(out, f.id)
+	}
+	return out
+}
+
+// handleWorldEntityModalSubmit persists a world entity from either the add form
+// (append to an existing same-named entity, or create) or the edit form (replace
+// the targeted entity's fields). Structured fields go into metadata JSONB; the
+// description column holds display/searchable prose.
+func (g *Gateway) handleWorldEntityModalSubmit(ctx context.Context, e *events.ModalSubmitInteractionCreate, isEdit bool) {
+	prefix := worldAddModalPrefix
+	if isEdit {
+		prefix = worldEditModalPrefix
+	}
+	kind := db.WorldEntityKind(strings.TrimPrefix(e.Data.CustomID, prefix+":"))
+	if !db.ValidWorldKind(kind) {
 		_ = e.CreateMessage(discord.MessageCreate{Content: "Unknown world entry type.", Flags: discord.MessageFlagEphemeral})
 		return
 	}
@@ -133,45 +182,51 @@ func (g *Gateway) handleWorldAddModalSubmit(ctx context.Context, e *events.Modal
 		}
 	}
 
-	// Upsert by case-insensitive name within kind (consistent with proposal apply
-	// and the unique index), so re-adding an entity edits it instead of failing.
 	existing, gerr := g.store.GetWorldEntityByName(ctx, camp.ID, kind, name)
 	verb := "Added"
 	var entityID uuid.UUID
 	switch {
 	case gerr == nil:
-		// Merge metadata onto the existing entity; keep the old description when
-		// the form left it blank so an edit doesn't wipe prior text.
-		merged := map[string]any{}
-		for k, v := range existing.Metadata {
-			merged[k] = v
-		}
-		for k, v := range meta {
-			merged[k] = v
-		}
-		desc := existing.Description
-		if description != "" {
+		verb = "Updated"
+		var (
+			desc   string
+			merged = map[string]any{}
+		)
+		if isEdit {
+			// EDIT: replace description and metadata with the submitted values
+			// (the form was prefilled, so the user saw and chose the full text).
 			desc = description
+			merged = meta
+		} else {
+			// ADD: accumulate — merge metadata and APPEND new description so prior
+			// hand-written detail is never lost.
+			for k, v := range existing.Metadata {
+				merged[k] = v
+			}
+			for k, v := range meta {
+				merged[k] = v
+			}
+			desc = appendDetail(existing.Description, description)
 		}
-		if err := g.store.UpdateWorldEntityFull(ctx, existing.ID, existing.Name, desc, merged); err != nil {
-			g.log.Error("world add modal: update", "err", err)
+		if err := g.store.UpdateWorldEntityFull(ctx, existing.ID, name, desc, merged); err != nil {
+			g.log.Error("world modal: update", "err", err, "edit", isEdit)
 			_ = e.CreateMessage(discord.MessageCreate{Content: "Couldn't save that. Please try again.", Flags: discord.MessageFlagEphemeral})
 			return
 		}
 		entityID = existing.ID
-		verb = "Updated"
 	case errors.Is(gerr, db.ErrNotFound):
-		created, err := g.store.CreateWorldEntity(ctx, db.WorldEntity{
+		// Edit of a non-existent entity falls through to create (nothing lost).
+		created, cerr := g.store.CreateWorldEntity(ctx, db.WorldEntity{
 			CampaignID: camp.ID, Kind: kind, Name: name, Description: description, Metadata: meta,
 		})
-		if err != nil {
-			g.log.Error("world add modal: create", "err", err)
+		if cerr != nil {
+			g.log.Error("world modal: create", "err", cerr, "edit", isEdit)
 			_ = e.CreateMessage(discord.MessageCreate{Content: "Couldn't save that. Please try again.", Flags: discord.MessageFlagEphemeral})
 			return
 		}
 		entityID = created.ID
 	default:
-		g.log.Error("world add modal: lookup", "err", gerr)
+		g.log.Error("world modal: lookup", "err", gerr)
 		_ = e.CreateMessage(discord.MessageCreate{Content: "Couldn't save that. Please try again.", Flags: discord.MessageFlagEphemeral})
 		return
 	}
@@ -180,7 +235,7 @@ func (g *Gateway) handleWorldAddModalSubmit(ctx context.Context, e *events.Modal
 	g.enqueueCanonEmbed(ctx, camp.ID, db.CanonSourceEntity, entityID)
 
 	logging.FromContext(ctx, g.log).Info("world entity saved via modal",
-		"campaign", camp.ID, "kind", kind, "name", name, "verb", verb, "user", e.User().ID.String())
+		"campaign", camp.ID, "kind", kind, "name", name, "verb", verb, "edit", isEdit, "user", e.User().ID.String())
 	_ = e.CreateMessage(discord.MessageCreate{
 		Content: fmt.Sprintf("🌍 %s %s **%s**.", verb, entityKindLabel(kind), name),
 		Flags:   discord.MessageFlagEphemeral,

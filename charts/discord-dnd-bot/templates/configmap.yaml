@@ -69,3 +69,6 @@ data:
   WORKER_TRANSCRIBE_JOB_TIMEOUT: {{ .Values.config.worker.transcribeJobTimeout | quote }}
   WORKER_JOB_TIMEOUT: {{ .Values.config.worker.jobTimeout | quote }}
   WORKER_MAX_RETRIES: {{ .Values.config.worker.maxRetries | quote }}
+
+  EXTRACT_MIN_CONFIDENCE: {{ .Values.config.extraction.minConfidence | quote }}
+  EXTRACT_CRITIC: {{ .Values.config.extraction.critic | quote }}

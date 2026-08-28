@@ -129,10 +129,11 @@ func allCommandSpecs() []commandSpec {
 			Description: "Manage player characters",
 			Options: []discord.ApplicationCommandOption{
 				discord.ApplicationCommandOptionSubCommand{Name: "add", Description: "Add or update your character (opens a form)"},
+				discord.ApplicationCommandOptionSubCommand{Name: "edit", Description: "Edit your character (opens a pre-filled form)"},
 				discord.ApplicationCommandOptionSubCommand{Name: "list", Description: "List characters in the active campaign"},
 				discord.ApplicationCommandOptionSubCommand{
-					Name:        "remove",
-					Description: "Remove a character",
+					Name:        "delete",
+					Description: "Delete a character",
 					Options: []discord.ApplicationCommandOption{
 						discord.ApplicationCommandOptionString{Name: "name", Description: "Character name", Required: true, Autocomplete: true},
 					},
@@ -142,13 +143,21 @@ func allCommandSpecs() []commandSpec {
 
 		{dm: true, def: discord.SlashCommandCreate{
 			Name:        "world",
-			Description: "Manage worldbuilding entries (NPCs, locations, factions, quests)",
+			Description: "Manage worldbuilding entries (NPCs, locations, factions, quests, story hooks)",
 			Options: []discord.ApplicationCommandOption{
 				discord.ApplicationCommandOptionSubCommand{
 					Name:        "add",
-					Description: "Add or update a world entry (opens a form)",
+					Description: "Add to a world entry (opens a form; adds detail, never overwrites)",
 					Options: []discord.ApplicationCommandOption{
 						discord.ApplicationCommandOptionString{Name: "kind", Description: "Type of entry", Required: true, Choices: worldKindChoices()},
+					},
+				},
+				discord.ApplicationCommandOptionSubCommand{
+					Name:        "edit",
+					Description: "Edit a world entry (opens a pre-filled form; replaces its fields)",
+					Options: []discord.ApplicationCommandOption{
+						discord.ApplicationCommandOptionString{Name: "kind", Description: "Type of entry", Required: true, Choices: worldKindChoices()},
+						discord.ApplicationCommandOptionString{Name: "name", Description: "Which entry to edit", Required: true, Autocomplete: true},
 					},
 				},
 				discord.ApplicationCommandOptionSubCommand{
@@ -156,6 +165,14 @@ func allCommandSpecs() []commandSpec {
 					Description: "List world entries",
 					Options: []discord.ApplicationCommandOption{
 						discord.ApplicationCommandOptionString{Name: "kind", Description: "Filter by type", Choices: worldKindChoices()},
+					},
+				},
+				discord.ApplicationCommandOptionSubCommand{
+					Name:        "delete",
+					Description: "Delete a world entry",
+					Options: []discord.ApplicationCommandOption{
+						discord.ApplicationCommandOptionString{Name: "kind", Description: "Type of entry", Required: true, Choices: worldKindChoices()},
+						discord.ApplicationCommandOptionString{Name: "name", Description: "Which entry to delete", Required: true, Autocomplete: true},
 					},
 				},
 			},
@@ -285,16 +302,6 @@ func allCommandSpecs() []commandSpec {
 		}},
 
 		{dm: true, def: discord.SlashCommandCreate{
-			Name:        "remember",
-			Description: "Add something to campaign memory the AI missed (proposed for DM approval)",
-			Options: []discord.ApplicationCommandOption{
-				discord.ApplicationCommandOptionString{Name: "kind", Description: "Type of entry", Choices: worldKindChoices()},
-				discord.ApplicationCommandOptionString{Name: "name", Description: "Name of the NPC/location/faction/quest"},
-				discord.ApplicationCommandOptionString{Name: "note", Description: "What should the campaign remember?"},
-			},
-		}},
-
-		{dm: true, def: discord.SlashCommandCreate{
 			Name:        "feedback",
 			Description: "Send feedback to the bot team",
 			Options: []discord.ApplicationCommandOption{
@@ -327,6 +334,7 @@ func worldKindChoices() []discord.ApplicationCommandOptionChoiceString {
 		{Name: "Location", Value: "location"},
 		{Name: "Faction", Value: "faction"},
 		{Name: "Quest", Value: "quest"},
+		{Name: "Story hook", Value: "hook"},
 	}
 }
 

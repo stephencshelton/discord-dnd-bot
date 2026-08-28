@@ -193,6 +193,10 @@ func entityKindLabel(k db.WorldEntityKind) string {
 		return "Faction"
 	case db.KindQuest:
 		return "Quest"
+	case db.KindHook:
+		return "Story hook"
+	case db.KindCharacter:
+		return "Player character"
 	default:
 		return string(k)
 	}
@@ -274,7 +278,7 @@ func (g *Gateway) handleReviewButton(ctx context.Context, e *events.ComponentInt
 		return e.Modal(editModal(*prop))
 
 	case reviewApprove:
-		entity, applied, aerr := g.store.ApproveProposal(ctx, proposalID, reviewerID)
+		change, applied, aerr := g.store.ApproveProposal(ctx, proposalID, reviewerID)
 		if aerr != nil {
 			return aerr
 		}
@@ -282,10 +286,17 @@ func (g *Gateway) handleReviewButton(ctx context.Context, e *events.ComponentInt
 		if applied {
 			metrics.StateProposalsReviewed.WithLabelValues("approved").Inc()
 			logging.FromContext(ctx, g.log).Info("proposal approved",
-				"entity", entity.ID, "name", entity.Name, "kind", entity.Kind, "reviewer", reviewerID)
-			// Make the newly-canon entity retrievable by /ask (async, best-effort).
-			g.enqueueCanonEmbed(ctx, entity.CampaignID, db.CanonSourceEntity, entity.ID)
-			msg = fmt.Sprintf("✅ Approved — **%s** is now part of your campaign world.", prop.EntityName)
+				"source_kind", change.SourceKind, "source", change.SourceID, "name", change.DisplayName, "reviewer", reviewerID)
+			// Make the newly-canon record retrievable by /ask (async, best-effort).
+			// A character proposal with no matching PC has a zero SourceID — skip.
+			if change.SourceID != uuid.Nil {
+				g.enqueueCanonEmbed(ctx, change.CampaignID, change.SourceKind, change.SourceID)
+			}
+			if change.SourceKind == db.CanonSourceCharacter && change.SourceID == uuid.Nil {
+				msg = fmt.Sprintf("✅ Approved — but I couldn't find a player character named **%s** to attach it to.", prop.EntityName)
+			} else {
+				msg = fmt.Sprintf("✅ Approved — **%s** is now part of your campaign records.", prop.EntityName)
+			}
 		} else {
 			// Idempotent no-op (already decided / double-click).
 			msg = "That proposal was already decided."
@@ -381,15 +392,42 @@ func (g *Gateway) routeModal(e *events.ModalSubmitInteractionCreate) {
 	ctx, cancel := context.WithTimeout(context.Background(), interactionTimeout)
 	defer cancel()
 
-	// Dispatch by custom-ID prefix. Each modal family owns its own parsing.
+	// Dispatch by custom-ID prefix using the modal registry. Each modal family
+	// registers a prefix + handler in modalRoutes(), so adding a new modal is a
+	// single entry there — no edits to this dispatcher.
 	customID := e.Data.CustomID
-	switch {
-	case strings.HasPrefix(customID, worldAddModalPrefix+":"):
-		g.handleWorldAddModalSubmit(ctx, e)
-	case customID == characterAddModalID:
-		g.handleCharacterAddModalSubmit(ctx, e)
-	default:
-		g.handleReviewModalSubmit(ctx, e)
+	for _, r := range g.modalRoutes() {
+		if r.match(customID) {
+			r.handle(ctx, e)
+			return
+		}
+	}
+	// Fallback: the review-proposal edit modal (custom ID carries a UUID, so it
+	// isn't a fixed prefix like the others).
+	g.handleReviewModalSubmit(ctx, e)
+}
+
+// modalRoute binds a custom-ID matcher to a submit handler.
+type modalRoute struct {
+	match  func(customID string) bool
+	handle func(ctx context.Context, e *events.ModalSubmitInteractionCreate)
+}
+
+// modalRoutes is the registry of modal-submit handlers. To add a new modal
+// family, add one entry here; the dispatcher needs no changes. Order matters
+// only if prefixes overlap (they don't).
+func (g *Gateway) modalRoutes() []modalRoute {
+	hasPrefix := func(p string) func(string) bool {
+		return func(id string) bool { return strings.HasPrefix(id, p+":") }
+	}
+	return []modalRoute{
+		{match: hasPrefix(worldAddModalPrefix), handle: func(ctx context.Context, e *events.ModalSubmitInteractionCreate) {
+			g.handleWorldEntityModalSubmit(ctx, e, false)
+		}},
+		{match: hasPrefix(worldEditModalPrefix), handle: func(ctx context.Context, e *events.ModalSubmitInteractionCreate) {
+			g.handleWorldEntityModalSubmit(ctx, e, true)
+		}},
+		{match: func(id string) bool { return id == characterAddModalID }, handle: g.handleCharacterAddModalSubmit},
 	}
 }
 

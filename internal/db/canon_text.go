@@ -68,9 +68,32 @@ func canonKindLabel(k WorldEntityKind) string {
 		return "Faction"
 	case KindQuest:
 		return "Quest"
+	case KindHook:
+		return "Story hook"
 	default:
 		return string(k)
 	}
+}
+
+// AppendDetail returns existing with addition appended on its own line, so a
+// record that "comes back up" accumulates detail rather than overwriting it.
+// It avoids duplication: if addition is empty or already contained in existing
+// (case-insensitively), existing is returned unchanged. This is the ADD/accrue
+// path (used by /world add and approved AI proposals); deliberate replacement is
+// done by /world edit.
+func AppendDetail(existing, addition string) string {
+	existing = strings.TrimSpace(existing)
+	addition = strings.TrimSpace(addition)
+	if addition == "" {
+		return existing
+	}
+	if existing == "" {
+		return addition
+	}
+	if strings.Contains(strings.ToLower(existing), strings.ToLower(addition)) {
+		return existing // already recorded; don't duplicate
+	}
+	return existing + "\n" + addition
 }
 
 // metadataLines renders a metadata map as sorted "Key: value" lines, skipping

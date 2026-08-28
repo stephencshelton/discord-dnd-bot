@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -181,15 +182,15 @@ func TestApproveNewEntity(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	ent, applied, err := store.ApproveProposal(ctx, created.ID, "dm-1")
+	ch, applied, err := store.ApproveProposal(ctx, created.ID, "dm-1")
 	if err != nil {
 		t.Fatalf("ApproveProposal: %v", err)
 	}
 	if !applied {
 		t.Fatal("first approve should apply")
 	}
-	if ent == nil || ent.Name != "Eastwatch" || ent.Description != "A border town." {
-		t.Fatalf("entity not created correctly: %+v", ent)
+	if ch == nil || ch.DisplayName != "Eastwatch" || ch.SourceKind != CanonSourceEntity {
+		t.Fatalf("applied change wrong: %+v", ch)
 	}
 
 	// Proposal is now approved.
@@ -202,8 +203,11 @@ func TestApproveNewEntity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("entity not in canon: %v", err)
 	}
-	if canon.ID != ent.ID {
+	if canon.ID != ch.SourceID {
 		t.Errorf("canon id mismatch")
+	}
+	if canon.Description != "A border town." {
+		t.Errorf("entity description = %q", canon.Description)
 	}
 }
 
@@ -233,12 +237,23 @@ func TestApproveExistingEntityUpdate(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	ent, applied, err := store.ApproveProposal(ctx, created.ID, "dm-1")
+	ch, applied, err := store.ApproveProposal(ctx, created.ID, "dm-1")
 	if err != nil || !applied {
 		t.Fatalf("approve: applied=%v err=%v", applied, err)
 	}
-	if ent.Description != "Completed — survivors returned." {
-		t.Errorf("description not updated: %q", ent.Description)
+	if ch.SourceID != existing.ID {
+		t.Errorf("update created a new entity instead of updating")
+	}
+	// Re-fetch to verify the merge (append description + merged metadata).
+	ent, gerr := store.GetWorldEntityByID(ctx, existing.ID)
+	if gerr != nil {
+		t.Fatalf("refetch entity: %v", gerr)
+	}
+	if !strings.Contains(ent.Description, "Completed — survivors returned.") {
+		t.Errorf("description not appended: %q", ent.Description)
+	}
+	if !strings.Contains(ent.Description, "Find the caravan.") {
+		t.Errorf("prior description lost (should append, not overwrite): %q", ent.Description)
 	}
 	if status, _ := ent.Metadata["status"].(string); status != "completed" {
 		t.Errorf("status metadata not merged: %+v", ent.Metadata)
@@ -246,9 +261,6 @@ func TestApproveExistingEntityUpdate(t *testing.T) {
 	// Hand-written reward metadata must survive the merge (no clobber).
 	if reward, _ := ent.Metadata["reward"].(string); reward != "500gp" {
 		t.Errorf("hand-written metadata clobbered: %+v", ent.Metadata)
-	}
-	if ent.ID != existing.ID {
-		t.Errorf("update created a new entity instead of updating")
 	}
 }
 
@@ -299,19 +311,19 @@ func TestIdempotentApprove(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	ent1, applied1, err := store.ApproveProposal(ctx, created.ID, "dm-1")
+	ch1, applied1, err := store.ApproveProposal(ctx, created.ID, "dm-1")
 	if err != nil || !applied1 {
 		t.Fatalf("first approve: applied=%v err=%v", applied1, err)
 	}
-	ent2, applied2, err := store.ApproveProposal(ctx, created.ID, "dm-1")
+	ch2, applied2, err := store.ApproveProposal(ctx, created.ID, "dm-1")
 	if err != nil {
 		t.Fatalf("second approve: %v", err)
 	}
 	if applied2 {
 		t.Error("second approve should be an idempotent no-op (applied=false)")
 	}
-	if ent2 != nil {
-		t.Error("second approve should not return an entity")
+	if ch2 != nil {
+		t.Error("second approve should not return a change")
 	}
 
 	// Exactly one NPC named Dana exists.
@@ -328,7 +340,7 @@ func TestIdempotentApprove(t *testing.T) {
 	if count != 1 {
 		t.Errorf("expected exactly 1 Dana, got %d (duplicate created!)", count)
 	}
-	_ = ent1
+	_ = ch1
 }
 
 // TestDuplicateEntityPreventedByUniqueIndex ensures two create proposals for the
@@ -404,5 +416,92 @@ func TestReplacePendingSessionProposalsIsIdempotent(t *testing.T) {
 	}
 	if len(pending) != 1 || pending[0].EntityName != "C" {
 		t.Fatalf("expected only [C] pending after replace, got %+v", pending)
+	}
+}
+
+// TestApproveAppendsDescription verifies an approved update APPENDS to an
+// entity's description rather than overwriting it (details accumulate).
+func TestApproveAppendsDescription(t *testing.T) {
+	store, campID := newTestStore(t)
+	ctx := context.Background()
+
+	seed, err := store.CreateWorldEntity(ctx, WorldEntity{
+		CampaignID: campID, Kind: KindNPC, Name: "Varek", Description: "A stern guard captain.",
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	created, err := store.CreateStateProposal(ctx, StateProposal{
+		CampaignID: campID, Action: ActionUpdateEntity, EntityKind: KindNPC,
+		EntityName: "Varek", Patch: map[string]any{"description": "Secretly working for the cult."},
+		Evidence: "Overheard him plotting.", Confidence: 0.9,
+	})
+	if err != nil {
+		t.Fatalf("create proposal: %v", err)
+	}
+	if _, applied, aerr := store.ApproveProposal(ctx, created.ID, "dm"); aerr != nil || !applied {
+		t.Fatalf("approve: applied=%v err=%v", applied, aerr)
+	}
+	ent, _ := store.GetWorldEntityByID(ctx, seed.ID)
+	if !strings.Contains(ent.Description, "stern guard captain") {
+		t.Errorf("prior detail lost: %q", ent.Description)
+	}
+	if !strings.Contains(ent.Description, "cult") {
+		t.Errorf("new detail not appended: %q", ent.Description)
+	}
+}
+
+// TestApproveCharacterProposalAppendsNotes verifies a character-target proposal
+// appends to an existing PC's notes and never creates a PC.
+func TestApproveCharacterProposalAppendsNotes(t *testing.T) {
+	store, campID := newTestStore(t)
+	ctx := context.Background()
+
+	pc, err := store.CreatePC(ctx, PlayerCharacter{
+		CampaignID: campID, DiscordUserID: "user-1", Name: "Ludo", Notes: "Loves shiny things.",
+	})
+	if err != nil {
+		t.Fatalf("create pc: %v", err)
+	}
+	created, err := store.CreateStateProposal(ctx, StateProposal{
+		CampaignID: campID, Action: ActionUpdateEntity, EntityKind: KindCharacter,
+		EntityName: "Ludo", Patch: map[string]any{"description": "Slew the dragon of Eastwatch."},
+		Evidence: "Ludo landed the killing blow.", Confidence: 0.9,
+	})
+	if err != nil {
+		t.Fatalf("create proposal: %v", err)
+	}
+	ch, applied, aerr := store.ApproveProposal(ctx, created.ID, "dm")
+	if aerr != nil || !applied {
+		t.Fatalf("approve: applied=%v err=%v", applied, aerr)
+	}
+	if ch.SourceKind != CanonSourceCharacter || ch.SourceID != pc.ID {
+		t.Errorf("applied change wrong for PC: %+v", ch)
+	}
+	got, _ := store.GetPCByID(ctx, pc.ID)
+	if !strings.Contains(got.Notes, "Loves shiny things.") {
+		t.Errorf("prior PC notes lost: %q", got.Notes)
+	}
+	if !strings.Contains(got.Notes, "dragon of Eastwatch") {
+		t.Errorf("new PC deed not appended: %q", got.Notes)
+	}
+
+	// A character proposal naming no known PC is a no-op change (no PC created).
+	before, _ := store.ListPCs(ctx, campID)
+	orphan, _ := store.CreateStateProposal(ctx, StateProposal{
+		CampaignID: campID, Action: ActionUpdateEntity, EntityKind: KindCharacter,
+		EntityName: "Ghost", Patch: map[string]any{"description": "Did something."},
+		Evidence: "e", Confidence: 0.5,
+	})
+	ch2, applied2, _ := store.ApproveProposal(ctx, orphan.ID, "dm")
+	if !applied2 {
+		t.Error("orphan character proposal should still be marked applied (approved)")
+	}
+	if ch2.SourceID != uuid.Nil {
+		t.Errorf("orphan character proposal should have no source id, got %v", ch2.SourceID)
+	}
+	after, _ := store.ListPCs(ctx, campID)
+	if len(after) != len(before) {
+		t.Errorf("character proposal must never create a PC: before=%d after=%d", len(before), len(after))
 	}
 }

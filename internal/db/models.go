@@ -48,7 +48,35 @@ const (
 	KindLocation WorldEntityKind = "location"
 	KindFaction  WorldEntityKind = "faction"
 	KindQuest    WorldEntityKind = "quest"
+	// KindHook covers unresolved story hooks / plot threads the party could
+	// pursue (a mysterious letter, an unanswered summons). Distinct from quests
+	// (which have objectives/status) so /prep can list dangling threads.
+	KindHook WorldEntityKind = "hook"
 )
+
+// AllWorldKinds is every valid world-entity kind, used for validation and to
+// enumerate the extraction/template surface in one place.
+var AllWorldKinds = []WorldEntityKind{KindNPC, KindLocation, KindFaction, KindQuest, KindHook}
+
+// KindCharacter is a proposal target discriminator (NOT a world_entities kind):
+// a proposal with EntityKind == KindCharacter targets an existing player
+// character in player_characters rather than a world entity. It's stored in the
+// same free-text entity_kind column so no schema change is needed, and the apply
+// path branches on it. Extraction can only UPDATE characters (append recorded
+// deeds/facts to their notes) — never create one, since a PC needs a Discord
+// owner the transcript can't supply.
+const KindCharacter WorldEntityKind = "character"
+
+// ValidWorldKind reports whether k is a known world-entity kind (excludes the
+// KindCharacter proposal-target discriminator).
+func ValidWorldKind(k WorldEntityKind) bool {
+	for _, v := range AllWorldKinds {
+		if v == k {
+			return true
+		}
+	}
+	return false
+}
 
 // WorldEntity is a generic worldbuilding record (NPC/location/faction/quest).
 type WorldEntity struct {
@@ -133,7 +161,7 @@ const (
 type StateProposal struct {
 	ID          uuid.UUID
 	CampaignID  uuid.UUID
-	SessionID   *uuid.UUID // nil for manually-authored (/remember) proposals
+	SessionID   *uuid.UUID // nil for proposals not tied to a specific recording
 	Action      ProposalAction
 	EntityKind  WorldEntityKind
 	EntityID    *uuid.UUID // set for update_entity; nil for create_entity
@@ -157,4 +185,15 @@ func (p StateProposal) Description() string {
 		return d
 	}
 	return ""
+}
+
+// AppliedChange describes the canonical record an approved proposal created or
+// updated, independent of whether it targeted a world entity or a player
+// character. It lets callers (e.g. the review handler) react uniformly — post a
+// message, enqueue the right embedding — without re-deriving the target type.
+type AppliedChange struct {
+	CampaignID  uuid.UUID
+	SourceKind  string    // CanonSourceEntity | CanonSourceCharacter
+	SourceID    uuid.UUID // the world_entities.id or player_characters.id affected
+	DisplayName string    // entity/character name, for user-facing messages
 }

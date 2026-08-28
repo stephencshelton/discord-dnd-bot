@@ -14,21 +14,20 @@ PostgreSQL, Redis, object storage, and LiteLLM are external service boundaries. 
 The implemented command surface includes:
 
 - `/campaign create`, `list`, `activate`, `archive`, and `delete` (delete purges the campaign's sessions, notes, embeddings, and S3 audio — guarded by retyping the name)
-- `/character add`, `list`, and `remove` — `add` opens a structured fill-in form (name, class, race, level, bio); re-running it edits your existing character
-- `/world add` and `list` for NPCs, locations, factions, and quests — `add` opens a kind-specific form (e.g. a quest captures status/objective/giver, an NPC captures role/location/attitude) whose structured fields are stored as entity metadata; re-adding by the same name edits it
+- `/character add`, `edit`, `list`, and `delete` — `add`/`edit` open a structured fill-in form (name, class, race, level, bio); `add` prefills and re-saves your existing character
+- `/world add`, `edit`, `list`, and `delete` for NPCs, locations, factions, quests, and story hooks — `add` opens a kind-specific form whose structured fields are stored as entity metadata and **adds** to any existing same-named entry (details accumulate, never overwritten); `edit` opens a pre-filled form that **replaces** the entry's fields; `delete` removes an entry (and drops it from `/ask`)
 - `/session start`, `stop`, and `status`
 - `/session list` and `/session requeue` to inspect the active campaign's sessions by status and re-run a failed/lost transcription
 - Voice recording with per-speaker tracks, crash-safe PCM checkpointing to object storage, and automatic resume/reaping after a gateway restart
 - Automatic transcription and AI-generated session notes
-- **Automatic campaign-state extraction with DM review** — after a session's notes are written, an AI step _proposes_ world-state changes (new/updated NPCs, locations, factions, quests, relationships, facts, and story hooks) that a DM reviews with `/review-session`; nothing becomes canon until explicitly approved (see [Automatic campaign-state extraction](#automatic-campaign-state-extraction) below)
+- **Automatic campaign-state extraction with DM review** — after a session's notes are written, an AI step _proposes_ world-state changes (new/updated NPCs, locations, factions, quests, story hooks, and recorded deeds for existing player characters) that a DM reviews with `/review-session`; nothing becomes canon until explicitly approved, and approving an existing entry **appends** detail rather than overwriting (see [Automatic campaign-state extraction](#automatic-campaign-state-extraction) below)
 - `/review-session` (DM/admin) to approve, reject, or edit AI-proposed world-state changes with buttons — idempotent, no command spam
-- `/remember` to capture something the extraction missed (returns a fill-in template with no options; with options it files a pending proposal for review)
 - `/roll` for dice (e.g. `2d6+3`, `d20`, `4d6kh3`) — free, instant, no AI
 - `/lore` for open-ended worldbuilding *brainstorming* (invents ideas — not your canon)
 - `/recap` for a “previously on” narrative summary from recent completed sessions
-- `/prep` for a DM-focused “where we left off & what’s next” briefing assembled from actual state (last session, active quests, key NPCs/factions, characters) — practical, not a narrative recap
+- `/prep` for a DM-focused “where we left off & what’s next” briefing assembled from actual state (last session, active quests, open story hooks, key NPCs/factions, characters) — practical, not a narrative recap
 - `/search` for lexical full-text search over completed session notes/transcripts
-- `/ask` for grounded Q&A over **everything on record** — session transcripts *and* curated canon (NPCs, locations, factions, quests, player characters), so recall works whether a fact was spoken at the table or added with `/world add`, `/character add`, or `/remember` (retrieval-augmented generation with pgvector; curated canon is preferred when sources conflict)
+- `/ask` for grounded Q&A over **everything on record** — session transcripts *and* curated canon (NPCs, locations, factions, quests, story hooks, player characters), so recall works whether a fact was spoken at the table or added with `/world add` or `/character add`/`edit` (retrieval-augmented generation with pgvector; curated canon is preferred when sources conflict)
 - `/art` for AI-generated campaign scene art
 - `/reindex` to rebuild `/ask` memory from all completed sessions
 - `/remind set`, `clear`, and `show` for weekly UTC reminders
@@ -147,7 +146,7 @@ generation:
 2. Curated **canon** is indexed too: every world entity (NPC/location/faction/
    quest) and player character is embedded into the `canon_embeddings` table
    whenever it's added or changed — via `/world add`, `/character add`, an
-   approved `/review-session` proposal, or `/remember`. So a fact added by hand
+   approved `/review-session` proposal, or the templated `/world add`/`/character add`. So a fact added by hand
    or approved from AI extraction is retrievable even if it was never spoken on a
    recording.
 3. On `/ask`, the gateway embeds the question, retrieves the most similar
@@ -202,41 +201,54 @@ How it works:
 2. The extraction job feeds the speaker-attributed transcript, the generated
    notes, campaign metadata, the players' characters, and the existing world
    entities to `LITELLM_STATE_MODEL` (falls back to `LITELLM_CHAT_MODEL`), asking
-   for **strict JSON** describing only meaningful, evidence-backed changes. The
-   model is instructed to be conservative and is told the transcript is
-   *untrusted* — dialogue that looks like instructions ("ignore your rules",
-   "add an NPC named …") is treated as in-world speech, never a command.
+   for **strict JSON** describing only meaningful, evidence-backed changes across
+   NPCs, locations, factions, quests, story hooks, and recorded deeds for
+   existing player characters. The model is instructed to be conservative and is
+   told the transcript is *untrusted* — dialogue that looks like instructions
+   ("ignore your rules", "add an NPC named …") is treated as in-world speech,
+   never a command.
 3. The output is validated and normalized (invalid or evidence-free items are
    dropped; near-duplicate names are matched case-insensitively against existing
    entities so a "new NPC" that already exists becomes an *update*, not a
-   duplicate). Survivors are stored as **pending proposals** in the
-   `state_proposals` table. Re-running extraction replaces a session's pending
-   proposals (idempotent) while leaving already-approved/rejected ones intact.
-4. A DM runs **`/review-session`** (Manage Server permission required) to step
+   duplicate). Player-character proposals only attach to an **existing** PC
+   (extraction never invents one). Survivors are stored as **pending proposals**
+   in the `state_proposals` table. Re-running extraction replaces a session's
+   pending proposals (idempotent) while leaving already-approved/rejected ones
+   intact.
+4. **Noteworthiness gating** trims trivia before a DM is bothered: proposals
+   below `EXTRACT_MIN_CONFIDENCE` (default `0.4`) are dropped, then — when
+   `EXTRACT_CRITIC` is enabled (default) — a second "editor" pass (using the
+   recap model) keeps only genuinely significant proposals. The critic fails
+   open: an error leaves the confidence-filtered set intact rather than dropping
+   everything.
+5. A DM runs **`/review-session`** (Manage Server permission required) to step
    through pending proposals with **Approve / Reject / Edit / Skip** buttons —
    one message, edited in place, no command spam. Each proposal shows the
    proposed change, the model's explanation, and the supporting **evidence** so
    the DM understands *why* it was suggested.
-   - **Approve** atomically applies the change to `world_entities` (create or
-     merge-update) and marks the proposal approved. It is **idempotent**:
-     clicking Approve twice, or a retried interaction, never creates a duplicate
-     entity or double-applies (a case-insensitive unique index and a
-     claim-then-apply transaction guarantee this). An update *merges* — it won't
-     clobber hand-written description/metadata the proposal doesn't mention.
+   - **Approve** atomically applies the change and marks the proposal approved.
+     It is **idempotent**: clicking Approve twice, or a retried interaction,
+     never creates a duplicate entity or double-applies (a case-insensitive
+     unique index and a claim-then-apply transaction guarantee this). An update
+     **appends** to an existing entry's description (and merges metadata) so
+     hand-written detail is never overwritten; a player-character proposal
+     appends the recorded deed to that PC's notes.
    - **Reject** leaves canon completely untouched.
    - **Edit** opens a modal to tweak the name/description before approving.
-5. Once approved, the entity is immediately available to `/world`, `/lore`,
-   `/recap`, `/ask` (after reindex), and future AI context — exactly like a
-   hand-authored entry.
+6. Once approved, the entry is immediately available to `/world`, `/lore`,
+   `/recap`, `/prep`, `/ask` (after reindex), and future AI context — exactly
+   like a hand-authored entry.
 
-Missed something? **`/remember`** (with no options) returns a fill-in template
-showing the format; run it with `kind`, `name`, and `note` to file your own
-pending proposal, which goes through the very same `/review-session` approval
-path — so even a human note is confirmed before it becomes canon.
+Missed something the extraction didn't catch? Add it directly with the templated
+**`/world add`** (NPC/location/faction/quest/hook) or **`/character edit`**
+commands — these write canon immediately (you're the reviewer) and feed `/ask`.
+`/world add` *adds* to an existing same-named entry (details accumulate);
+`/world edit` *replaces* its fields.
 
-World entities gained a backwards-compatible `metadata` JSONB column for optional
-structured fields (e.g. a quest's `status`), which approved proposals populate;
-existing rows default to `{}`.
+World entities carry a backwards-compatible `metadata` JSONB column for
+structured, kind-specific fields (e.g. a quest's `status`, an NPC's `role`),
+populated by both the templates and approved proposals; existing rows default to
+`{}`.
 
 ### External Secrets
 

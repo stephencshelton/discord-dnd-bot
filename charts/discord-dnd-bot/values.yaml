@@ -199,6 +199,19 @@ config:
     # retries (a failed job is dropped immediately).
     maxRetries: 3
 
+  # Post-session campaign-state extraction — how aggressively low-value
+  # proposals are filtered before a DM is asked to review them (via
+  # /review-session). Tightening these means fewer, higher-signal proposals.
+  extraction:
+    # Drop proposals whose model-reported confidence is below this floor (0..1).
+    # 0 disables the floor. 0.4 trims obvious trivia while keeping borderline
+    # items for the critic pass / DM to judge.
+    minConfidence: 0.4
+    # Run a second AI "editor" pass (using the recap model) that keeps only
+    # genuinely noteworthy proposals, so a human isn't bugged with routine
+    # events. Fails open (a critic error keeps the confidence-filtered set).
+    critic: true
+
 # -------------------------------------------------------------------------
 # Object-storage bucket provisioning via AWS Controllers for Kubernetes (ACK).
 #

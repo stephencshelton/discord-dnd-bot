@@ -11,9 +11,14 @@ import (
 
 func mustParse(t *testing.T, raw string, existing []ExistingEntity) []db.StateProposal {
 	t.Helper()
+	return mustParseWithChars(t, raw, existing, nil)
+}
+
+func mustParseWithChars(t *testing.T, raw string, existing []ExistingEntity, chars []ExistingCharacter) []db.StateProposal {
+	t.Helper()
 	camp := uuid.New()
 	sid := uuid.New()
-	props, err := Parse(raw, camp, &sid, existing)
+	props, err := Parse(raw, camp, &sid, existing, chars)
 	if err != nil {
 		t.Fatalf("Parse returned error: %v", err)
 	}
@@ -97,7 +102,7 @@ func TestParseMalformedOutput(t *testing.T) {
 		"",
 		"   ",
 	} {
-		if _, err := Parse(raw, uuid.New(), nil, nil); err == nil {
+		if _, err := Parse(raw, uuid.New(), nil, nil, nil); err == nil {
 			t.Errorf("Parse(%q) expected error, got nil", raw)
 		}
 	}
@@ -189,6 +194,59 @@ func TestParseConfidenceClamped(t *testing.T) {
 		if p.Confidence < 0 || p.Confidence > 1 {
 			t.Errorf("%s confidence not clamped: %v", p.EntityName, p.Confidence)
 		}
+	}
+}
+
+// TestParseHookKind accepts the story-hook kind as a valid create proposal.
+func TestParseHookKind(t *testing.T) {
+	raw := `{"proposals":[
+      {"action":"create_entity","entity_kind":"hook","entity_name":"The Sealed Letter","patch":{"description":"An unopened letter bearing the royal seal.","status":"open"},"evidence":"They found a sealed letter they couldn't open.","confidence":0.7}
+    ]}`
+	props := mustParse(t, raw, nil)
+	if len(props) != 1 {
+		t.Fatalf("expected 1 hook proposal, got %d", len(props))
+	}
+	if props[0].EntityKind != db.KindHook || props[0].Action != db.ActionCreateEntity {
+		t.Errorf("hook proposal wrong: kind=%s action=%s", props[0].EntityKind, props[0].Action)
+	}
+	if status, _ := props[0].Patch["status"].(string); status != "open" {
+		t.Errorf("hook status metadata missing: %+v", props[0].Patch)
+	}
+}
+
+// TestParseCharacterTargetResolvesToExistingPC accepts a character proposal only
+// when it names a known player character, and always makes it an update.
+func TestParseCharacterTargetResolvesToExistingPC(t *testing.T) {
+	pcID := uuid.New()
+	chars := []ExistingCharacter{{ID: pcID, Name: "Ludo"}}
+	raw := `{"proposals":[
+      {"action":"update_entity","entity_kind":"character","entity_name":"ludo","patch":{"description":"Slew the dragon of Eastwatch."},"evidence":"Ludo landed the killing blow on the dragon.","confidence":0.9}
+    ]}`
+	props := mustParseWithChars(t, raw, nil, chars)
+	if len(props) != 1 {
+		t.Fatalf("expected 1 character proposal, got %d", len(props))
+	}
+	p := props[0]
+	if p.EntityKind != db.KindCharacter || p.Action != db.ActionUpdateEntity {
+		t.Errorf("character proposal wrong: kind=%s action=%s", p.EntityKind, p.Action)
+	}
+	if p.EntityID == nil || *p.EntityID != pcID {
+		t.Errorf("character proposal should target the existing PC id %v, got %v", pcID, p.EntityID)
+	}
+	if p.EntityName != "Ludo" {
+		t.Errorf("character name not canonicalized: %q", p.EntityName)
+	}
+}
+
+// TestParseCharacterTargetDroppedWhenUnknown drops a character proposal that
+// names no known PC (extraction never invents player characters).
+func TestParseCharacterTargetDroppedWhenUnknown(t *testing.T) {
+	raw := `{"proposals":[
+      {"action":"update_entity","entity_kind":"character","entity_name":"Nobody","patch":{"description":"Did a thing."},"evidence":"Someone did a thing.","confidence":0.9}
+    ]}`
+	props := mustParseWithChars(t, raw, nil, []ExistingCharacter{{ID: uuid.New(), Name: "Ludo"}})
+	if len(props) != 0 {
+		t.Fatalf("expected 0 proposals (unknown PC dropped), got %d", len(props))
 	}
 }
 

@@ -131,8 +131,8 @@ func (s *Store) ListPendingProposalsForSession(ctx context.Context, sessionID uu
 }
 
 // ListPendingProposalsForCampaign returns the pending proposals for a campaign,
-// oldest first. Used when reviewing without a specific session (e.g. manual
-// /remember proposals that aren't tied to a recording).
+// oldest first. Used when reviewing without a specific session (e.g. proposals
+// not tied to a particular recording).
 func (s *Store) ListPendingProposalsForCampaign(ctx context.Context, campaignID uuid.UUID) ([]StateProposal, error) {
 	rows, err := s.db.Pool.Query(ctx,
 		`SELECT `+proposalCols+` FROM state_proposals
@@ -237,9 +237,9 @@ func (s *Store) UpdateProposalPatch(ctx context.Context, id uuid.UUID, entityNam
 //     entity creation on the case-insensitive (campaign, kind, name) unique
 //     index via ON CONFLICT so a concurrent create can't duplicate an entity.
 //
-// It returns the resulting canonical entity and whether this call performed the
+// It returns the resulting canonical change and whether this call performed the
 // application.
-func (s *Store) ApproveProposal(ctx context.Context, id uuid.UUID, reviewerID string) (entity *WorldEntity, applied bool, err error) {
+func (s *Store) ApproveProposal(ctx context.Context, id uuid.UUID, reviewerID string) (change *AppliedChange, applied bool, err error) {
 	tx, err := s.db.Pool.Begin(ctx)
 	if err != nil {
 		return nil, false, err
@@ -263,8 +263,8 @@ func (s *Store) ApproveProposal(ctx context.Context, id uuid.UUID, reviewerID st
 		return nil, false, err
 	}
 
-	// 2) Apply the change to canon.
-	ent, err := applyProposalTx(ctx, tx, p)
+	// 2) Apply the change to canon (world entity or player character).
+	ch, err := applyProposalTx(ctx, tx, p)
 	if err != nil {
 		return nil, false, err
 	}
@@ -272,16 +272,57 @@ func (s *Store) ApproveProposal(ctx context.Context, id uuid.UUID, reviewerID st
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, err
 	}
-	return ent, true, nil
+	return ch, true, nil
 }
 
-// applyProposalTx performs the canonical world change for an approved proposal
-// inside the given transaction. Creating an entity is upserted on the
-// case-insensitive (campaign, kind, name) unique index so a retry or a
-// concurrent identical create merges rather than duplicates. Updating an entity
-// merges the patch's description (when provided) and metadata into the existing
-// row without clobbering hand-written fields the patch doesn't mention.
-func applyProposalTx(ctx context.Context, tx pgx.Tx, p *StateProposal) (*WorldEntity, error) {
+// applyProposalTx performs the canonical change for an approved proposal inside
+// the given transaction, dispatching on the proposal's target:
+//   - KindCharacter -> append the proposed detail to an existing player
+//     character's notes (never creates one; a PC needs a Discord owner).
+//   - any world kind -> create/append a world_entities row (see applyEntityTx).
+func applyProposalTx(ctx context.Context, tx pgx.Tx, p *StateProposal) (*AppliedChange, error) {
+	if p.EntityKind == KindCharacter {
+		return applyCharacterProposalTx(ctx, tx, p)
+	}
+	return applyEntityProposalTx(ctx, tx, p)
+}
+
+// applyCharacterProposalTx appends an approved proposal's detail to an existing
+// player character's notes (matched case-insensitively by name within the
+// campaign). It never creates a character. If no match exists, it's a no-op
+// change (returns an AppliedChange with a zero SourceID) so approval doesn't
+// error — the fact is simply not attachable to a known PC.
+func applyCharacterProposalTx(ctx context.Context, tx pgx.Tx, p *StateProposal) (*AppliedChange, error) {
+	var (
+		id    uuid.UUID
+		notes string
+	)
+	err := tx.QueryRow(ctx,
+		`SELECT id, COALESCE(notes,'') FROM player_characters
+		 WHERE campaign_id=$1 AND lower(name)=lower($2)`,
+		p.CampaignID, p.EntityName).Scan(&id, &notes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No such player character — nothing to attach the fact to.
+		return &AppliedChange{CampaignID: p.CampaignID, SourceKind: CanonSourceCharacter, DisplayName: p.EntityName}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	newNotes := AppendDetail(notes, p.Description())
+	if _, err := tx.Exec(ctx,
+		`UPDATE player_characters SET notes=$2, updated_at=now() WHERE id=$1`, id, newNotes); err != nil {
+		return nil, fmt.Errorf("update character notes: %w", err)
+	}
+	return &AppliedChange{CampaignID: p.CampaignID, SourceKind: CanonSourceCharacter, SourceID: id, DisplayName: p.EntityName}, nil
+}
+
+// applyEntityProposalTx creates or appends-to a world entity for an approved
+// proposal. Creating is upserted on the case-insensitive (campaign, kind, name)
+// unique index so a retry or a concurrent identical create merges rather than
+// duplicates. Updating an entity APPENDS the proposal's description to the
+// existing one (never overwriting hand-written detail — accumulate as the entity
+// recurs) and deep-merges metadata so structured fields survive.
+func applyEntityProposalTx(ctx context.Context, tx pgx.Tx, p *StateProposal) (*AppliedChange, error) {
 	desc := p.Description()
 	meta := map[string]any{}
 	for k, v := range p.Patch {
@@ -290,98 +331,82 @@ func applyProposalTx(ctx context.Context, tx pgx.Tx, p *StateProposal) (*WorldEn
 		}
 		meta[k] = v
 	}
+
+	// Resolve any existing entity so we can APPEND to (not replace) its
+	// description. For a create action we match on the unique key; for update we
+	// prefer the explicit id, then fall back to the name.
+	var (
+		existingID   uuid.UUID
+		existingDesc string
+		found        bool
+	)
+	if p.Action == ActionUpdateEntity && p.EntityID != nil {
+		if err := tx.QueryRow(ctx,
+			`SELECT id, COALESCE(description,'') FROM world_entities WHERE id=$1 AND campaign_id=$2`,
+			*p.EntityID, p.CampaignID).Scan(&existingID, &existingDesc); err == nil {
+			found = true
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+	if !found {
+		if err := tx.QueryRow(ctx,
+			`SELECT id, COALESCE(description,'') FROM world_entities
+			 WHERE campaign_id=$1 AND kind=$2 AND lower(name)=lower($3)`,
+			p.CampaignID, string(p.EntityKind), p.EntityName).Scan(&existingID, &existingDesc); err == nil {
+			found = true
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+
 	metaJSON, err := marshalMetadata(meta)
 	if err != nil {
 		return nil, fmt.Errorf("marshal patch metadata: %w", err)
 	}
 
-	switch p.Action {
-	case ActionCreateEntity:
-		// Upsert keyed on the unique (campaign, kind, lower(name)) index: if the
-		// entity already exists (retry, or a concurrent create), merge instead of
-		// erroring/duplicating. COALESCE keeps a non-empty existing description
-		// when the proposal's is empty; metadata is deep-merged (existing || new).
-		var e WorldEntity
-		var k string
-		var gotMeta []byte
-		err := tx.QueryRow(ctx,
-			`INSERT INTO world_entities (campaign_id, kind, name, description, metadata)
-			 VALUES ($1,$2,$3,$4,$5)
-			 ON CONFLICT (campaign_id, kind, lower(name)) DO UPDATE
-			   SET description = CASE WHEN EXCLUDED.description <> ''
-			                         THEN EXCLUDED.description
-			                         ELSE world_entities.description END,
-			       metadata = COALESCE(world_entities.metadata,'{}'::jsonb) || EXCLUDED.metadata,
-			       updated_at = now()
-			 RETURNING id, campaign_id, kind, name, COALESCE(description,''), COALESCE(metadata,'{}'::jsonb), created_at, updated_at`,
-			p.CampaignID, string(p.EntityKind), p.EntityName, desc, metaJSON).
-			Scan(&e.ID, &e.CampaignID, &k, &e.Name, &e.Description, &gotMeta, &e.CreatedAt, &e.UpdatedAt)
-		if err != nil {
-			return nil, fmt.Errorf("create entity: %w", err)
-		}
-		e.Kind = WorldEntityKind(k)
-		e.Metadata = unmarshalMetadata(gotMeta)
-		return &e, nil
-
-	case ActionUpdateEntity:
-		// Resolve the target entity: prefer the explicit ID, else fall back to
-		// case-insensitive name lookup (the entity may have been created since
-		// extraction, or the ID nulled by a delete). If it still doesn't exist,
-		// treat the update as a create so the DM's approval isn't silently lost.
-		var (
-			targetID uuid.UUID
-			found    bool
-		)
-		if p.EntityID != nil {
-			err := tx.QueryRow(ctx,
-				`SELECT id FROM world_entities WHERE id=$1 AND campaign_id=$2`,
-				*p.EntityID, p.CampaignID).Scan(&targetID)
-			if err == nil {
-				found = true
-			} else if !errors.Is(err, pgx.ErrNoRows) {
-				return nil, err
-			}
-		}
-		if !found {
-			err := tx.QueryRow(ctx,
-				`SELECT id FROM world_entities
-				 WHERE campaign_id=$1 AND kind=$2 AND lower(name)=lower($3)`,
-				p.CampaignID, string(p.EntityKind), p.EntityName).Scan(&targetID)
-			if err == nil {
-				found = true
-			} else if !errors.Is(err, pgx.ErrNoRows) {
-				return nil, err
-			}
-		}
-		if !found {
-			// No such entity — apply as a create so nothing is lost.
-			create := *p
-			create.Action = ActionCreateEntity
-			return applyProposalTx(ctx, tx, &create)
-		}
-
-		// Merge: only overwrite the description when the patch provides one, and
-		// deep-merge metadata so hand-written fields survive.
+	if found {
+		// Update in place: APPEND the new description (dedup-aware) and merge
+		// metadata. Existing hand-written detail is preserved.
+		newDesc := AppendDetail(existingDesc, desc)
 		var e WorldEntity
 		var k string
 		var gotMeta []byte
 		err := tx.QueryRow(ctx,
 			`UPDATE world_entities
-			 SET description = CASE WHEN $2 <> '' THEN $2 ELSE description END,
+			 SET description = $2,
 			     metadata = COALESCE(metadata,'{}'::jsonb) || $3::jsonb,
 			     updated_at = now()
 			 WHERE id=$1
 			 RETURNING id, campaign_id, kind, name, COALESCE(description,''), COALESCE(metadata,'{}'::jsonb), created_at, updated_at`,
-			targetID, desc, metaJSON).
+			existingID, newDesc, metaJSON).
 			Scan(&e.ID, &e.CampaignID, &k, &e.Name, &e.Description, &gotMeta, &e.CreatedAt, &e.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("update entity: %w", err)
 		}
-		e.Kind = WorldEntityKind(k)
-		e.Metadata = unmarshalMetadata(gotMeta)
-		return &e, nil
-
-	default:
-		return nil, fmt.Errorf("unknown proposal action %q", p.Action)
+		return &AppliedChange{CampaignID: e.CampaignID, SourceKind: CanonSourceEntity, SourceID: e.ID, DisplayName: e.Name}, nil
 	}
+
+	// No existing entity — create it. (Applies to both create actions and
+	// updates whose target no longer exists, so an approval is never lost.)
+	// ON CONFLICT guards against a concurrent create racing this one.
+	var e WorldEntity
+	var k string
+	var gotMeta []byte
+	err = tx.QueryRow(ctx,
+		`INSERT INTO world_entities (campaign_id, kind, name, description, metadata)
+		 VALUES ($1,$2,$3,$4,$5)
+		 ON CONFLICT (campaign_id, kind, lower(name)) DO UPDATE
+		   SET description = CASE WHEN EXCLUDED.description <> ''
+		                         THEN EXCLUDED.description
+		                         ELSE world_entities.description END,
+		       metadata = COALESCE(world_entities.metadata,'{}'::jsonb) || EXCLUDED.metadata,
+		       updated_at = now()
+		 RETURNING id, campaign_id, kind, name, COALESCE(description,''), COALESCE(metadata,'{}'::jsonb), created_at, updated_at`,
+		p.CampaignID, string(p.EntityKind), p.EntityName, desc, metaJSON).
+		Scan(&e.ID, &e.CampaignID, &k, &e.Name, &e.Description, &gotMeta, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("create entity: %w", err)
+	}
+	return &AppliedChange{CampaignID: e.CampaignID, SourceKind: CanonSourceEntity, SourceID: e.ID, DisplayName: e.Name}, nil
 }

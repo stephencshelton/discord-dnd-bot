@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/stephencshelton/discord-dnd-bot/internal/db"
 	"github.com/stephencshelton/discord-dnd-bot/internal/extract"
 	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
@@ -71,8 +72,10 @@ func (w *Worker) handleExtractState(ctx context.Context, raw json.RawMessage) er
 	}
 
 	var charLines []string
+	var existingChars []extract.ExistingCharacter
 	if pcs, perr := w.store.ListPCs(ctx, camp.ID); perr == nil {
 		for _, pc := range pcs {
+			existingChars = append(existingChars, extract.ExistingCharacter{ID: pc.ID, Name: pc.Name})
 			line := pc.Name
 			if pc.Class != "" || pc.Race != "" {
 				line += fmt.Sprintf(" (%s %s)", strings.TrimSpace(pc.Race), strings.TrimSpace(pc.Class))
@@ -95,7 +98,7 @@ func (w *Worker) handleExtractState(ctx context.Context, raw json.RawMessage) er
 	// this job (retrying the same saved transcript yields the same bad output);
 	// it's logged + metered but must not fail the session.
 	sid := sessionID
-	proposals, err := extract.Parse(rawJSON, camp.ID, &sid, existing)
+	proposals, err := extract.Parse(rawJSON, camp.ID, &sid, existing, existingChars)
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("extract", "error").Inc()
 		w.log.Warn("state extraction produced unparseable output",
@@ -103,6 +106,21 @@ func (w *Worker) handleExtractState(ctx context.Context, raw json.RawMessage) er
 		return queue.Permanent(fmt.Errorf("parse extraction: %w", err))
 	}
 	metrics.AIRequests.WithLabelValues("extract", "ok").Inc()
+
+	// Noteworthiness gating so a DM isn't bugged with trivia:
+	//   1) Confidence floor — cheap, deterministic drop of low-confidence items.
+	//   2) Critic pass — a second AI review that keeps only genuinely significant
+	//      proposals. Fail-open: a critic error/parse-failure leaves the
+	//      confidence-filtered set intact rather than dropping everything.
+	rawCount := len(proposals)
+	proposals = extract.FilterByConfidence(proposals, w.cfg.Extraction.MinConfidence)
+	if w.cfg.Extraction.Critic && len(proposals) > 0 {
+		proposals = w.criticFilter(ctx, proposals)
+	}
+	if dropped := rawCount - len(proposals); dropped > 0 {
+		w.log.Info("state extraction filtered low-value proposals",
+			"session", sessionID, "dropped", dropped, "kept", len(proposals))
+	}
 
 	// Replace this session's prior PENDING proposals so a reprocess is idempotent
 	// (approved/rejected ones are preserved by the store method).
@@ -122,4 +140,27 @@ func (w *Worker) handleExtractState(ctx context.Context, raw json.RawMessage) er
 			len(proposals)))
 	}
 	return nil
+}
+
+// criticFilter runs the second-pass "editor" review: it summarizes each
+// candidate proposal, asks the recap model which are genuinely noteworthy, and
+// returns only those. It FAILS OPEN — any error (AI call or parse) returns the
+// input unchanged, since it's better to surface a borderline proposal for the DM
+// than to silently drop everything on a critic hiccup.
+func (w *Worker) criticFilter(ctx context.Context, proposals []db.StateProposal) []db.StateProposal {
+	candidates := make([]string, len(proposals))
+	for i, p := range proposals {
+		candidates[i] = extract.CriticCandidate(p)
+	}
+	raw, err := w.ai.Chat(ctx, w.cfg.LiteLLM.Recap(), []litellm.Message{
+		{Role: "system", Content: prompts.CriticSystem},
+		{Role: "user", Content: prompts.CriticUser(candidates)},
+	}, 500)
+	if err != nil {
+		metrics.AIRequests.WithLabelValues("extract_critic", "error").Inc()
+		w.log.Warn("state extraction critic pass failed; keeping confidence-filtered set", "err", err)
+		return proposals // fail-open
+	}
+	metrics.AIRequests.WithLabelValues("extract_critic", "ok").Inc()
+	return extract.ApplyCriticKeep(proposals, raw)
 }

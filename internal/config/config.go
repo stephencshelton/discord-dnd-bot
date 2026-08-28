@@ -26,13 +26,14 @@ type Config struct {
 	// HTTPAddr is the address the health/metrics server binds to.
 	HTTPAddr string `envconfig:"HTTP_ADDR" default:":8080"`
 
-	Discord  DiscordConfig
-	Database DatabaseConfig
-	Redis    RedisConfig
-	Storage  StorageConfig
-	LiteLLM  LiteLLMConfig
-	Audio    AudioConfig
-	Worker   WorkerConfig
+	Discord    DiscordConfig
+	Database   DatabaseConfig
+	Redis      RedisConfig
+	Storage    StorageConfig
+	LiteLLM    LiteLLMConfig
+	Audio      AudioConfig
+	Worker     WorkerConfig
+	Extraction ExtractionConfig
 }
 
 // DiscordConfig holds Discord bot credentials and behavior toggles.
@@ -253,6 +254,21 @@ type WorkerConfig struct {
 	// are never retried regardless of this setting. 0 disables retries entirely
 	// (a failed job is dropped immediately, the pre-retry behavior).
 	MaxRetries int `envconfig:"WORKER_MAX_RETRIES" default:"3"`
+}
+
+// ExtractionConfig tunes the post-session campaign-state extraction's
+// noteworthiness gating — how aggressively low-value proposals are filtered out
+// before a DM is asked to review them.
+type ExtractionConfig struct {
+	// MinConfidence is the floor (0..1) a proposal's model-reported confidence
+	// must meet to be kept. Proposals below it are dropped (never shown to the
+	// DM). 0 disables the floor. Default 0.4 trims the obviously-trivial while
+	// keeping borderline-but-plausible items.
+	MinConfidence float64 `envconfig:"EXTRACT_MIN_CONFIDENCE" default:"0.4"`
+	// Critic enables a second AI pass that scores each surviving proposal for
+	// genuine campaign significance and drops the trivial ones, so a human isn't
+	// bugged with noise. It uses the recap model (cheap, capable). Default true.
+	Critic bool `envconfig:"EXTRACT_CRITIC" default:"true"`
 }
 
 // Load reads configuration from the environment. It returns an error only for

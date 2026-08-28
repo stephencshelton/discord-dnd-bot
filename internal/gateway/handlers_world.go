@@ -185,6 +185,15 @@ func (g *Gateway) handleCharacter(ctx context.Context, ic *ictx) error {
 		existing, _ := g.userCharacter(ctx, camp.ID, userID)
 		return ic.e.Modal(characterAddModal(existing))
 
+	case "edit":
+		// Explicit edit: open the pre-filled form for the user's character. If
+		// they have none yet, guide them to add first.
+		existing, cerr := g.userCharacter(ctx, camp.ID, userID)
+		if cerr != nil || existing == nil {
+			return ic.reply("You don't have a character in this campaign yet — add one with `/character add`.", true)
+		}
+		return ic.e.Modal(characterAddModal(existing))
+
 	case "list":
 		pcs, err := g.store.ListPCs(ctx, camp.ID)
 		if err != nil {
@@ -200,7 +209,7 @@ func (g *Gateway) handleCharacter(ctx context.Context, ic *ictx) error {
 		}
 		return ic.reply(b.String(), true)
 
-	case "remove":
+	case "delete":
 		name := ic.optString("name")
 		pc, err := g.store.GetPCByName(ctx, camp.ID, name)
 		if errors.Is(err, db.ErrNotFound) {
@@ -214,7 +223,7 @@ func (g *Gateway) handleCharacter(ctx context.Context, ic *ictx) error {
 		}
 		// Drop it from /ask retrieval too (best-effort).
 		_ = g.store.DeleteCanonEmbedding(ctx, db.CanonSourceCharacter, pc.ID)
-		return ic.reply(fmt.Sprintf("Removed **%s**.", pc.Name), false)
+		return ic.reply(fmt.Sprintf("🗑️ Deleted **%s**.", pc.Name), false)
 	}
 	return fmt.Errorf("unknown character subcommand")
 }
@@ -232,14 +241,29 @@ func (g *Gateway) handleWorld(ctx context.Context, ic *ictx) error {
 	switch ic.subcommand() {
 	case "add":
 		// Open the kind-specific structured form (modal). The submit handler
-		// (handleWorldAddModalSubmit) persists the entity + metadata.
+		// (handleWorldEntityModalSubmit) persists the entity + metadata.
 		kind := db.WorldEntityKind(ic.optString("kind"))
-		switch kind {
-		case db.KindNPC, db.KindLocation, db.KindFaction, db.KindQuest:
-			return ic.e.Modal(worldAddModal(kind))
-		default:
-			return ic.reply("Pick a valid kind (NPC, Location, Faction, or Quest).", true)
+		if !db.ValidWorldKind(kind) {
+			return ic.reply("Pick a valid kind (NPC, Location, Faction, Quest, or Story hook).", true)
 		}
+		return ic.e.Modal(worldAddModal(kind))
+
+	case "edit":
+		// Open a PRE-FILLED form for an existing entry; submit REPLACES its
+		// fields (deliberate correction, distinct from add's append).
+		kind := db.WorldEntityKind(ic.optString("kind"))
+		if !db.ValidWorldKind(kind) {
+			return ic.reply("Pick a valid kind (NPC, Location, Faction, Quest, or Story hook).", true)
+		}
+		name := ic.optString("name")
+		entity, gerr := g.store.GetWorldEntityByName(ctx, camp.ID, kind, name)
+		if errors.Is(gerr, db.ErrNotFound) {
+			return ic.reply(fmt.Sprintf("No %s named %q. Add it with `/world add` first.", entityKindLabel(kind), name), true)
+		}
+		if gerr != nil {
+			return gerr
+		}
+		return ic.e.Modal(worldEntityModal(kind, entity, true))
 
 	case "list":
 		kind := db.WorldEntityKind(ic.optString("kind"))
@@ -263,6 +287,28 @@ func (g *Gateway) handleWorld(ctx context.Context, ic *ictx) error {
 			b.WriteString(line + "\n")
 		}
 		return ic.reply(b.String(), true)
+
+	case "delete":
+		kind := db.WorldEntityKind(ic.optString("kind"))
+		if !db.ValidWorldKind(kind) {
+			return ic.reply("Pick a valid kind (NPC, Location, Faction, Quest, or Story hook).", true)
+		}
+		name := ic.optString("name")
+		entity, gerr := g.store.GetWorldEntityByName(ctx, camp.ID, kind, name)
+		if errors.Is(gerr, db.ErrNotFound) {
+			return ic.reply(fmt.Sprintf("No %s named %q.", entityKindLabel(kind), name), true)
+		}
+		if gerr != nil {
+			return gerr
+		}
+		if err := g.store.DeleteWorldEntity(ctx, entity.ID); err != nil {
+			return err
+		}
+		// Drop it from /ask retrieval too (best-effort).
+		_ = g.store.DeleteCanonEmbedding(ctx, db.CanonSourceEntity, entity.ID)
+		logging.FromContext(ctx, g.log).Info("world entity deleted",
+			"campaign", camp.ID, "kind", kind, "name", entity.Name, "user", ic.userID())
+		return ic.reply(fmt.Sprintf("🗑️ Deleted %s **%s**.", entityKindLabel(kind), entity.Name), false)
 	}
 	return fmt.Errorf("unknown world subcommand")
 }
@@ -280,6 +326,7 @@ func worldMetaSummary(e db.WorldEntity) string {
 		db.KindLocation: {"region"},
 		db.KindFaction:  {"status", "goals"},
 		db.KindQuest:    {"status", "objective"},
+		db.KindHook:     {"status", "related"},
 	}
 	var parts []string
 	for _, k := range order[e.Kind] {
