@@ -124,11 +124,13 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 		return fmt.Errorf("save result: %w", err)
 	}
 
-	// 4b) Embed the notes for grounded /ask retrieval. Best-effort: a failure
-	// here must not fail the session (the notes are already saved and posted).
-	if err := w.embedSessionNotes(ctx, sessionID, sess.CampaignID, notes); err != nil {
+	// 4b) Embed the full transcript for grounded /ask retrieval. The transcript
+	// (not the summarized notes) is indexed so /ask can surface details that the
+	// lossy summary may have dropped. Best-effort: a failure here must not fail
+	// the session (the notes are already saved and posted).
+	if err := w.embedSessionNotes(ctx, sessionID, sess.CampaignID, transcript); err != nil {
 		metrics.AIRequests.WithLabelValues("embed", "error").Inc()
-		w.log.Warn("embed session notes", "session", sessionID, "err", err)
+		w.log.Warn("embed session transcript", "session", sessionID, "err", err)
 	} else {
 		metrics.AIRequests.WithLabelValues("embed", "ok").Inc()
 	}

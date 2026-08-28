@@ -17,11 +17,13 @@ import (
 // enough to keep most sections intact while staying under model input limits.
 const maxChunkRunes = 1200
 
-// embedSessionNotes splits a session's notes into passages, embeds them via the
+// embedSessionNotes splits a session's text into passages, embeds them via the
 // configured LiteLLM route, and stores the vectors for /ask retrieval. Replaces
-// existing rows so re-processing is idempotent.
-func (w *Worker) embedSessionNotes(ctx context.Context, sessionID, campaignID uuid.UUID, notes string) error {
-	passages := chunkNotes(notes, maxChunkRunes)
+// existing rows so re-processing is idempotent. The `text` is the full session
+// transcript (not the summarized notes) so /ask can retrieve fine-grained
+// details the summary may have omitted.
+func (w *Worker) embedSessionNotes(ctx context.Context, sessionID, campaignID uuid.UUID, text string) error {
+	passages := chunkNotes(text, maxChunkRunes)
 	if len(passages) == 0 {
 		return nil
 	}
@@ -57,12 +59,12 @@ func (w *Worker) handleReindexCampaign(ctx context.Context, raw json.RawMessage)
 		return fmt.Errorf("list completed sessions: %w", err)
 	}
 	if len(sessions) == 0 {
-		w.notify(p.GuildID, p.ChannelID, "🔎 No completed sessions with notes to index yet.")
+		w.notify(p.GuildID, p.ChannelID, "🔎 No completed sessions with transcripts to index yet.")
 		return nil
 	}
 	var indexed, failed int
 	for _, sess := range sessions {
-		if err := w.embedSessionNotes(ctx, sess.ID, campaignID, sess.Notes); err != nil {
+		if err := w.embedSessionNotes(ctx, sess.ID, campaignID, sess.Transcript); err != nil {
 			failed++
 			metrics.AIRequests.WithLabelValues("embed", "error").Inc()
 			w.log.Warn("reindex session", "session", sess.ID, "err", err)

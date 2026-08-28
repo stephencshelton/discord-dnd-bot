@@ -115,19 +115,22 @@ func (s *Store) HasEmbeddings(ctx context.Context, campaignID uuid.UUID) (bool, 
 	return exists, nil
 }
 
-// CompletedSessionNote is a completed session's notes, used for backfilling
-// embeddings via /reindex.
+// CompletedSessionNote is a completed session's text, used for backfilling
+// embeddings via /reindex. Both the full transcript and the summarized notes
+// are returned; /ask indexing uses the transcript for maximum recall.
 type CompletedSessionNote struct {
-	ID    uuid.UUID
-	Notes string
+	ID         uuid.UUID
+	Notes      string
+	Transcript string
 }
 
 // CompletedSessionsWithNotes returns completed sessions in a campaign that have
-// non-empty notes, oldest first. Used to (re)build /ask embeddings.
+// a non-empty transcript, oldest first. Used to (re)build /ask embeddings from
+// the full transcript.
 func (s *Store) CompletedSessionsWithNotes(ctx context.Context, campaignID uuid.UUID) ([]CompletedSessionNote, error) {
 	rows, err := s.db.Pool.Query(ctx,
-		`SELECT id, COALESCE(notes,'') FROM sessions
-		  WHERE campaign_id=$1 AND status='complete' AND notes <> ''
+		`SELECT id, COALESCE(notes,''), COALESCE(transcript,'') FROM sessions
+		  WHERE campaign_id=$1 AND status='complete' AND COALESCE(transcript,'') <> ''
 		  ORDER BY started_at ASC`, campaignID)
 	if err != nil {
 		return nil, err
@@ -136,7 +139,7 @@ func (s *Store) CompletedSessionsWithNotes(ctx context.Context, campaignID uuid.
 	var out []CompletedSessionNote
 	for rows.Next() {
 		var c CompletedSessionNote
-		if err := rows.Scan(&c.ID, &c.Notes); err != nil {
+		if err := rows.Scan(&c.ID, &c.Notes, &c.Transcript); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
