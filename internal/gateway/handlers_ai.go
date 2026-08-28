@@ -112,8 +112,11 @@ func (g *Gateway) handleAsk(ctx context.Context, ic *ictx) error {
 	}
 	metrics.AIRequests.WithLabelValues("embed", "ok").Inc()
 
-	// 2) Retrieve the most relevant note passages for this campaign.
-	chunks, err := g.store.SearchSimilarNotes(ctx, camp.ID, qvecs[0], 6)
+	// 2) Retrieve the most relevant note passages for this campaign. /ask now
+	// indexes the full transcript rather than the summarized notes, so passages
+	// are more numerous and finer-grained — retrieve more of them so the model
+	// still gets enough surrounding context to answer.
+	chunks, err := g.store.SearchSimilarNotes(ctx, camp.ID, qvecs[0], 12)
 	if err != nil {
 		return err
 	}
