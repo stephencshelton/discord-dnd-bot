@@ -390,16 +390,20 @@ worker:
   # Redis job-queue backlog. Because ALL worker jobs (transcribe/art/reindex) are
   # enqueued onto a single Redis list, an empty list means there is genuinely
   # nothing to do, so the worker can safely scale to ZERO. KEDA activates the
-  # first replica when >= activationListLength jobs are waiting, then targets
-  # listLength jobs per replica. Requires the KEDA operator installed cluster-wide.
+  # first replica when the list length is STRICTLY GREATER THAN activationListLength
+  # (so 0 => a single queued job activates), then targets listLength jobs per
+  # replica. Requires the KEDA operator installed cluster-wide.
   keda:
     enabled: true
     minReplicaCount: 0
     maxReplicaCount: 1
     # Backlog per replica KEDA targets when scaling (desired = ceil(depth/listLength)).
     listLength: 1
-    # Queue depth at/above which KEDA activates the FIRST replica from zero.
-    activationListLength: 1
+    # Activate the FIRST replica from zero when the queue has MORE THAN this many
+    # jobs. MUST be 0 for scale-from-zero on a single job: KEDA compares with
+    # strictly-greater-than, so a value of 1 would require 2+ queued jobs before
+    # anything scales (a single /session requeue would never wake the worker).
+    activationListLength: 0
     pollingInterval: 15
     # Seconds to wait after the queue empties before scaling back toward zero.
     # Comfortably longer than the longest single job would take to start; the
@@ -479,7 +483,9 @@ stt:
     minReplicaCount: 0
     maxReplicaCount: 1
     listLength: 1
-    activationListLength: 1
+    # 0 so a single queued job activates STT from zero (KEDA uses strictly-
+    # greater-than; see the worker.keda notes above).
+    activationListLength: 0
     pollingInterval: 15
     cooldownPeriod: 600
   # Model download + load on cold start can take a while; give it slack.
