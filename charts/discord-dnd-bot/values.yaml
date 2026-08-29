@@ -579,8 +579,19 @@ redis:
     pullPolicy: IfNotPresent
   auth:
     enabled: false
+  # Persistence is OFF by default. The queue is EPHEMERAL work, not a system of
+  # record — jobs are reconstructable (transcription rebuilds from the S3 audio
+  # chunks; `/session requeue` re-enqueues; the worker reaps orphaned in-flight
+  # jobs on restart). A ReadWriteOnce PVC actively HURTS availability here: when
+  # the Redis pod reschedules (node loss, rollout, eviction) the new pod cannot
+  # attach the volume until the old one fully detaches, causing a multi-minute
+  # "Multi-Attach" gap during which the ENTIRE job queue AND KEDA's scaling
+  # signal are unreachable — so nothing scales and in-flight work stalls. With
+  # persistence off Redis uses an emptyDir and reschedules instantly. Turn this
+  # on only if you understand that trade-off; for durable queues prefer a managed
+  # Redis (set redis.enabled=false and config.redis.addr to the managed endpoint).
   persistence:
-    enabled: true
+    enabled: false
     size: 2Gi
     storageClass: ""
   resources:
