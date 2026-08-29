@@ -446,7 +446,7 @@ stt:
   #   Systran/faster-whisper-small   (default — good CPU speed/quality)
   #   Systran/faster-whisper-medium  (slower, more accurate)
   #   Systran/faster-whisper-large-v3 (best accuracy; needs ~16Gi RAM, see below)
-  model: "Systran/faster-whisper-medium"
+  model: "Systran/faster-whisper-large-v3"
   # Port the Speaches server listens on inside the container.
   port: 8000
   # Persist downloaded model weights so restarts don't re-download. Requires a
@@ -474,10 +474,10 @@ stt:
   resources:
     requests:
       cpu: "4"
-      memory: 10Gi
+      memory: 16Gi
     limits:
       cpu: "4"
-      memory: 10Gi
+      memory: 16Gi
   autoscaling:
     enabled: false
     minReplicas: 1
