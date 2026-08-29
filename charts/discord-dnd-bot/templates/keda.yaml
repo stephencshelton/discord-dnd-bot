@@ -67,6 +67,23 @@ spec:
       authenticationRef:
         name: {{ include "discord-dnd-bot.fullname" . }}-redis
       {{- end }}
+    # Second trigger on the in-flight (processing) list: a job is atomically moved
+    # there the instant it's dequeued, so the pending list above reads empty while
+    # a long job is still running. KEDA activates if ANY trigger is active, so
+    # this keeps the worker scaled up until in-flight jobs actually finish — the
+    # fix for scaling to zero (and killing the pod) mid-job.
+    - type: redis
+      metadata:
+        address: {{ include "discord-dnd-bot.redisAddr" . | quote }}
+        listName: "discord-dnd-bot:jobs:processing"
+        listLength: "1"
+        activationListLength: "0"
+        databaseIndex: {{ .Values.config.redis.db | quote }}
+        enableTLS: "false"
+      {{- if $redisAuth }}
+      authenticationRef:
+        name: {{ include "discord-dnd-bot.fullname" . }}-redis
+      {{- end }}
 {{- end }}
 
 {{- if and .Values.stt.enabled .Values.stt.keda.enabled }}
@@ -94,6 +111,21 @@ spec:
         listName: "discord-dnd-bot:jobs"
         listLength: {{ .Values.stt.keda.listLength | quote }}
         activationListLength: {{ .Values.stt.keda.activationListLength | quote }}
+        databaseIndex: {{ .Values.config.redis.db | quote }}
+        enableTLS: "false"
+      {{- if $redisAuth }}
+      authenticationRef:
+        name: {{ include "discord-dnd-bot.fullname" . }}-redis
+      {{- end }}
+    # In-flight (processing) list trigger — see the worker ScaledObject above.
+    # Keeps STT scaled up while a transcription job is running even after the
+    # pending queue drains, so STT isn't torn down mid-transcription.
+    - type: redis
+      metadata:
+        address: {{ include "discord-dnd-bot.redisAddr" . | quote }}
+        listName: "discord-dnd-bot:jobs:processing"
+        listLength: "1"
+        activationListLength: "0"
         databaseIndex: {{ .Values.config.redis.db | quote }}
         enableTLS: "false"
       {{- if $redisAuth }}

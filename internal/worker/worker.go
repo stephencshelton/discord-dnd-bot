@@ -81,6 +81,15 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 	w.log.Info("worker started", "concurrency", concurrency)
 
+	// Recover any jobs orphaned on the processing list by a previous worker that
+	// was hard-killed mid-job (the reliable-queue safety net). Best-effort: a
+	// Redis blip here just means the next worker start reaps them instead.
+	if n, err := w.queue.ReapOrphans(ctx); err != nil {
+		w.log.Warn("reap orphaned jobs on startup failed", "err", err)
+	} else if n > 0 {
+		w.log.Info("recovered orphaned jobs from processing list", "count", n)
+	}
+
 	// Periodically export queue depth so dashboards/HPA see backlog directly.
 	go w.reportQueueDepth(ctx, 15*time.Second)
 
@@ -195,6 +204,16 @@ func (w *Worker) process(ctx context.Context, job *queue.Job) {
 		status = "error"
 		log.Error("job failed", "err", err)
 		w.maybeRequeue(ctx, job, log, err)
+		return
+	}
+
+	// Success: remove the job's in-flight copy from the processing list so the
+	// reliable queue considers it done and the reaper won't re-run it. Uses a
+	// short independent deadline so a slow Redis can't wedge the worker loop.
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if aerr := w.queue.Ack(actx, job); aerr != nil {
+		log.Error("failed to ack completed job; reaper may re-run it", "err", aerr)
 	}
 }
 
@@ -213,30 +232,46 @@ func (w *Worker) isLastAttempt(job *queue.Job) bool {
 // which the job is dropped. Requeuing uses the worker's run context (not the
 // per-job timeout context, which may already be cancelled).
 func (w *Worker) maybeRequeue(ctx context.Context, job *queue.Job, log *slog.Logger, jobErr error) {
+	// ackDrop removes a terminally-dropped job's in-flight copy so the reaper
+	// won't resurrect it. Used for permanent failures and exhausted retries —
+	// NOT for the shutdown case, where we deliberately leave it on the processing
+	// list so a restarted worker's reaper picks it back up.
+	ackDrop := func() {
+		actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if err := w.queue.Ack(actx, job); err != nil {
+			log.Error("failed to ack dropped job", "err", err)
+		}
+	}
+
 	if queue.IsPermanent(jobErr) {
 		log.Warn("job failed permanently; not retrying", "attempt", job.Attempt)
 		metrics.JobsDropped.WithLabelValues(string(job.Type), "permanent").Inc()
+		ackDrop()
 		return
 	}
 	if job.Attempt >= w.cfg.Worker.MaxRetries {
 		log.Error("job exhausted retries; dropping",
 			"attempt", job.Attempt, "max_retries", w.cfg.Worker.MaxRetries)
 		metrics.JobsDropped.WithLabelValues(string(job.Type), "max_retries_exceeded").Inc()
+		ackDrop()
 		return
 	}
-	// Don't try to requeue while shutting down — the enqueue would race the
-	// drain and likely fail; the job stays lost but that's the shutdown case.
+	// Don't try to requeue while shutting down — leave the job on the processing
+	// list so the restarted worker's reaper recovers it (no longer "lost").
 	if ctx.Err() != nil {
-		log.Warn("worker shutting down; not requeuing failed job", "attempt", job.Attempt)
+		log.Warn("worker shutting down; leaving failed job for reaper", "attempt", job.Attempt)
 		metrics.JobsDropped.WithLabelValues(string(job.Type), "shutdown").Inc()
 		return
 	}
 	// Give the requeue a short, independent deadline so a slow/broken Redis
-	// can't wedge the worker loop.
+	// can't wedge the worker loop. Requeue also removes the in-flight copy.
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if err := w.queue.Requeue(rctx, job); err != nil {
-		log.Error("failed to requeue job; it is lost", "attempt", job.Attempt, "err", err)
+		// Requeue failed — but the job is still on the processing list, so the
+		// reaper will recover it on the next worker start. Not lost.
+		log.Error("failed to requeue job; left on processing list for reaper", "attempt", job.Attempt, "err", err)
 		metrics.JobsDropped.WithLabelValues(string(job.Type), "requeue_failed").Inc()
 		return
 	}

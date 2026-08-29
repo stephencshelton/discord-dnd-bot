@@ -356,9 +356,15 @@ gateway:
 worker:
   enabled: true
   replicaCount: 1
-  # Seconds Kubernetes waits for in-flight jobs to drain on shutdown. Should be
-  # at least as long as the slowest single job (a transcription chunk).
-  terminationGracePeriodSeconds: 120
+  # Seconds Kubernetes waits for in-flight jobs to drain on SIGTERM before it
+  # force-kills the pod. On shutdown the worker stops pulling new jobs and lets
+  # running ones finish. Short jobs (art, embed, extract, reindex) complete well
+  # within this window. A long transcription may exceed it and be force-killed —
+  # that's SAFE now: the reliable queue keeps the job on a processing list, and a
+  # restarted worker's reaper re-runs it (transcription rebuilds from the S3
+  # audio chunks, so it's idempotent). Raised from 120s so most jobs finish
+  # cleanly rather than relying on reap-and-resume.
+  terminationGracePeriodSeconds: 600
   image:
     repository: ""       # defaults to .image.repository
     tag: ""              # defaults to worker-<appVersion>; set by CI

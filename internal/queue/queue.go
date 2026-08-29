@@ -53,6 +53,11 @@ type Job struct {
 	// requeues the job after a retryable failure. It bounds retries so a job
 	// that keeps failing can't loop forever.
 	Attempt int `json:"attempt,omitempty"`
+
+	// raw is the exact serialized bytes of this job as they live on the Redis
+	// processing list (set by Dequeue). Ack/Requeue use it to LREM the precise
+	// element. Not serialized — it's transient in-process bookkeeping.
+	raw string `json:"-"`
 }
 
 // TranscribeSessionPayload carries the session to process.
@@ -97,7 +102,17 @@ type EmbedCanonPayload struct {
 	SourceID   string `json:"source_id"`
 }
 
-const queueKey = "discord-dnd-bot:jobs"
+const (
+	// queueKey is the main pending-jobs list (LPUSH to enqueue, the tail is
+	// consumed oldest-first).
+	queueKey = "discord-dnd-bot:jobs"
+	// processingKey holds jobs a worker has dequeued but not yet finished. A job
+	// is atomically moved here by Dequeue (BRPOPLPUSH) and removed by Ack once it
+	// completes (success or terminal drop). This is the "reliable queue" pattern:
+	// if a worker is hard-killed mid-job, the job survives here and the reaper
+	// returns it to the main queue, so a job is never silently lost.
+	processingKey = "discord-dnd-bot:jobs:processing"
+)
 
 // ErrPermanent wraps a job failure that must NOT be retried — the input is
 // fundamentally bad (unparseable payload, missing session, no audio captured,
@@ -141,10 +156,21 @@ func (q *Queue) Ping(ctx context.Context) error { return q.rdb.Ping(ctx).Err() }
 // Close releases the client.
 func (q *Queue) Close() error { return q.rdb.Close() }
 
-// Depth returns the number of jobs currently waiting in the queue. Used to
-// export a backlog gauge for dashboards and HPA.
+// Depth returns the number of jobs currently OUTSTANDING — pending plus
+// in-flight (on the processing list). Used to export a backlog gauge for
+// dashboards and autoscaling. Counting in-flight jobs matters: a long-running
+// job leaves the pending list the instant it's dequeued, so pending-only depth
+// would read zero while work is still happening and mislead scale-down.
 func (q *Queue) Depth(ctx context.Context) (int64, error) {
-	return q.rdb.LLen(ctx, queueKey).Result()
+	pending, err := q.rdb.LLen(ctx, queueKey).Result()
+	if err != nil {
+		return 0, err
+	}
+	inflight, err := q.rdb.LLen(ctx, processingKey).Result()
+	if err != nil {
+		return 0, err
+	}
+	return pending + inflight, nil
 }
 
 // Enqueue pushes a typed job. The gateway calls this; it returns immediately.
@@ -171,13 +197,19 @@ func (q *Queue) Enqueue(ctx context.Context, jobType JobType, payload any) error
 	return nil
 }
 
-// Requeue pushes a previously-dequeued job back onto the queue with its Attempt
-// counter incremented, so a transient failure (a LiteLLM/storage blip, a pod
-// crash mid-job) can be retried rather than lost. Because Dequeue uses BRPOP —
-// which atomically removes the job from Redis — a failed job would otherwise
-// vanish; Requeue is how the worker puts it back. The job goes to the head
-// (LPush, same as Enqueue) so it will be picked up again promptly.
+// Requeue returns a previously-dequeued job to the pending queue with its
+// Attempt counter incremented, so a transient failure can be retried. It also
+// removes the job's in-flight copy from the processing list (the reliable-queue
+// bookkeeping), so the job exists in exactly one place afterward. The job goes
+// to the head (LPush) so it's picked up again promptly.
 func (q *Queue) Requeue(ctx context.Context, job *Job) error {
+	// Remove the in-flight copy first (best-effort; if this fails the reaper
+	// would eventually re-queue the same job, which retry logic tolerates).
+	if job.raw != "" {
+		if err := q.rdb.LRem(ctx, processingKey, 1, job.raw).Err(); err != nil {
+			metrics.ComponentError("redis", "requeue_ack")
+		}
+	}
 	job.Attempt++
 	body, err := json.Marshal(job)
 	if err != nil {
@@ -191,9 +223,28 @@ func (q *Queue) Requeue(ctx context.Context, job *Job) error {
 	return nil
 }
 
-// Dequeue blocks up to timeout for the next job. Returns (nil, nil) on timeout.
+// Ack removes a finished job's in-flight copy from the processing list. It MUST
+// be called once a job reaches a terminal state (success, or a permanent/
+// exhausted-retries drop) so the reliable queue doesn't later re-run it via the
+// reaper. Idempotent and best-effort: a job with no recorded raw body (e.g. an
+// externally-injected job) is a no-op.
+func (q *Queue) Ack(ctx context.Context, job *Job) error {
+	if job == nil || job.raw == "" {
+		return nil
+	}
+	if err := q.rdb.LRem(ctx, processingKey, 1, job.raw).Err(); err != nil {
+		metrics.ComponentError("redis", "ack")
+		return err
+	}
+	return nil
+}
+
+// Dequeue blocks up to timeout for the next job, atomically moving it from the
+// pending queue to the processing list (BRPOPLPUSH). The job stays on the
+// processing list — visible to Depth and recoverable by the reaper — until the
+// worker calls Ack (done) or Requeue (retry). Returns (nil, nil) on timeout.
 func (q *Queue) Dequeue(ctx context.Context, timeout time.Duration) (*Job, error) {
-	res, err := q.rdb.BRPop(ctx, timeout, queueKey).Result()
+	body, err := q.rdb.BRPopLPush(ctx, queueKey, processingKey, timeout).Result()
 	if err == redis.Nil {
 		return nil, nil // timed out, no job
 	}
@@ -205,14 +256,44 @@ func (q *Queue) Dequeue(ctx context.Context, timeout time.Duration) (*Job, error
 		}
 		return nil, err
 	}
-	if len(res) != 2 {
-		metrics.ComponentError("redis", "dequeue_decode")
-		return nil, fmt.Errorf("unexpected BRPOP result length %d", len(res))
-	}
 	var job Job
-	if err := json.Unmarshal([]byte(res[1]), &job); err != nil {
+	if err := json.Unmarshal([]byte(body), &job); err != nil {
 		metrics.ComponentError("redis", "dequeue_decode")
+		// Remove the un-decodable element so it doesn't wedge the processing list.
+		_ = q.rdb.LRem(ctx, processingKey, 1, body).Err()
 		return nil, err
 	}
+	job.raw = body // remember the exact bytes so Ack/Requeue can LREM this element
 	return &job, nil
+}
+
+// ReapOrphans returns every job left on the processing list to the pending
+// queue. A job lands there when a worker dies mid-processing (hard kill, node
+// loss) without Ack/Requeue. Because the worker fleet is small (default max 1
+// replica) and drains in-flight jobs on graceful shutdown, anything still on the
+// processing list at reap time is genuinely orphaned, so moving it all back to
+// pending is safe and recovers otherwise-lost work. Call on worker startup (and
+// optionally periodically). Returns how many jobs were recovered.
+//
+// NOTE: with multiple concurrently-running workers this would also re-queue
+// jobs another worker is actively processing; that's acceptable only because
+// the worker runs at low/one replica and every handler is idempotent (dedup on
+// transcribe/extract/embed). If the worker fleet is ever scaled to many always-
+// on replicas, switch to a per-job visibility-timeout reaper instead.
+func (q *Queue) ReapOrphans(ctx context.Context) (int, error) {
+	recovered := 0
+	for {
+		// Atomically move one element from processing back to the pending head.
+		body, err := q.rdb.RPopLPush(ctx, processingKey, queueKey).Result()
+		if err == redis.Nil {
+			return recovered, nil // processing list drained
+		}
+		if err != nil {
+			metrics.ComponentError("redis", "reap")
+			return recovered, err
+		}
+		recovered++
+		metrics.JobsRetried.WithLabelValues("reaped").Inc()
+		_ = body
+	}
 }

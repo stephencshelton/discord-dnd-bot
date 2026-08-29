@@ -63,10 +63,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Health/metrics endpoint. Readiness = Redis reachable.
-	health := httpserver.New(cfg.HTTPAddr, log, func(hctx context.Context) error {
-		return q.Ping(hctx)
-	})
+	// Health/metrics endpoint. The worker takes NO inbound traffic (it's a queue
+	// consumer, not a server), so readiness must NOT gate on Redis: a transient
+	// Redis blip returning 503 would only cause Kubernetes to disrupt/terminate
+	// the pod mid-job for no benefit. Liveness (/healthz) already covers "process
+	// alive"; readiness is always OK here. The worker's own dequeue loop handles
+	// Redis reconnection.
+	health := httpserver.New(cfg.HTTPAddr, log, nil)
 	go func() {
 		if err := health.Start(ctx); err != nil {
 			log.Error("health server", "err", err)
