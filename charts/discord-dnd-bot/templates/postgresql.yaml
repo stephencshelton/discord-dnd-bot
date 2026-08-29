@@ -46,6 +46,7 @@ spec:
       labels:
         {{- include "discord-dnd-bot.componentSelectorLabels" (dict "root" . "component" "postgresql") | nindent 8 }}
     spec:
+      priorityClassName: system-cluster-critical
       securityContext:
         runAsUser: 999
         runAsGroup: 999

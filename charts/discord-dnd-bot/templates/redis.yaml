@@ -43,6 +43,7 @@ spec:
       labels:
         {{- include "discord-dnd-bot.componentSelectorLabels" (dict "root" . "component" "redis") | nindent 8 }}
     spec:
+      priorityClassName: {{ .Values.redis.priorityClassName | default "system-cluster-critical" }}
       securityContext:
         runAsUser: 999
         runAsGroup: 999
@@ -89,6 +90,33 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+      {{- with .Values.redis.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.redis.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.redis.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if and .Values.redis.podDisruptionBudget .Values.redis.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  minAvailable: {{ .Values.redis.podDisruptionBudget.minAvailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "discord-dnd-bot.componentSelectorLabels" (dict "root" . "component" "redis") | nindent 6 }}
+{{- end }}
 {{- if .Values.redis.persistence.enabled }}
 ---
 apiVersion: v1

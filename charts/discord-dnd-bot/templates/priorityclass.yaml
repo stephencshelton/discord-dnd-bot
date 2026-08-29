@@ -1,0 +1,21 @@
+{{- /*
+Optional chart-managed PriorityClass. Protects components that reference it
+(notably the single-replica bundled Redis) from cluster-autoscaler/Karpenter
+consolidation eviction, which otherwise takes the job queue down on node churn.
+
+Deliberately NOT the reserved system-cluster-critical/system-node-critical
+classes: those are for genuine cluster infrastructure, are only usable in
+kube-system, and misusing them for app pods can starve real system components.
+This renders a dedicated high-value (but sub-system) class instead.
+*/ -}}
+{{- if .Values.priorityClass.create }}
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.priorityClass.name | default (printf "%s-critical" (include "discord-dnd-bot.fullname" .)) }}
+  labels:
+    {{- include "discord-dnd-bot.labels" . | nindent 4 }}
+value: {{ .Values.priorityClass.value }}
+globalDefault: false
+description: {{ .Values.priorityClass.description | quote }}
+{{- end }}

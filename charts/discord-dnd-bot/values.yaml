@@ -607,3 +607,40 @@ redis:
     limits:
       cpu: "500m"
       memory: 512Mi
+  # Scheduling protection. The bundled Redis is a SINGLE replica, so any node
+  # eviction (autoscaler/Karpenter consolidation, spot reclaim, drain) takes the
+  # whole job queue down for ~30-45s while the pod reschedules. These knobs keep
+  # it stable:
+  #
+  #   priorityClassName — assign a HIGH-priority class so the autoscaler is
+  #     reluctant to evict Redis during consolidation. Do NOT use the reserved
+  #     system-cluster-critical/system-node-critical classes for an app workload
+  #     (those are for real cluster infra and only valid in kube-system); use a
+  #     dedicated high-value class instead. Set priorityClass.create=true below
+  #     to have this chart render one named "<release>-critical" for you, or set
+  #     this to the name of a class you already have.
+  priorityClassName: ""
+  # nodeSelector/affinity/tolerations — pin Redis to stable (e.g. on-demand,
+  # non-spot) nodes so it isn't on a reclaim-prone instance.
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  # PodDisruptionBudget — tells voluntary-disruption actors (drain, autoscaler
+  # consolidation) not to evict Redis unless unavoidable. Complements the
+  # priority class; enable both for the strongest protection.
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
+# Optional chart-managed PriorityClass for protecting the bundled Redis (and
+# anything else you point at it) from node-consolidation eviction. Disabled by
+# default; when enabled it renders a cluster-scoped PriorityClass you can
+# reference via redis.priorityClassName (and worker/gateway if desired). Kept
+# well BELOW the reserved system priorities (which are ~2000000000) so it never
+# competes with genuine cluster infrastructure.
+priorityClass:
+  create: false
+  # Name defaults to "<release>-critical" when empty.
+  name: ""
+  value: 1000000
+  description: "High priority for discord-dnd-bot stateful/queue components (protects from node consolidation eviction)."
