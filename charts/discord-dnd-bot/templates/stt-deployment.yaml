@@ -10,12 +10,15 @@ spec:
   {{- if and (not .Values.stt.autoscaling.enabled) (not .Values.stt.keda.enabled) }}
   replicas: {{ .Values.stt.replicaCount }}
   {{- end }}
+
   # Model weights live on a single RWO PVC; avoid two pods mounting it at once.
   strategy:
     type: Recreate
+
   selector:
     matchLabels:
       {{- include "discord-dnd-bot.componentSelectorLabels" (dict "root" . "component" "stt") | nindent 6 }}
+
   template:
     metadata:
       labels:
@@ -27,18 +30,16 @@ spec:
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+
     spec:
       priorityClassName: system-cluster-critical
       serviceAccountName: {{ include "discord-dnd-bot.serviceAccountName" . }}
+
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      # The Speaches image is built around its own "ubuntu" user (UID 1000) with
-      # HOME=/home/ubuntu and PATH pointing at /home/ubuntu/speaches/.venv/bin
-      # (where uvicorn lives). The chart's global hardening pins UID 10001, which
-      # loses that PATH and HOME -> `uvicorn: not found`. Run STT as UID 1000 but
-      # keep the other hardening (non-root, no privilege escalation, dropped caps).
+
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -46,49 +47,76 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+
       containers:
         - name: stt
           image: "{{ .Values.stt.image.repository }}:{{ .Values.stt.image.tag }}"
           imagePullPolicy: {{ .Values.stt.image.pullPolicy }}
+
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
+
           env:
-            # Default model name for requests that don't specify one.
+            # Default Whisper model.
             - name: WHISPER__MODEL
               value: {{ .Values.stt.model | quote }}
-            # Preload (download) the model on startup. WHISPER__MODEL only sets
-            # the default *name*; it does NOT fetch weights. Without this the HF
-            # cache dir is never created and transcription fails with
-            # `CacheNotFound: /home/ubuntu/.cache/huggingface/hub`. PRELOAD_MODELS
-            # downloads each listed model at boot, creating the cache and weights.
+
+            # Download model weights during startup.
             - name: PRELOAD_MODELS
               value: '["{{ .Values.stt.model }}"]'
-            # Match the image's baked-in user home. uvicorn is installed in the
-            # venv at /home/ubuntu/speaches/.venv/bin; set PATH explicitly so it
-            # is always found regardless of how the runtime resolves the image env.
+
             - name: HOME
               value: /home/ubuntu
+
             - name: PATH
               value: /home/ubuntu/speaches/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-            # Keep model weights + HF cache on the mounted (writable) volume so
-            # readOnlyRootFilesystem is satisfied and restarts reuse the cache.
-            # Set both HF_HOME and HF_HUB_CACHE: huggingface_hub scans the
-            # `<HF_HUB_CACHE>` path directly, so it must point at the hub subdir.
+
             - name: HF_HOME
               value: /home/ubuntu/.cache/huggingface
+
             - name: HF_HUB_CACHE
               value: /home/ubuntu/.cache/huggingface/hub
+
+            {{- if .Values.stt.gpu.enabled }}
+            # Run faster-whisper/CTranslate2 on the NVIDIA GPU.
+            - name: WHISPER__INFERENCE_DEVICE
+              value: "cuda"
+
+            # FP16 gives excellent Large-v3 performance on NVIDIA GPUs
+            # while comfortably fitting T4/A10G/L4 VRAM.
+            - name: WHISPER__COMPUTE_TYPE
+              value: {{ .Values.stt.gpu.computeType | quote }}
+
+            # GPU index exposed by the NVIDIA device plugin.
+            - name: WHISPER__DEVICE_INDEX
+              value: "0"
+
+            # One inference worker per GPU. Multiple workers would compete
+            # for the same GPU and aren't useful for our sequential
+            # three-minute transcription chunks.
+            - name: WHISPER__NUM_WORKERS
+              value: {{ .Values.stt.gpu.numWorkers | quote }}
+
+            # Keep Large-v3 resident in VRAM between chunks.
+            # The entire pod will disappear when KEDA scales STT to zero,
+            # so unloading it while the pod is alive just adds latency.
+            - name: STT_MODEL_TTL
+              value: {{ .Values.stt.gpu.modelTtl | quote }}
+            {{- end }}
+
             {{- with .Values.stt.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+
           ports:
             - name: http
               containerPort: {{ .Values.stt.port }}
               protocol: TCP
+
           startupProbe:
             httpGet:
               path: /health
@@ -96,23 +124,29 @@ spec:
             initialDelaySeconds: {{ .Values.stt.startupProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.stt.startupProbe.periodSeconds }}
             failureThreshold: {{ .Values.stt.startupProbe.failureThreshold }}
+
           livenessProbe:
             httpGet:
               path: /health
               port: http
             periodSeconds: 30
+
           readinessProbe:
             httpGet:
               path: /health
               port: http
             periodSeconds: 15
+
           resources:
             {{- toYaml .Values.stt.resources | nindent 12 }}
+
           volumeMounts:
             - name: cache
               mountPath: /home/ubuntu/.cache
+
             - name: tmp
               mountPath: /tmp
+
       volumes:
         - name: cache
           {{- if .Values.stt.persistence.enabled }}
@@ -121,20 +155,25 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+
         - name: tmp
           emptyDir: {}
+
       {{- with .Values.stt.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+
       {{- with .Values.stt.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+
       {{- with .Values.stt.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+
 {{- if .Values.stt.persistence.enabled }}
 ---
 apiVersion: v1
@@ -144,12 +183,15 @@ metadata:
   labels:
     {{- include "discord-dnd-bot.labels" . | nindent 4 }}
     app.kubernetes.io/component: stt
+
 spec:
   accessModes:
     {{- toYaml .Values.stt.persistence.accessModes | nindent 4 }}
+
   {{- with .Values.stt.persistence.storageClass }}
   storageClassName: {{ . | quote }}
   {{- end }}
+
   resources:
     requests:
       storage: {{ .Values.stt.persistence.size }}

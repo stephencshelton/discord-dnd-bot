@@ -433,86 +433,149 @@ worker:
 stt:
   enabled: false
   replicaCount: 1
+
   image:
     repository: ghcr.io/speaches-ai/speaches
-    # Pin an explicit CPU tag. Do NOT use the floating `latest-cpu`: it lags
-    # behind and predates the `preload_models` (PRELOAD_MODELS) feature added in
-    # 0.9.0-rc.3, so the STT deployment's PRELOAD_MODELS env is silently ignored,
-    # the HF cache is never populated, and transcription fails with
-    # `CacheNotFound: /home/ubuntu/.cache/huggingface/hub`. This tag has it.
-    tag: "0.9.0-rc.3-cpu"
+    # CUDA-enabled Speaches image. EKS Auto Mode supplies the NVIDIA driver
+    # and device plugin on accelerated nodes; this image provides the CUDA
+    # userspace/runtime needed by CTranslate2/faster-whisper.
+    tag: "0.9.0-rc.3-cuda-12.6.3"
     pullPolicy: IfNotPresent
-  # Whisper model to load. Swap freely without code changes:
-  #   Systran/faster-whisper-small   (default — good CPU speed/quality)
-  #   Systran/faster-whisper-medium  (slower, more accurate)
-  #   Systran/faster-whisper-large-v3 (best accuracy; needs ~16Gi RAM, see below)
+
+  # Whisper model to load.
+  # large-v3 provides the best transcription accuracy and runs efficiently
+  # on the T4/A10G/L4 GPUs allowed by the GPU NodePool.
   model: "Systran/faster-whisper-large-v3"
+
   # Port the Speaches server listens on inside the container.
   port: 8000
-  # Persist downloaded model weights so restarts don't re-download. Requires a
-  # default StorageClass; set enabled=false to use an ephemeral emptyDir.
-  # large-v3 weights are ~3GB; bump this to 10Gi if you switch to it.
+
+  # GPU inference settings consumed by the STT deployment template.
+  gpu:
+    enabled: true
+
+    # FP16 is a good default for Large-v3 on T4, A10G and L4 GPUs.
+    computeType: "float16"
+
+    # One inference worker per GPU. The application sends 3-minute chunks,
+    # so optimize for individual transcription latency rather than running
+    # multiple CTranslate2 workers against the same GPU.
+    numWorkers: 1
+
+    # Keep Large-v3 loaded in VRAM between requests. KEDA scales the entire
+    # STT pod to zero when idle, so unloading the model while the pod remains
+    # alive only adds unnecessary reload latency between 3-minute chunks.
+    modelTtl: -1
+
+  # Persist downloaded model weights so GPU pod restarts do not repeatedly
+  # download ~3GB of Large-v3 weights from Hugging Face.
   persistence:
     enabled: true
-    size: 5Gi
+
+    # Give the cache some headroom for Hugging Face metadata/temp files and
+    # potential future model changes.
+    size: 10Gi
+
     storageClass: ""
+
     accessModes:
       - ReadWriteOnce
-  # STT is CPU/RAM heavy relative to the Go services. Tune to your instance size.
+
+  # GPU inference moves the expensive Whisper computation off the CPU.
   #
-  # Memory sizing by model (peak RSS, CPU path, one downmixed-mono segment of
-  # config.audio.transcribeSegmentMinutes minutes — segment length bounds the
-  # per-request audio buffer, so RAM is driven by MODEL SIZE, not session length):
-  #   small   -> ~4Gi
-  #   medium  -> ~10Gi   (current default)
-  #   large-v3-> ~16Gi   (weights ~3GB + CTranslate2 runtime + decode buffers;
-  #                        8Gi OOMs, hence this reservation). Since STT scales to
-  #                        zero via KEDA when the queue is empty, this larger
-  #                        reservation only applies while a session is actually
-  #                        being transcribed.
-  # If you set model to large-v3, raise both requests and limits to 16Gi.
+  # Request only part of the host CPU/RAM so the pod can fit on the smallest
+  # single-GPU instances:
+  #
+  #   g4dn.xlarge -> 4 vCPU / 16 GiB / 1x T4 16GB
+  #   g5.xlarge   -> 4 vCPU / 16 GiB / 1x A10G 24GB
+  #   g6.xlarge   -> 4 vCPU / 16 GiB / 1x L4 24GB
+  #
+  # Requesting the full 4 CPU / 16Gi would leave no room for Kubernetes/node
+  # overhead and could prevent Auto Mode from selecting an xlarge GPU node.
   resources:
     requests:
-      cpu: "4"
-      memory: 16Gi
+      cpu: "2"
+      memory: 8Gi
+      nvidia.com/gpu: "1"
+
     limits:
       cpu: "4"
-      memory: 16Gi
+      memory: 12Gi
+      nvidia.com/gpu: "1"
+
   autoscaling:
     enabled: false
     minReplicas: 1
-    maxReplicas: 4
+    maxReplicas: 1
     targetCPUUtilizationPercentage: 70
-  # Event-driven autoscaling via KEDA. STT is NOT a queue consumer itself — the
-  # worker calls it through LiteLLM during transcribe_session jobs — but the same
-  # Redis queue backlog is the right signal: if jobs are waiting, transcription
-  # (and therefore STT) is imminent. Scaling STT to zero when the queue is empty
-  # frees its large CPU/RAM reservation. NOTE: STT cold start is slow (model
-  # download/load, see startupProbe); the worker's retry/requeue logic bridges
-  # the gap, so early transcribe attempts may fail-and-retry until STT is Ready.
-  # Give a longer cooldown than the worker so STT does not thrash on brief lulls.
+
+  # Event-driven autoscaling via KEDA.
+  #
+  # STT is not the Redis consumer itself; the worker invokes STT while
+  # processing queued transcription jobs. Queue depth therefore remains
+  # the activation signal.
+  #
+  # Scaling to zero also allows the GPU NodePool to eventually consolidate
+  # the expensive GPU node completely away.
   keda:
     enabled: true
     minReplicaCount: 0
     maxReplicaCount: 1
     listLength: 1
-    # 0 so a single queued job activates STT from zero (KEDA uses strictly-
-    # greater-than; see the worker.keda notes above).
+
+    # A single queued transcription job should activate STT.
     activationListLength: 0
+
     pollingInterval: 15
+
+    # Keep the pod/GPU around for 10 minutes after work disappears so
+    # short pauses between 3-minute chunks or sessions do not cause
+    # repeated node provisioning + CUDA/model cold starts.
     cooldownPeriod: 600
-  # Model download + load on cold start can take a while; give it slack.
+
+  # A completely cold start may require:
+  #   GPU EC2 provisioning
+  #   Bottlerocket startup
+  #   container image pull
+  #   CUDA initialization
+  #   Large-v3 loading into VRAM
+  #
+  # Allow up to roughly 10 minutes before Kubernetes considers startup failed.
   startupProbe:
     initialDelaySeconds: 10
     periodSeconds: 10
     failureThreshold: 60
+
   podDisruptionBudget:
     enabled: false
     minAvailable: 1
-  nodeSelector: {}
-  tolerations: []
+
+  # Select only the dedicated EKS Auto Mode GPU NodePool created with:
+  #
+  #   template.metadata.labels:
+  #     workload-type: gpu
+  #
+  # The nvidia.com/gpu resource request is what tells the scheduler that
+  # actual GPU capacity is required.
+  nodeSelector:
+    eks.amazonaws.com/compute-type: auto
+    workload-type: gpu
+
+  # Match the taint on the dedicated GPU NodePool:
+  #
+  #   nvidia.com/gpu=true:NoSchedule
+  #
+  # This keeps ordinary workloads off expensive GPU nodes.
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
   affinity: {}
-  # Extra env vars passed to the Speaches container (advanced tuning).
+
+  # Additional Speaches environment variables can still be added here.
+  # GPU-specific variables are generated by the Helm template from stt.gpu.
   extraEnv: []
 
 service:
