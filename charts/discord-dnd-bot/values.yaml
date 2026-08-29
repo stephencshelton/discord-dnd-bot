@@ -445,12 +445,13 @@ stt:
   # Whisper model to load. Swap freely without code changes:
   #   Systran/faster-whisper-small   (default — good CPU speed/quality)
   #   Systran/faster-whisper-medium  (slower, more accurate)
-  #   Systran/faster-whisper-large-v3 (heavy; large instances only)
+  #   Systran/faster-whisper-large-v3 (best accuracy; needs ~16Gi RAM, see below)
   model: "Systran/faster-whisper-medium"
   # Port the Speaches server listens on inside the container.
   port: 8000
   # Persist downloaded model weights so restarts don't re-download. Requires a
   # default StorageClass; set enabled=false to use an ephemeral emptyDir.
+  # large-v3 weights are ~3GB; bump this to 10Gi if you switch to it.
   persistence:
     enabled: true
     size: 5Gi
@@ -458,6 +459,18 @@ stt:
     accessModes:
       - ReadWriteOnce
   # STT is CPU/RAM heavy relative to the Go services. Tune to your instance size.
+  #
+  # Memory sizing by model (peak RSS, CPU path, one downmixed-mono segment of
+  # config.audio.transcribeSegmentMinutes minutes — segment length bounds the
+  # per-request audio buffer, so RAM is driven by MODEL SIZE, not session length):
+  #   small   -> ~4Gi
+  #   medium  -> ~10Gi   (current default)
+  #   large-v3-> ~16Gi   (weights ~3GB + CTranslate2 runtime + decode buffers;
+  #                        8Gi OOMs, hence this reservation). Since STT scales to
+  #                        zero via KEDA when the queue is empty, this larger
+  #                        reservation only applies while a session is actually
+  #                        being transcribed.
+  # If you set model to large-v3, raise both requests and limits to 16Gi.
   resources:
     requests:
       cpu: "4"

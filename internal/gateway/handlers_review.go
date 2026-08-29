@@ -57,15 +57,13 @@ func parseReviewCustomID(id string) (verb string, proposalID uuid.UUID, ok bool)
 
 // handleReviewSession is the /review-session command: it finds the pending
 // proposals for the active campaign (optionally a specific session) and shows
-// the first one with Approve/Reject/Edit/Skip buttons. Admin-gated (see the
-// command's DefaultMemberPermissions and the runtime check below).
+// the first one with Approve/Reject/Edit/Skip buttons. Open to anyone in the
+// server — proposals are only suggestions and applying one is reversible via the
+// /world commands, so gating isn't warranted.
 func (g *Gateway) handleReviewSession(ctx context.Context, ic *ictx) error {
 	guildID := ic.guildID()
 	if guildID == "" {
 		return ic.reply("Use `/review-session` inside a server.", true)
-	}
-	if !g.isReviewer(ic.e.Member()) {
-		return ic.reply("Only server managers can review campaign-state proposals.", true)
 	}
 	camp, err := g.activeCampaign(ctx, guildID)
 	if err != nil {
@@ -106,18 +104,6 @@ func (g *Gateway) handleReviewSession(ctx context.Context, ic *ictx) error {
 		Components: components,
 		Flags:      discord.MessageFlagEphemeral,
 	})
-}
-
-// isReviewer reports whether the interacting member may review proposals. It
-// requires the Manage Server permission (mirrors the command's
-// DefaultMemberPermissions) and is re-checked at button time so a stale message
-// can't be actioned by a non-manager. A nil member (DM) is never a reviewer.
-func (g *Gateway) isReviewer(m *discord.ResolvedMember) bool {
-	if m == nil {
-		return false
-	}
-	return m.Permissions.Has(discord.PermissionManageGuild) ||
-		m.Permissions.Has(discord.PermissionAdministrator)
 }
 
 // reviewView renders one proposal as an embed + action buttons. remaining is
@@ -253,14 +239,6 @@ func (g *Gateway) routeComponent(e *events.ComponentInteractionCreate) {
 // proposal in the SAME ephemeral message (edit-in-place), so the DM moves
 // through the queue without re-running the command.
 func (g *Gateway) handleReviewButton(ctx context.Context, e *events.ComponentInteractionCreate, verb string, proposalID uuid.UUID) error {
-	// Authorization: re-check Manage Server at click time.
-	if !g.isReviewer(e.Member()) {
-		return e.UpdateMessage(discord.MessageUpdate{
-			Content:    ptr("Only server managers can review campaign-state proposals."),
-			Embeds:     &[]discord.Embed{},
-			Components: &[]discord.LayoutComponent{},
-		})
-	}
 	reviewerID := e.User().ID.String()
 
 	prop, err := g.store.GetStateProposal(ctx, proposalID)
@@ -435,11 +413,6 @@ func (g *Gateway) modalRoutes() []modalRoute {
 func (g *Gateway) handleReviewModalSubmit(ctx context.Context, e *events.ModalSubmitInteractionCreate) {
 	verb, proposalID, ok := parseReviewCustomID(e.Data.CustomID)
 	if !ok || verb != reviewModal {
-		return
-	}
-
-	if !g.isReviewer(e.Member()) {
-		_ = e.CreateMessage(discord.MessageCreate{Content: "Only server managers can edit proposals.", Flags: discord.MessageFlagEphemeral})
 		return
 	}
 

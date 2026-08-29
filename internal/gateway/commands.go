@@ -6,7 +6,6 @@ import (
 
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/rest"
-	"github.com/disgoorg/omit"
 	"github.com/disgoorg/snowflake/v2"
 )
 
@@ -293,9 +292,8 @@ func allCommandSpecs() []commandSpec {
 		}},
 
 		{dm: false, def: discord.SlashCommandCreate{
-			Name:                     "review-session",
-			Description:              "Review AI-proposed campaign-world changes and approve/reject them (DM/admin)",
-			DefaultMemberPermissions: omit.NewPtr(discord.PermissionManageGuild),
+			Name:        "review-session",
+			Description: "Review AI-proposed campaign-world changes and approve/reject them",
 			Options: []discord.ApplicationCommandOption{
 				discord.ApplicationCommandOptionString{Name: "session_id", Description: "Review a specific session's proposals (leave empty for all pending)", Autocomplete: true},
 			},

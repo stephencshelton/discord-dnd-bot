@@ -39,31 +39,6 @@ func TestReviewCustomIDRoundTrip(t *testing.T) {
 	}
 }
 
-// TestIsReviewer enforces the authorization rule: only members with Manage
-// Server (or Administrator) may review; a nil member (DM) never can.
-func TestIsReviewer(t *testing.T) {
-	g := &Gateway{}
-
-	if g.isReviewer(nil) {
-		t.Error("nil member should not be a reviewer")
-	}
-
-	noPerm := &discord.ResolvedMember{Permissions: discord.PermissionViewChannel}
-	if g.isReviewer(noPerm) {
-		t.Error("member without Manage Server should not be a reviewer")
-	}
-
-	manage := &discord.ResolvedMember{Permissions: discord.PermissionManageGuild}
-	if !g.isReviewer(manage) {
-		t.Error("member with Manage Server should be a reviewer")
-	}
-
-	admin := &discord.ResolvedMember{Permissions: discord.PermissionAdministrator}
-	if !g.isReviewer(admin) {
-		t.Error("administrator should be a reviewer")
-	}
-}
-
 // TestReviewViewRendersActions confirms a proposal renders an embed with the
 // expected fields and the four action buttons.
 func TestReviewViewRendersActions(t *testing.T) {
@@ -118,10 +93,9 @@ func TestEntityKindLabel(t *testing.T) {
 	}
 }
 
-// TestReviewSessionCommandIsRegisteredAndAdminGated ensures the command exists,
-// is guild-only, and requires Manage Server (defence-in-depth beyond the runtime
-// isReviewer check).
-func TestReviewSessionCommandIsRegisteredAndAdminGated(t *testing.T) {
+// TestReviewSessionCommandRegistered ensures the command exists, is guild-only,
+// and is NOT permission-gated (open to everyone in the server).
+func TestReviewSessionCommandRegistered(t *testing.T) {
 	var found bool
 	for _, sp := range allCommandSpecs() {
 		if sp.def.Name != "review-session" {
@@ -131,9 +105,8 @@ func TestReviewSessionCommandIsRegisteredAndAdminGated(t *testing.T) {
 		if sp.dm {
 			t.Error("review-session should be guild-only (dm=false)")
 		}
-		perms := sp.def.DefaultMemberPermissions
-		if !perms.OK || perms.Value == nil || !perms.Value.Has(discord.PermissionManageGuild) {
-			t.Errorf("review-session should default-require Manage Server, got %+v", perms)
+		if sp.def.DefaultMemberPermissions.OK {
+			t.Errorf("review-session should NOT be permission-gated, got %+v", sp.def.DefaultMemberPermissions)
 		}
 	}
 	if !found {
