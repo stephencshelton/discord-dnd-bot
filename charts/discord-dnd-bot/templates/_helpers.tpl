@@ -92,12 +92,19 @@ config.database.host still wins (for a managed/external DB).
 Effective Redis address (host:port). When the bundled Redis is enabled the chart
 owns the Service name, so it is derived from the fullname automatically; an
 explicit config.redis.addr still wins (for a managed/external Redis).
+
+Uses the fully-qualified <svc>.<namespace>.svc.cluster.local form, not just the
+short Service name: this address is also handed to KEDA's ScaledObject trigger,
+and the KEDA operator resolves it from ITS OWN pod (typically in a separate
+`keda` namespace), where the short name's DNS search-domain fallback doesn't
+include this release's namespace and resolution fails (SERVFAIL). The FQDN
+resolves correctly regardless of which namespace queries it.
 */}}
 {{- define "discord-dnd-bot.redisAddr" -}}
 {{- if .Values.config.redis.addr }}
 {{- .Values.config.redis.addr }}
 {{- else if .Values.redis.enabled }}
-{{- printf "%s-redis-master:6379" (include "discord-dnd-bot.fullname" .) }}
+{{- printf "%s-redis-master.%s.svc.cluster.local:6379" (include "discord-dnd-bot.fullname" .) .Release.Namespace }}
 {{- else }}
 {{- "localhost:6379" }}
 {{- end }}
