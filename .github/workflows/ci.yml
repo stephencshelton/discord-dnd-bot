@@ -82,7 +82,7 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
       - name: gosec (static security analysis)
-        uses: securego/gosec@549db668017d67c5eedc9ee8a695208bc3af7c23 # v2.29.0
+        uses: securego/gosec@deb54465fea23d19a77f037e11e6589021f8501d # v2.29.0
         with:
           # -no-fail: report findings via SARIF (uploaded below) instead of
           # failing the job, so results always land in the Security tab rather
