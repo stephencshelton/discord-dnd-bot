@@ -102,6 +102,9 @@ func commandListEmbed() discord.Embed {
 		Name:  "Chat",
 		Value: "**@mention** me in a channel or **DM** me to chat about your campaign. If you're in more than one of my servers, use `/dm-server` to pick which one your DMs use.",
 	})
+	// The command set grows over time; budget the fields against the embed's
+	// 6000-char total so adding commands can't silently break /help.
+	e.Fields = fitEmbedFields(len([]rune(e.Title))+len([]rune(e.Description)), e.Fields)
 	return e
 }
 
@@ -241,17 +244,11 @@ func optionTypeName(t discord.ApplicationCommandOptionType) string {
 	}
 }
 
-// clampField keeps a field value within Discord's 1024-char limit.
+// clampField keeps a field value within Discord's 1024-char field limit,
+// breaking on a word boundary. An empty value is replaced with a placeholder
+// because Discord rejects empty field values.
 func clampField(s string) string {
-	const max = 1024
-	r := []rune(s)
-	if len(r) <= max {
-		if s == "" {
-			return "—"
-		}
-		return s
-	}
-	return string(r[:max-1]) + "…"
+	return truncateForField(s)
 }
 
 // boolPtr returns a pointer to b (for discord.EmbedField.Inline).

@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
+	"github.com/stephencshelton/discord-dnd-bot/internal/discordfmt"
 	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
@@ -123,27 +124,32 @@ func reviewView(p db.StateProposal, idx, total int) (discord.Embed, []discord.La
 		desc = "_(no description proposed)_"
 	}
 
+	// Field names/values here all come from MODEL output, so none of it can be
+	// trusted to fit: entity names cap at 256, values at 1024, and the embed as a
+	// whole at 6000. fitEmbedFields enforces all three (an over-length embed makes
+	// Discord reject the interaction outright, showing the DM nothing).
 	fields := []discord.EmbedField{
-		{Name: p.EntityName, Value: truncate(desc, 1000)},
+		{Name: p.EntityName, Value: desc},
 	}
 	if p.Explanation != "" {
-		fields = append(fields, discord.EmbedField{Name: "Change", Value: truncate(p.Explanation, 1000)})
+		fields = append(fields, discord.EmbedField{Name: "Change", Value: p.Explanation})
 	}
 	if p.Evidence != "" {
-		fields = append(fields, discord.EmbedField{Name: "Evidence", Value: truncate(p.Evidence, 1000)})
+		fields = append(fields, discord.EmbedField{Name: "Evidence", Value: p.Evidence})
 	}
 	// Surface any extra structured patch fields (e.g. quest status) so the DM
 	// sees exactly what will be merged into the entity's metadata.
 	if extra := patchExtras(p); extra != "" {
-		fields = append(fields, discord.EmbedField{Name: "Details", Value: truncate(extra, 1000)})
+		fields = append(fields, discord.EmbedField{Name: "Details", Value: extra})
 	}
 
 	footer := fmt.Sprintf("Confidence %.0f%% · proposal %d of %d pending · nothing changes until you approve", p.Confidence*100, idx+1, total)
+	description := fmt.Sprintf("Proposed change to **%s**", discordfmt.Truncate(p.EntityName, 200))
 	embed := discord.Embed{
 		Title:       title,
-		Description: fmt.Sprintf("Proposed change to **%s**", p.EntityName),
+		Description: description,
 		Color:       color,
-		Fields:      fields,
+		Fields:      fitEmbedFields(len([]rune(title))+len([]rune(description))+len([]rune(footer)), fields),
 		Footer:      &discord.EmbedFooter{Text: footer},
 	}
 
@@ -188,13 +194,6 @@ func entityKindLabel(k db.WorldEntityKind) string {
 	default:
 		return string(k)
 	}
-}
-
-func truncate(s string, n int) string {
-	if len([]rune(s)) <= n {
-		return s
-	}
-	return string([]rune(s)[:n-1]) + "…"
 }
 
 // onComponentInteraction dispatches button clicks. Runs on its own goroutine for

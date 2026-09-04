@@ -204,7 +204,7 @@ func (g *Gateway) sessionList(ctx context.Context, ic *ictx, guildID string) err
 		b.WriteString("\nMissing `/review-session` proposals for one? Re-derive them from its saved transcript with " +
 			"`/session requeue session_id:<id> proposals_only:true` (no re-transcription).")
 	}
-	return ic.reply(b.String(), true)
+	return ic.replyLong(b.String(), true)
 }
 
 // sessionRequeue re-enqueues work for an existing session, letting anyone

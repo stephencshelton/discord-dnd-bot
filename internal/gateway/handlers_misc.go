@@ -175,7 +175,7 @@ func (g *Gateway) handleDMServer(ctx context.Context, ic *ictx) error {
 			fmt.Fprintf(&b, "• %s\n", g.guildName(gid))
 		}
 		b.WriteString("\nRun `/dm-server server:<name>` to choose or switch.")
-		return ic.reply(b.String(), true)
+		return ic.replyLong(b.String(), true)
 	}
 
 	// Setting a selection: validate it's a server the user actually shares.

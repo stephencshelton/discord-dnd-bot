@@ -16,6 +16,20 @@ const (
 	MessageLimit = 2000
 	// EmbedDescriptionLimit is the maximum characters in an embed description.
 	EmbedDescriptionLimit = 4096
+	// EmbedFieldValueLimit is the maximum characters in an embed FIELD value.
+	// Much smaller than EmbedDescriptionLimit — mixing the two up is an easy way
+	// to get a 50035 rejection, since a field value that would be a fine
+	// description is four times over the field cap.
+	EmbedFieldValueLimit = 1024
+	// EmbedFieldNameLimit is the maximum characters in an embed field name.
+	EmbedFieldNameLimit = 256
+	// EmbedTotalLimit is the maximum COMBINED characters across an embed's title,
+	// description, footer, author and all field names/values. Individually-valid
+	// fields can still breach this in aggregate, so a multi-result embed must be
+	// budgeted as a whole, not just per field.
+	EmbedTotalLimit = 6000
+	// MaxEmbedFields is the maximum number of fields in one embed.
+	MaxEmbedFields = 25
 
 	// ChunkLimit is the message size used when splitting long content across
 	// several messages. It sits below MessageLimit to leave room for the newline

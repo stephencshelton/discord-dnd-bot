@@ -104,6 +104,61 @@ func (ic *ictx) reply(content string, ephemeral bool) error {
 	return ic.e.CreateMessage(discord.MessageCreate{Content: content, Flags: ephemeralFlags(ephemeral)})
 }
 
+// replyLong sends an immediate text response that may exceed Discord's 2000-char
+// message limit, continuing into follow-up messages rather than failing.
+//
+// Use this for ANY reply whose length is driven by data (listings, search
+// results): passing an over-length body to reply makes Discord reject the whole
+// interaction with `50035 ... BASE_TYPE_MAX_LENGTH`, so the user sees "the
+// application did not respond" and gets nothing at all. That's how `/world list`
+// broke once enough entities accumulated — and because approving a proposal
+// APPENDS to an entity's description, these listings grow on their own over time.
+//
+// Output is bounded: at most maxFollowupMessages messages, with the last marked
+// as trimmed.
+func (ic *ictx) replyLong(content string, ephemeral bool) error {
+	chunks := discordfmt.ChunkMarkdown(content, discordfmt.ChunkLimit)
+	switch len(chunks) {
+	case 0:
+		return ic.reply("_(no content)_", ephemeral)
+	case 1:
+		return ic.reply(chunks[0], ephemeral)
+	}
+	chunks = boundChunks(chunks)
+	if err := ic.reply(chunks[0], ephemeral); err != nil {
+		return err
+	}
+	return ic.sendFollowups(chunks[1:], ephemeral)
+}
+
+// sendFollowups posts additional messages for a reply that didn't fit in one.
+// The ephemeral flag must be repeated on each follow-up, otherwise the overflow
+// of an ephemeral reply would be posted publicly in the channel.
+func (ic *ictx) sendFollowups(chunks []string, ephemeral bool) error {
+	for _, chunk := range chunks {
+		if _, err := ic.e.Client().Rest.CreateFollowupMessage(
+			ic.e.ApplicationID(), ic.e.Token(),
+			discord.MessageCreate{Content: chunk, Flags: ephemeralFlags(ephemeral)},
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// boundChunks caps how many messages one reply may occupy and marks the last one
+// so a truncated listing is obviously incomplete rather than silently short.
+func boundChunks(chunks []string) []string {
+	if len(chunks) <= maxFollowupMessages {
+		return chunks
+	}
+	chunks = chunks[:maxFollowupMessages]
+	last := len(chunks) - 1
+	chunks[last] = discordfmt.Truncate(chunks[last], discordfmt.ChunkLimit-40) +
+		"\n\n_…trimmed — narrow it down with the `kind` option or `/search`._"
+	return chunks
+}
+
 // replyEmbed sends an immediate embed response.
 func (ic *ictx) replyEmbed(embed discord.Embed) error {
 	return ic.e.CreateMessage(discord.MessageCreate{Embeds: []discord.Embed{embed}})
@@ -151,22 +206,12 @@ func (ic *ictx) followupLong(content string) error {
 	case 1:
 		return ic.followup(chunks[0])
 	}
-	if len(chunks) > maxFollowupMessages {
-		chunks = chunks[:maxFollowupMessages]
-		chunks[len(chunks)-1] = discordfmt.Truncate(chunks[len(chunks)-1], discordfmt.ChunkLimit-2) + " _(trimmed)_"
-	}
+	chunks = boundChunks(chunks)
 	if err := ic.followup(chunks[0]); err != nil {
 		return err
 	}
-	for _, chunk := range chunks[1:] {
-		if _, err := ic.e.Client().Rest.CreateFollowupMessage(
-			ic.e.ApplicationID(), ic.e.Token(),
-			discord.MessageCreate{Content: chunk},
-		); err != nil {
-			return err
-		}
-	}
-	return nil
+	// These paths ack non-ephemerally, so the overflow is public to match.
+	return ic.sendFollowups(chunks[1:], false)
 }
 
 // maxFollowupMessages bounds how many messages one command reply may occupy, so

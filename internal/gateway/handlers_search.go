@@ -35,14 +35,18 @@ func (g *Gateway) handleSearch(ctx context.Context, ic *ictx) error {
 	fields := make([]discord.EmbedField, 0, len(results))
 	for _, result := range results {
 		fields = append(fields, discord.EmbedField{
-			Name:   fmt.Sprintf("Session · <t:%d:d>", result.StartedAt.Unix()),
-			Value:  truncateForEmbed(result.Snippet),
+			Name: fmt.Sprintf("Session · <t:%d:d>", result.StartedAt.Unix()),
+			// Field values cap at 1024 (not the 4096 an embed DESCRIPTION allows),
+			// and the whole embed caps at 6000 — so the snippets are budgeted
+			// together by fitEmbedFields rather than trimmed independently.
+			Value:  result.Snippet,
 			Inline: boolPtr(false),
 		})
 	}
+	const title = "Campaign memory"
 	return ic.replyEmbed(discord.Embed{
-		Title:  "Campaign memory",
+		Title:  title,
 		Color:  0x0ea5e9,
-		Fields: fields,
+		Fields: fitEmbedFields(len(title), fields),
 	})
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
+	"github.com/stephencshelton/discord-dnd-bot/internal/discordfmt"
 	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
 )
 
@@ -18,6 +19,25 @@ func (g *Gateway) activeCampaign(ctx context.Context, guildID string) (*db.Campa
 		return nil, errors.New("no active campaign — create one with `/campaign create` then `/campaign activate`")
 	}
 	return c, err
+}
+
+// listLineLimit caps a single entry's line in a listing. Listings are indexes:
+// one entry must not be able to crowd out the rest (or blow the message limit)
+// just because its description is long. Full detail lives on the entry itself.
+const listLineLimit = 240
+
+// listLine bounds one listing row, cutting on a word boundary so it reads as
+// abbreviated rather than corrupted.
+func listLine(s string) string {
+	return discordfmt.Truncate(s, listLineLimit)
+}
+
+// plural picks the singular or plural suffix for n.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func (g *Gateway) handleCampaign(ctx context.Context, ic *ictx) error {
@@ -66,9 +86,9 @@ func (g *Gateway) handleCampaign(ctx context.Context, ic *ictx) error {
 			if c.Archived {
 				line += " — archived"
 			}
-			b.WriteString(line + "\n")
+			b.WriteString(listLine(line) + "\n")
 		}
-		return ic.reply(b.String(), true)
+		return ic.replyLong(b.String(), true)
 
 	case "activate":
 		name := ic.optString("name")
@@ -205,9 +225,10 @@ func (g *Gateway) handleCharacter(ctx context.Context, ic *ictx) error {
 		var b strings.Builder
 		fmt.Fprintf(&b, "**Characters in %s:**\n", camp.Name)
 		for _, pc := range pcs {
-			fmt.Fprintf(&b, "• **%s** — Lv %d %s %s (<@%s>)\n", pc.Name, pc.Level, pc.Race, pc.Class, pc.DiscordUserID)
+			fmt.Fprintf(&b, "%s\n", listLine(fmt.Sprintf("• **%s** — Lv %d %s %s (<@%s>)",
+				pc.Name, pc.Level, pc.Race, pc.Class, pc.DiscordUserID)))
 		}
-		return ic.reply(b.String(), true)
+		return ic.replyLong(b.String(), true)
 
 	case "delete":
 		name := ic.optString("name")
@@ -275,7 +296,7 @@ func (g *Gateway) handleWorld(ctx context.Context, ic *ictx) error {
 			return ic.reply("No world entries yet. Add one with `/world add`.", true)
 		}
 		var b strings.Builder
-		fmt.Fprintf(&b, "**World of %s:**\n", camp.Name)
+		fmt.Fprintf(&b, "**World of %s** — %d entr%s:\n", camp.Name, len(entries), plural(len(entries), "y", "ies"))
 		for _, e := range entries {
 			line := fmt.Sprintf("• _[%s]_ **%s**", e.Kind, e.Name)
 			if e.Description != "" {
@@ -284,9 +305,13 @@ func (g *Gateway) handleWorld(ctx context.Context, ic *ictx) error {
 			if summary := worldMetaSummary(e); summary != "" {
 				line += " _(" + summary + ")_"
 			}
-			b.WriteString(line + "\n")
+			// A listing is an INDEX, so each entry gets a bounded one-liner. Entity
+			// descriptions grow every time a /review-session proposal is approved
+			// (approval appends), so without this cap one long-lived NPC can crowd
+			// out every other entry — or push the whole message past Discord's limit.
+			b.WriteString(listLine(line) + "\n")
 		}
-		return ic.reply(b.String(), true)
+		return ic.replyLong(b.String(), true)
 
 	case "delete":
 		kind := db.WorldEntityKind(ic.optString("kind"))
