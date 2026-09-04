@@ -44,7 +44,7 @@ func (w *Worker) chatComplete(ctx context.Context, task, model string, msgs []li
 
 	var full strings.Builder
 	for round := 0; ; round++ {
-		res, err := w.ai.ChatWithResult(ctx, model, convo, maxTokens)
+		res, err := w.ai.Chat(ctx, model, convo, maxTokens)
 		if err != nil {
 			return "", err
 		}

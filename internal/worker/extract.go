@@ -181,15 +181,20 @@ func (w *Worker) notifyExtractionFailed(ctx context.Context, p queue.ExtractStat
 // returns only those. It FAILS OPEN — any error (AI call or parse) returns the
 // input unchanged, since it's better to surface a borderline proposal for the DM
 // than to silently drop everything on a critic hiccup.
+//
+// Note the failure mode this shares with extraction: the critic replies in JSON,
+// so a reply cut off at the token limit doesn't error — it fails open and every
+// candidate survives, silently disabling the filtering. chatComplete repairs the
+// truncation instead, and the budget is configurable.
 func (w *Worker) criticFilter(ctx context.Context, proposals []db.StateProposal) []db.StateProposal {
 	candidates := make([]string, len(proposals))
 	for i, p := range proposals {
 		candidates[i] = extract.CriticCandidate(p)
 	}
-	raw, err := w.ai.Chat(ctx, w.cfg.LiteLLM.Recap(), []litellm.Message{
+	raw, err := w.chatComplete(ctx, "extract_critic", w.cfg.LiteLLM.Recap(), []litellm.Message{
 		{Role: "system", Content: prompts.CriticSystem},
 		{Role: "user", Content: prompts.CriticUser(candidates)},
-	}, 500)
+	}, w.cfg.LiteLLM.CriticTokens())
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("extract_critic", "error").Inc()
 		w.log.Warn("state extraction critic pass failed; keeping confidence-filtered set", "err", err)

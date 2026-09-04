@@ -9,6 +9,7 @@ import (
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
 
+	"github.com/stephencshelton/discord-dnd-bot/internal/discordfmt"
 	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
@@ -130,6 +131,47 @@ func (ic *ictx) followup(content string) error {
 	)
 	return err
 }
+
+// followupLong edits the deferred response with text that may exceed Discord's
+// 2000-char message limit, continuing into additional follow-up messages instead
+// of throwing the remainder away.
+//
+// Previously these replies were hard-cut at 2000 runes mid-word, which reads as a
+// failed generation rather than a trimmed one — the same symptom as a model
+// running out of tokens. Splitting on Markdown line boundaries also keeps each
+// piece rendering correctly and lets Discord soft-wrap it.
+//
+// A pathological reply is still bounded: at most maxFollowupMessages parts are
+// sent and the last one is marked as trimmed.
+func (ic *ictx) followupLong(content string) error {
+	chunks := discordfmt.ChunkMarkdown(content, discordfmt.ChunkLimit)
+	switch len(chunks) {
+	case 0:
+		return ic.followup("_(no content)_")
+	case 1:
+		return ic.followup(chunks[0])
+	}
+	if len(chunks) > maxFollowupMessages {
+		chunks = chunks[:maxFollowupMessages]
+		chunks[len(chunks)-1] = discordfmt.Truncate(chunks[len(chunks)-1], discordfmt.ChunkLimit-2) + " _(trimmed)_"
+	}
+	if err := ic.followup(chunks[0]); err != nil {
+		return err
+	}
+	for _, chunk := range chunks[1:] {
+		if _, err := ic.e.Client().Rest.CreateFollowupMessage(
+			ic.e.ApplicationID(), ic.e.Token(),
+			discord.MessageCreate{Content: chunk},
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// maxFollowupMessages bounds how many messages one command reply may occupy, so
+// a runaway generation can't flood a channel.
+const maxFollowupMessages = 4
 
 // followupEmbed edits the deferred response with an embed.
 func (ic *ictx) followupEmbed(embed discord.Embed) error {

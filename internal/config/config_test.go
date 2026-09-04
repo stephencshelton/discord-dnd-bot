@@ -117,33 +117,93 @@ func TestLiteLLMModelResolvers(t *testing.T) {
 // would be sent verbatim and let the provider pick a tiny default, which is how
 // session notes ended up cut off mid-sentence and extraction JSON unparseable.
 func TestLiteLLMTokenBudgets(t *testing.T) {
+	// Every resolver must fall back to a positive default when unset or negative.
 	var zero LiteLLMConfig
-	if got := zero.NotesTokens(); got != defaultNotesMaxTokens {
-		t.Errorf("NotesTokens() with unset config = %d, want %d", got, defaultNotesMaxTokens)
+	neg := LiteLLMConfig{
+		NotesMaxTokens:  -1,
+		StateMaxTokens:  -1,
+		CriticMaxTokens: -1,
+		LoreMaxTokens:   -1,
+		AskMaxTokens:    -1,
+		RecapMaxTokens:  -1,
+		PrepMaxTokens:   -1,
+		ChatMaxTokens:   -1,
 	}
-	if got := zero.StateTokens(); got != defaultStateMaxTokens {
-		t.Errorf("StateTokens() with unset config = %d, want %d", got, defaultStateMaxTokens)
+	defaults := map[string]struct {
+		got, want int
+	}{
+		"Notes":  {zero.NotesTokens(), defaultNotesMaxTokens},
+		"State":  {zero.StateTokens(), defaultStateMaxTokens},
+		"Critic": {zero.CriticTokens(), defaultCriticMaxTokens},
+		"Lore":   {zero.LoreTokens(), defaultLoreMaxTokens},
+		"Ask":    {zero.AskTokens(), defaultAskMaxTokens},
+		"Recap":  {zero.RecapTokens(), defaultRecapMaxTokens},
+		"Prep":   {zero.PrepTokens(), defaultPrepMaxTokens},
+		"Chat":   {zero.ChatTokens(), defaultChatMaxTokens},
+	}
+	for name, tc := range defaults {
+		if tc.got != tc.want {
+			t.Errorf("%sTokens() unset = %d, want default %d", name, tc.got, tc.want)
+		}
+		if tc.got <= 0 {
+			t.Errorf("%sTokens() default must be positive, got %d", name, tc.got)
+		}
+	}
+	negatives := map[string]struct {
+		got, want int
+	}{
+		"Notes":  {neg.NotesTokens(), defaultNotesMaxTokens},
+		"State":  {neg.StateTokens(), defaultStateMaxTokens},
+		"Critic": {neg.CriticTokens(), defaultCriticMaxTokens},
+		"Lore":   {neg.LoreTokens(), defaultLoreMaxTokens},
+		"Ask":    {neg.AskTokens(), defaultAskMaxTokens},
+		"Recap":  {neg.RecapTokens(), defaultRecapMaxTokens},
+		"Prep":   {neg.PrepTokens(), defaultPrepMaxTokens},
+		"Chat":   {neg.ChatTokens(), defaultChatMaxTokens},
+	}
+	for name, tc := range negatives {
+		if tc.got != tc.want {
+			t.Errorf("%sTokens() negative = %d, want default %d", name, tc.got, tc.want)
+		}
 	}
 
-	neg := LiteLLMConfig{NotesMaxTokens: -1, StateMaxTokens: 0}
-	if got := neg.NotesTokens(); got != defaultNotesMaxTokens {
-		t.Errorf("NotesTokens() with negative config = %d, want %d", got, defaultNotesMaxTokens)
+	// A configured positive value must be honoured verbatim.
+	set := LiteLLMConfig{
+		NotesMaxTokens:  1,
+		StateMaxTokens:  2,
+		CriticMaxTokens: 3,
+		LoreMaxTokens:   4,
+		AskMaxTokens:    5,
+		RecapMaxTokens:  6,
+		PrepMaxTokens:   7,
+		ChatMaxTokens:   8,
 	}
-	if got := neg.StateTokens(); got != defaultStateMaxTokens {
-		t.Errorf("StateTokens() with zero config = %d, want %d", got, defaultStateMaxTokens)
+	overrides := map[string]struct {
+		got, want int
+	}{
+		"Notes":  {set.NotesTokens(), 1},
+		"State":  {set.StateTokens(), 2},
+		"Critic": {set.CriticTokens(), 3},
+		"Lore":   {set.LoreTokens(), 4},
+		"Ask":    {set.AskTokens(), 5},
+		"Recap":  {set.RecapTokens(), 6},
+		"Prep":   {set.PrepTokens(), 7},
+		"Chat":   {set.ChatTokens(), 8},
 	}
-
-	set := LiteLLMConfig{NotesMaxTokens: 1234, StateMaxTokens: 4321}
-	if got := set.NotesTokens(); got != 1234 {
-		t.Errorf("NotesTokens() = %d, want 1234", got)
-	}
-	if got := set.StateTokens(); got != 4321 {
-		t.Errorf("StateTokens() = %d, want 4321", got)
+	for name, tc := range overrides {
+		if tc.got != tc.want {
+			t.Errorf("%sTokens() = %d, want configured %d", name, tc.got, tc.want)
+		}
 	}
 
 	// The extraction budget must exceed the notes budget: extraction re-states
 	// every proposal as JSON with evidence quotes, so it is the larger output.
 	if defaultStateMaxTokens <= defaultNotesMaxTokens {
 		t.Errorf("state budget (%d) should exceed notes budget (%d)", defaultStateMaxTokens, defaultNotesMaxTokens)
+	}
+	// /prep renders five sections into an embed, so it needs more room than the
+	// single-answer interactive commands.
+	if defaultPrepMaxTokens <= defaultChatMaxTokens {
+		t.Errorf("prep budget (%d) should exceed the plain chat budget (%d)", defaultPrepMaxTokens, defaultChatMaxTokens)
 	}
 }

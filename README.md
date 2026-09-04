@@ -119,8 +119,14 @@ Configuration is loaded from environment variables. The same configuration is us
 | `LITELLM_EMBED_DIM` | No | `1536` | Embedding vector dimensionality; must match the embed model (sizes the pgvector column) |
 | `LITELLM_REQUEST_TIMEOUT` | No | `120s` | AI request timeout |
 | `LITELLM_UPLOAD_TIMEOUT` | No | `300s` | Timeout for multipart audio uploads |
-| `LITELLM_NOTES_MAX_TOKENS` | No | `6000` | Output token budget for session notes. A model that runs out stops **mid-sentence with no error**, so this is a completeness knob — long sessions need room for every section |
-| `LITELLM_STATE_MAX_TOKENS` | No | `12000` | Output token budget for `/review-session` proposal extraction. The reply is JSON, so a truncated one is unparseable rather than merely short |
+| `LITELLM_NOTES_MAX_TOKENS` | No | `6000` | Output token budget for session notes. A model that runs out stops **mid-sentence with no error**, so these are completeness knobs — long sessions need room for every section |
+| `LITELLM_STATE_MAX_TOKENS` | No | `12000` | Budget for `/review-session` proposal extraction. The reply is JSON, so a truncated one is unparseable rather than merely short |
+| `LITELLM_CRITIC_MAX_TOKENS` | No | `1000` | Budget for the extraction critic pass. Truncation here fails open (keeps everything), silently disabling the filtering |
+| `LITELLM_LORE_MAX_TOKENS` | No | `1200` | Budget for `/lore` (message surface; overflow continues into follow-up messages) |
+| `LITELLM_ASK_MAX_TOKENS` | No | `1200` | Budget for `/ask` (message surface; overflow continues into follow-up messages) |
+| `LITELLM_RECAP_MAX_TOKENS` | No | `1200` | Budget for `/recap` (embed description, 4096 chars) |
+| `LITELLM_PREP_MAX_TOKENS` | No | `2000` | Budget for `/prep` (embed description; five sections, the longest interactive reply) |
+| `LITELLM_CHAT_MAX_TOKENS` | No | `800` | Budget for the conversational @mention / DM reply |
 | `AUDIO_SILENCE_TRIM` | No | `true` | Drop near-silent frames before upload to cut billed minutes |
 | `AUDIO_SILENCE_RMS_THRESHOLD` | No | `350` | Per-frame RMS (0–32767) treated as silence |
 | `AUDIO_TRANSCRIBE_SEGMENT_MINUTES` | No | `3` | Split each speaker's track into ≤ this many minutes per WAV segment (downmixed to mono) when transcribing, bounding worker and STT memory (`0` = whole track in one request) |
@@ -133,6 +139,24 @@ Each chat endpoint (notes, recap, lore, ask) can point at a different LiteLLM
 route, so operators can pick the cheapest capable model per task purely through
 `values.yaml`/env — no code changes. Empty per-task values fall back to
 `LITELLM_CHAT_MODEL`.
+
+Every task also has its own `LITELLM_*_MAX_TOKENS` output budget, defaulting to a
+value sized for the Discord surface the reply lands on (a 2000-character message
+or a 4096-character embed). These are **completeness** knobs, not cost knobs:
+hitting the token limit is not an error — the provider returns success with the
+text chopped mid-sentence — so an undersized budget reads as a broken bot. A
+non-positive value falls back to the default rather than being sent verbatim.
+Defence in depth around this:
+
+- background tasks (notes, extraction, critic) **auto-continue** a truncated
+  reply and stitch the pieces together;
+- extraction additionally salvages every complete proposal from JSON that still
+  ends mid-structure;
+- interactive replies mark the cut so it reads as trimmed rather than crashed,
+  and long `/lore` / `/ask` answers **continue into follow-up messages** instead
+  of being discarded at 2000 characters;
+- truncations are counted in `discord_dnd_bot_ai_responses_truncated_total`
+  (labelled by task), so a too-small budget is visible in monitoring.
 
 The database schema is embedded in the binaries and applied idempotently at startup by the gateway and worker.
 

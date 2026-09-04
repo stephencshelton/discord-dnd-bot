@@ -66,6 +66,24 @@ data:
   {{- with .Values.config.litellm.stateMaxTokens }}
   LITELLM_STATE_MAX_TOKENS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.config.litellm.criticMaxTokens }}
+  LITELLM_CRITIC_MAX_TOKENS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.litellm.loreMaxTokens }}
+  LITELLM_LORE_MAX_TOKENS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.litellm.askMaxTokens }}
+  LITELLM_ASK_MAX_TOKENS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.litellm.recapMaxTokens }}
+  LITELLM_RECAP_MAX_TOKENS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.litellm.prepMaxTokens }}
+  LITELLM_PREP_MAX_TOKENS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.litellm.chatMaxTokens }}
+  LITELLM_CHAT_MAX_TOKENS: {{ . | quote }}
+  {{- end }}
 
   AUDIO_SILENCE_TRIM: {{ .Values.config.audio.silenceTrim | quote }}
   AUDIO_SILENCE_RMS_THRESHOLD: {{ .Values.config.audio.silenceRMSThreshold | quote }}

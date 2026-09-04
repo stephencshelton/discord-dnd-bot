@@ -8,6 +8,7 @@ import (
 	"github.com/disgoorg/disgo/discord"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
+	"github.com/stephencshelton/discord-dnd-bot/internal/discordfmt"
 	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 	"github.com/stephencshelton/discord-dnd-bot/internal/prompts"
@@ -33,13 +34,11 @@ func (g *Gateway) handleLore(ctx context.Context, ic *ictx) error {
 		{Role: "system", Content: prompts.LoreSystem},
 		{Role: "user", Content: prompts.LoreUser(camp.Name, camp.System, camp.Premise, prompt)},
 	}
-	answer, err := g.ai.Chat(ctx, g.cfg.LiteLLM.Lore(), msgs, 700)
+	answer, truncated, err := g.chat(ctx, "lore", g.cfg.LiteLLM.Lore(), msgs, g.cfg.LiteLLM.LoreTokens())
 	if err != nil {
-		metrics.AIRequests.WithLabelValues("chat", "error").Inc()
 		return err
 	}
-	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
-	return ic.followup(truncateForDiscord(answer))
+	return ic.followupLong(markTruncated(answer, truncated))
 }
 
 // handleRecap generates a "previously on" from recent session notes.
@@ -66,15 +65,13 @@ func (g *Gateway) handleRecap(ctx context.Context, ic *ictx) error {
 		{Role: "system", Content: prompts.LoreSystem},
 		{Role: "user", Content: prompts.RecapUser(camp.Name, notes)},
 	}
-	recap, err := g.ai.Chat(ctx, g.cfg.LiteLLM.Recap(), msgs, 400)
+	recap, truncated, err := g.chat(ctx, "recap", g.cfg.LiteLLM.Recap(), msgs, g.cfg.LiteLLM.RecapTokens())
 	if err != nil {
-		metrics.AIRequests.WithLabelValues("chat", "error").Inc()
 		return err
 	}
-	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
 	e := discord.Embed{
 		Title:       "Previously, on " + camp.Name + "...",
-		Description: truncateForEmbed(recap),
+		Description: truncateForEmbed(markTruncated(recap, truncated)),
 		Color:       0x8b5cf6,
 	}
 	return ic.followupEmbed(e)
@@ -137,13 +134,11 @@ func (g *Gateway) handleAsk(ctx context.Context, ic *ictx) error {
 		{Role: "system", Content: prompts.AskSystem},
 		{Role: "user", Content: prompts.AskUser(camp.Name, question, passages)},
 	}
-	answer, err := g.ai.Chat(ctx, g.cfg.LiteLLM.Ask(), msgs, 600)
+	answer, truncated, err := g.chat(ctx, "ask", g.cfg.LiteLLM.Ask(), msgs, g.cfg.LiteLLM.AskTokens())
 	if err != nil {
-		metrics.AIRequests.WithLabelValues("chat", "error").Inc()
 		return err
 	}
-	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
-	return ic.followup(truncateForDiscord(answer))
+	return ic.followupLong(markTruncated(answer, truncated))
 }
 
 // handlePrep assembles a concrete, actionable pre-session briefing for the
@@ -220,16 +215,14 @@ func (g *Gateway) handlePrep(ctx context.Context, ic *ictx) error {
 		{Role: "system", Content: prompts.PrepSystem},
 		{Role: "user", Content: prompts.PrepUser(camp.Name, camp.System, lastDate, lastNotes, activeQuests, openHooks, keyEntities, characters)},
 	}
-	briefing, err := g.ai.Chat(ctx, g.cfg.LiteLLM.Recap(), msgs, 900)
+	briefing, truncated, err := g.chat(ctx, "prep", g.cfg.LiteLLM.Recap(), msgs, g.cfg.LiteLLM.PrepTokens())
 	if err != nil {
-		metrics.AIRequests.WithLabelValues("chat", "error").Inc()
 		return err
 	}
-	metrics.AIRequests.WithLabelValues("chat", "ok").Inc()
 
 	e := discord.Embed{
 		Title:       "🗺️ Session prep — " + camp.Name,
-		Description: truncateForEmbed(briefing),
+		Description: truncateForEmbed(markTruncated(briefing, truncated)),
 		Color:       0x0ea5e9,
 	}
 	return ic.followupEmbed(e)
@@ -352,22 +345,26 @@ func (g *Gateway) handleArt(ctx context.Context, ic *ictx) error {
 	return ic.followup("🎨 Painting your scene… I'll post it in this channel shortly.")
 }
 
-// truncateForDiscord trims content to Discord's 2000-char message limit.
-func truncateForDiscord(s string) string {
-	const max = 2000
-	r := []rune(s)
-	if len(r) <= max {
+// markTruncated appends a short note when the model's reply was cut off at the
+// token limit, so an incomplete answer reads as "there was more" instead of
+// looking like the bot crashed mid-thought. Raising the relevant
+// LITELLM_*_MAX_TOKENS is the fix if this shows up often.
+func markTruncated(s string, truncated bool) string {
+	if !truncated {
 		return s
 	}
-	return string(r[:max-1]) + "\u2026"
+	return strings.TrimRight(s, " \t\n") + "\n\n_…(cut off — the reply hit its length limit)_"
 }
 
-// truncateForEmbed trims content to Discord's 4096-char embed-description limit.
+// truncateForDiscord trims content to Discord's message limit, breaking on a
+// word boundary. Prefer ictx.followupLong for AI output: it continues into
+// follow-up messages instead of discarding the remainder.
+func truncateForDiscord(s string) string {
+	return discordfmt.Truncate(s, discordfmt.MessageLimit)
+}
+
+// truncateForEmbed trims content to Discord's embed-description limit, breaking
+// on a word boundary.
 func truncateForEmbed(s string) string {
-	const max = 4096
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max-1]) + "\u2026"
+	return discordfmt.Truncate(s, discordfmt.EmbedDescriptionLimit)
 }

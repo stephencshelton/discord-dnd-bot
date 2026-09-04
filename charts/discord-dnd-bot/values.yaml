@@ -167,18 +167,37 @@ config:
     requestTimeout: "120s"
     # Larger timeout for multipart audio uploads to the transcription model.
     uploadTimeout: "300s"
-    # Output token budgets for the two long-output tasks. These are COMPLETENESS
-    # knobs, not cost knobs: a model that runs out of output tokens stops
-    # mid-sentence with no error at all.
-    #   notesMaxTokens — session notes. Too small and the writeup visibly cuts
-    #     off partway through (a 3-4 hour session needs room for every section).
-    #   stateMaxTokens — /review-session proposal extraction. Must be generous
-    #     because the reply is JSON: a truncated reply isn't just short, it's
-    #     unparseable, which discards EVERY proposal from the session.
-    # The worker also auto-continues a truncated reply and salvages the complete
-    # proposals from truncated JSON, so these mainly avoid extra round trips.
+    # Per-task output token budgets. These are COMPLETENESS knobs, not cost
+    # knobs: a model that runs out of output tokens stops mid-sentence and
+    # returns success with no error, so a reply that's too small looks like a
+    # broken generation rather than a short one.
+    #
+    # Each default is sized to the Discord surface the reply is rendered into —
+    # a 2000-char message or a 4096-char embed — with headroom to finish the
+    # thought. Background (worker) tasks additionally auto-continue a truncated
+    # reply, so for those these mainly avoid extra round trips.
+    #
+    #   notesMaxTokens  session notes. A 3-4 hour session needs room for every
+    #                   section; too small and the writeup visibly cuts off.
+    #   stateMaxTokens  /review-session proposal extraction. Must be generous:
+    #                   the reply is JSON, so truncation makes it UNPARSEABLE and
+    #                   discards every proposal from the session.
+    #   criticMaxTokens the extraction critic pass (a short JSON index list).
+    #                   Truncation here fails open, silently keeping everything.
+    #   loreMaxTokens   /lore   — message surface (overflow splits across msgs).
+    #   askMaxTokens    /ask    — message surface (overflow splits across msgs).
+    #   recapMaxTokens  /recap  — embed description.
+    #   prepMaxTokens   /prep   — embed description; five sections, the longest
+    #                   of the interactive replies.
+    #   chatMaxTokens   conversational @mention / DM reply — message surface.
     notesMaxTokens: 6000
     stateMaxTokens: 12000
+    criticMaxTokens: 1000
+    loreMaxTokens: 1200
+    askMaxTokens: 1200
+    recapMaxTokens: 1200
+    prepMaxTokens: 2000
+    chatMaxTokens: 800
 
   # Recording / transcription tuning.
   audio:

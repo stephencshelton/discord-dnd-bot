@@ -102,17 +102,17 @@ func (g *Gateway) handleMessageCreate(e *events.MessageCreate) {
 	}
 
 	start := time.Now()
-	answer, err := g.ai.Chat(ctx, g.cfg.LiteLLM.ChatModel, []litellm.Message{
+	answer, truncated, err := g.chat(ctx, "mention", g.cfg.LiteLLM.ChatModel, []litellm.Message{
 		{Role: "system", Content: sys},
 		{Role: "user", Content: userMsg},
-	}, 500)
+	}, g.cfg.LiteLLM.ChatTokens())
 	metrics.CommandDuration.WithLabelValues("chat").Observe(time.Since(start).Seconds())
 	if err != nil {
 		g.log.Error("chat failed", "err", err, "user", authorID, "channel", channelID.String())
 		g.sendReply(e, "Sorry, I couldn't answer that right now.")
 		return
 	}
-	g.sendReply(e, truncateForDiscord(answer))
+	g.sendReply(e, truncateForDiscord(markTruncated(answer, truncated)))
 }
 
 // sendReply posts a reply referencing the triggering message, falling back to a

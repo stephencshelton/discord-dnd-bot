@@ -14,6 +14,7 @@ import (
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/audio"
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
+	"github.com/stephencshelton/discord-dnd-bot/internal/discordfmt"
 	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 	"github.com/stephencshelton/discord-dnd-bot/internal/prompts"
@@ -360,7 +361,7 @@ func (w *Worker) postNotes(channelID, campaign, notes string) {
 	if err := w.sendMessage(channelID, discord.MessageCreate{Content: header}); err != nil {
 		w.log.Error("post notes header", "err", err)
 	}
-	for _, chunk := range chunkMarkdown(notes, discordMessageLimit) {
+	for _, chunk := range chunkMarkdown(notes, discordfmt.ChunkLimit) {
 		if err := w.sendMessage(channelID, discord.MessageCreate{Content: chunk}); err != nil {
 			w.log.Error("post notes chunk", "err", err)
 		}
@@ -392,69 +393,9 @@ func (w *Worker) notify(_ string, channelID, msg string) {
 	}
 }
 
-// discordMessageLimit is the largest message body we post. Discord's hard limit
-// is 2000 characters; the margin absorbs the newline joins.
-const discordMessageLimit = 1900
+// chunkMarkdown and chunkString delegate to the shared discordfmt helpers, which
+// own Discord's surface limits and the "never split mid-line/mid-word" rules for
+// both the gateway and the worker.
+func chunkMarkdown(s string, size int) []string { return discordfmt.ChunkMarkdown(s, size) }
 
-// chunkMarkdown splits Markdown into message-sized pieces WITHOUT cutting a line
-// in half, so each posted chunk still renders as valid Markdown (a heading or
-// bullet split mid-line loses its formatting and reads as garbage). Lines are
-// packed greedily; a single line longer than size is hard-split as a last resort.
-func chunkMarkdown(s string, size int) []string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil
-	}
-	if size <= 0 {
-		return []string{s}
-	}
-
-	var out []string
-	var cur strings.Builder
-	curRunes := 0
-	flush := func() {
-		if chunk := strings.TrimRight(cur.String(), "\n"); strings.TrimSpace(chunk) != "" {
-			out = append(out, chunk)
-		}
-		cur.Reset()
-		curRunes = 0
-	}
-	for _, line := range strings.Split(s, "\n") {
-		n := len([]rune(line))
-		// A pathologically long single line (no wrap opportunity) is hard-split.
-		if n > size {
-			flush()
-			out = append(out, chunkString(line, size)...)
-			continue
-		}
-		// +1 for the newline that will join this line to the current chunk.
-		if curRunes > 0 && curRunes+1+n > size {
-			flush()
-		}
-		if curRunes > 0 {
-			cur.WriteByte('\n')
-			curRunes++
-		}
-		cur.WriteString(line)
-		curRunes += n
-	}
-	flush()
-	return out
-}
-
-// chunkString splits s into pieces no longer than size runes.
-func chunkString(s string, size int) []string {
-	if size <= 0 {
-		return []string{s}
-	}
-	var out []string
-	r := []rune(s)
-	for len(r) > size {
-		out = append(out, string(r[:size]))
-		r = r[size:]
-	}
-	if len(r) > 0 {
-		out = append(out, string(r))
-	}
-	return out
-}
+func chunkString(s string, size int) []string { return discordfmt.HardSplit(s, size) }

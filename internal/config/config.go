@@ -188,34 +188,71 @@ type LiteLLMConfig struct {
 	// chat completion.
 	UploadTimeout time.Duration `envconfig:"LITELLM_UPLOAD_TIMEOUT" default:"300s"`
 
-	// NotesMaxTokens caps session-note generation. This is a COMPLETENESS knob,
-	// not a cost knob: a long (3-4 hour) session's structured notes need room for
-	// every section, and a model that runs out of tokens stops mid-sentence with
-	// no error — the visible symptom is a recap that just cuts off. The worker
-	// also auto-continues a truncated reply, so raising this mainly saves the
-	// extra round trips.
+	// Per-task output token budgets.
+	//
+	// These are COMPLETENESS knobs, not cost knobs. A model that runs out of
+	// output tokens stops MID-SENTENCE and returns HTTP 200 with no error, so a
+	// budget that's too small silently produces a reply that looks like a broken
+	// generation. Each default is sized to the Discord surface the reply is
+	// rendered into (a 2000-char message or a 4096-char embed), with headroom so
+	// the model finishes its thought rather than being cut off.
+	//
+	// NotesMaxTokens caps session-note generation. A long (3-4 hour) session's
+	// structured notes need room for every section. The worker also auto-continues
+	// a truncated reply, so raising this mainly saves the extra round trips.
 	NotesMaxTokens int `envconfig:"LITELLM_NOTES_MAX_TOKENS" default:"6000"`
 	// StateMaxTokens caps the post-session state-extraction reply. It must be
 	// generous because the model emits JSON: a cut-off reply isn't merely short,
 	// it's unparseable, which historically threw away EVERY proposal from a long
 	// session (so /review-session had nothing to show).
 	StateMaxTokens int `envconfig:"LITELLM_STATE_MAX_TOKENS" default:"12000"`
+	// CriticMaxTokens caps the extraction critic pass (it emits a short JSON list
+	// of the candidate indices worth keeping). Truncation here fails open — every
+	// candidate survives — so a small budget silently disables the filtering
+	// rather than erroring.
+	CriticMaxTokens int `envconfig:"LITELLM_CRITIC_MAX_TOKENS" default:"1000"`
+	// LoreMaxTokens caps /lore. Rendered as a message; overflow is split across
+	// follow-up messages, so this bounds total length rather than one message.
+	LoreMaxTokens int `envconfig:"LITELLM_LORE_MAX_TOKENS" default:"1200"`
+	// AskMaxTokens caps grounded /ask answers. Rendered as a message (overflow
+	// split across follow-ups).
+	AskMaxTokens int `envconfig:"LITELLM_ASK_MAX_TOKENS" default:"1200"`
+	// RecapMaxTokens caps /recap. Rendered in an embed description (4096 chars).
+	RecapMaxTokens int `envconfig:"LITELLM_RECAP_MAX_TOKENS" default:"1200"`
+	// PrepMaxTokens caps /prep. Rendered in an embed description; a prep sheet has
+	// five sections and is the longest of the interactive replies.
+	PrepMaxTokens int `envconfig:"LITELLM_PREP_MAX_TOKENS" default:"2000"`
+	// ChatMaxTokens caps the conversational @mention / DM reply. Rendered as a
+	// message.
+	ChatMaxTokens int `envconfig:"LITELLM_CHAT_MAX_TOKENS" default:"800"`
 }
 
-// Default token budgets, used when the configured value is unset/non-positive.
+// Default per-task token budgets, used when the configured value is unset or
+// non-positive.
 const (
-	defaultNotesMaxTokens = 6000
-	defaultStateMaxTokens = 12000
+	defaultNotesMaxTokens  = 6000
+	defaultStateMaxTokens  = 12000
+	defaultCriticMaxTokens = 1000
+	defaultLoreMaxTokens   = 1200
+	defaultAskMaxTokens    = 1200
+	defaultRecapMaxTokens  = 1200
+	defaultPrepMaxTokens   = 2000
+	defaultChatMaxTokens   = 800
 )
 
-// NotesTokens returns the session-notes token budget, falling back to the
-// default when unset or non-positive (a 0/negative max_tokens would be sent
-// verbatim and let the provider pick a tiny default).
+// Token-budget resolvers. Each falls back to its default when unset or
+// non-positive: a 0/negative max_tokens would otherwise be marshalled away or
+// sent verbatim, letting the provider pick a tiny default and truncate the reply.
 func (c LiteLLMConfig) NotesTokens() int { return positiveOr(c.NotesMaxTokens, defaultNotesMaxTokens) }
-
-// StateTokens returns the state-extraction token budget, falling back to the
-// default when unset or non-positive.
 func (c LiteLLMConfig) StateTokens() int { return positiveOr(c.StateMaxTokens, defaultStateMaxTokens) }
+func (c LiteLLMConfig) CriticTokens() int {
+	return positiveOr(c.CriticMaxTokens, defaultCriticMaxTokens)
+}
+func (c LiteLLMConfig) LoreTokens() int  { return positiveOr(c.LoreMaxTokens, defaultLoreMaxTokens) }
+func (c LiteLLMConfig) AskTokens() int   { return positiveOr(c.AskMaxTokens, defaultAskMaxTokens) }
+func (c LiteLLMConfig) RecapTokens() int { return positiveOr(c.RecapMaxTokens, defaultRecapMaxTokens) }
+func (c LiteLLMConfig) PrepTokens() int  { return positiveOr(c.PrepMaxTokens, defaultPrepMaxTokens) }
+func (c LiteLLMConfig) ChatTokens() int  { return positiveOr(c.ChatMaxTokens, defaultChatMaxTokens) }
 
 func positiveOr(v, fallback int) int {
 	if v > 0 {

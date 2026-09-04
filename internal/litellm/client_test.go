@@ -36,8 +36,12 @@ func TestChatSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chat error: %v", err)
 	}
-	if got != "hello there" {
-		t.Errorf("Chat = %q, want %q", got, "hello there")
+	if got.Content != "hello there" {
+		t.Errorf("Chat = %q, want %q", got.Content, "hello there")
+	}
+	// A response with no finish_reason must not be mistaken for a truncated one.
+	if got.Truncated {
+		t.Error("absent finish_reason should not report truncation")
 	}
 }
 
@@ -65,15 +69,15 @@ func TestChatEmptyChoices(t *testing.T) {
 	}
 }
 
-// TestChatWithResultReportsTruncation covers the silent failure mode behind
+// TestChatReportsTruncation covers the silent failure mode behind
 // cut-off session notes and unparseable extraction JSON: hitting max_tokens is
 // NOT an HTTP error, so the caller only learns about it from finish_reason.
-func TestChatWithResultReportsTruncation(t *testing.T) {
+func TestChatReportsTruncation(t *testing.T) {
 	for _, reason := range []string{"length", "max_tokens"} {
 		c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"cut off mid-sen"},"finish_reason":"` + reason + `"}]}`))
 		})
-		res, err := c.ChatWithResult(context.Background(), "dnd-chat", nil, 10)
+		res, err := c.Chat(context.Background(), "dnd-chat", nil, 10)
 		srv.Close()
 		if err != nil {
 			t.Fatalf("finish_reason=%s: unexpected error %v", reason, err)
@@ -92,7 +96,7 @@ func TestChatWithResultReportsTruncation(t *testing.T) {
 		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"all done"},"finish_reason":"stop"}]}`))
 	})
 	defer srv.Close()
-	res, err := c.ChatWithResult(context.Background(), "dnd-chat", nil, 10)
+	res, err := c.Chat(context.Background(), "dnd-chat", nil, 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -240,8 +244,8 @@ func TestRetriesOnTransient5xxThenSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success after retries, got: %v", err)
 	}
-	if got != "eventually ok" {
-		t.Errorf("Chat = %q", got)
+	if got.Content != "eventually ok" {
+		t.Errorf("Chat = %q", got.Content)
 	}
 	if n := atomic.LoadInt32(&attempts); n != 3 {
 		t.Errorf("expected 3 attempts, got %d", n)

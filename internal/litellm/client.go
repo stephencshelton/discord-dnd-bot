@@ -98,11 +98,14 @@ type apiError struct {
 	Type    string `json:"type"`
 }
 
-// ChatResult is a chat completion plus why generation stopped. Callers that
-// generate long output (session notes, state-extraction JSON) need this: when
-// the model hits max_tokens the reply is silently CUT MID-SENTENCE, which
-// produced half-written recaps and unparseable JSON. Truncated lets a caller
-// continue the generation instead of shipping a fragment.
+// ChatResult is a chat completion plus why generation stopped.
+//
+// Callers MUST consider Truncated. When a model hits max_tokens the reply is cut
+// off MID-SENTENCE and the HTTP call still succeeds, so a completion that only
+// returns the text cannot tell a finished answer from a chopped one. That gap
+// silently produced half-written session notes and unparseable extraction JSON,
+// which is why there is no text-only Chat method: the stop reason is part of the
+// result, not optional metadata.
 type ChatResult struct {
 	Content string
 	// FinishReason is the provider's stop reason ("stop", "length", ...). Empty
@@ -112,17 +115,11 @@ type ChatResult struct {
 	Truncated bool
 }
 
-// Chat sends a chat completion and returns the assistant's text reply. It powers
-// bot mentions, DM chat, and session-note generation. Output truncation is not
-// visible through this call — use ChatWithResult when completeness matters.
-func (c *Client) Chat(ctx context.Context, model string, msgs []Message, maxTokens int) (string, error) {
-	res, err := c.ChatWithResult(ctx, model, msgs, maxTokens)
-	return res.Content, err
-}
-
-// ChatWithResult is Chat plus the stop reason, so callers can detect and repair
-// a reply that was cut off at max_tokens.
-func (c *Client) ChatWithResult(ctx context.Context, model string, msgs []Message, maxTokens int) (ChatResult, error) {
+// Chat sends a chat completion and returns the assistant's reply together with
+// the stop reason, so callers can detect and repair a reply that was cut off at
+// max_tokens. It powers bot mentions, DM chat, session notes, and the
+// campaign-state extraction.
+func (c *Client) Chat(ctx context.Context, model string, msgs []Message, maxTokens int) (ChatResult, error) {
 	body, err := json.Marshal(chatRequest{
 		Model:       model,
 		Messages:    msgs,
