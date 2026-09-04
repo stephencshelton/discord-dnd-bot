@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/disgoorg/disgo/discord"
@@ -170,6 +171,27 @@ func (ic *ictx) replyEmbedEphemeral(embed discord.Embed) error {
 		Embeds: []discord.Embed{embed},
 		Flags:  discord.MessageFlagEphemeral,
 	})
+}
+
+// replyEmbedLong sends an embed plus any content that didn't fit inside it,
+// continued as follow-up messages.
+//
+// Used by the detail views (/world show, /character show): a record's description
+// grows every time a /review-session proposal is approved (approval APPENDS), so
+// it can outgrow an embed. Discarding the tail would defeat the purpose of a
+// "show the whole entry" command, so the remainder is posted rather than cut.
+func (ic *ictx) replyEmbedLong(embed discord.Embed, overflow string, ephemeral bool) error {
+	if err := ic.e.CreateMessage(discord.MessageCreate{
+		Embeds: []discord.Embed{embed},
+		Flags:  ephemeralFlags(ephemeral),
+	}); err != nil {
+		return err
+	}
+	if strings.TrimSpace(overflow) == "" {
+		return nil
+	}
+	chunks := boundChunks(discordfmt.ChunkMarkdown(overflow, discordfmt.ChunkLimit))
+	return ic.sendFollowups(chunks, ephemeral)
 }
 
 // ack sends a deferred ("thinking...") response so we have up to 15 minutes to

@@ -228,7 +228,11 @@ func (g *Gateway) handleCharacter(ctx context.Context, ic *ictx) error {
 			fmt.Fprintf(&b, "%s\n", listLine(fmt.Sprintf("• **%s** — Lv %d %s %s (<@%s>)",
 				pc.Name, pc.Level, pc.Race, pc.Class, pc.DiscordUserID)))
 		}
+		b.WriteString("\n_See a full sheet with `/character show`._")
 		return ic.replyLong(b.String(), true)
+
+	case "show":
+		return g.handleCharacterShow(ctx, ic, camp)
 
 	case "delete":
 		name := ic.optString("name")
@@ -311,7 +315,11 @@ func (g *Gateway) handleWorld(ctx context.Context, ic *ictx) error {
 			// out every other entry — or push the whole message past Discord's limit.
 			b.WriteString(listLine(line) + "\n")
 		}
+		b.WriteString("\n_Read one in full with `/world show name:<name>`._")
 		return ic.replyLong(b.String(), true)
+
+	case "show":
+		return g.handleWorldShow(ctx, ic, camp)
 
 	case "delete":
 		kind := db.WorldEntityKind(ic.optString("kind"))

@@ -131,6 +131,14 @@ func allCommandSpecs() []commandSpec {
 				discord.ApplicationCommandOptionSubCommand{Name: "edit", Description: "Edit your character (opens a pre-filled form)"},
 				discord.ApplicationCommandOptionSubCommand{Name: "list", Description: "List characters in the active campaign"},
 				discord.ApplicationCommandOptionSubCommand{
+					Name:        "show",
+					Description: "Show a character sheet in full, including recorded deeds (read-only)",
+					Options: []discord.ApplicationCommandOption{
+						// Optional: defaults to the caller's own character.
+						discord.ApplicationCommandOptionString{Name: "name", Description: "Whose character (default: yours)", Autocomplete: true},
+					},
+				},
+				discord.ApplicationCommandOptionSubCommand{
 					Name:        "delete",
 					Description: "Delete a character",
 					Options: []discord.ApplicationCommandOption{
@@ -164,6 +172,21 @@ func allCommandSpecs() []commandSpec {
 					Description: "List world entries",
 					Options: []discord.ApplicationCommandOption{
 						discord.ApplicationCommandOptionString{Name: "kind", Description: "Filter by type", Choices: worldKindChoices()},
+					},
+				},
+				// show is the READ-ONLY counterpart to list: list is an index (rows are
+				// abbreviated), so there has to be a way to read one entry in full.
+				// Without it the only way to see everything was /world edit, i.e. opening
+				// a write form just to look — which risks overwriting the entry.
+				discord.ApplicationCommandOptionSubCommand{
+					Name:        "show",
+					Description: "Show a world entry in full (read-only)",
+					Options: []discord.ApplicationCommandOption{
+						discord.ApplicationCommandOptionString{Name: "name", Description: "Which entry to show", Required: true, Autocomplete: true},
+						// kind is OPTIONAL here (unlike edit/delete): you usually recall the
+						// name, not the category. It only disambiguates a name reused across
+						// kinds.
+						discord.ApplicationCommandOptionString{Name: "kind", Description: "Only needed if the same name exists as more than one type", Choices: worldKindChoices()},
 					},
 				},
 				discord.ApplicationCommandOptionSubCommand{

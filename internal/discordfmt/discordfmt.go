@@ -112,10 +112,14 @@ func ChunkMarkdown(s string, size int) []string {
 	}
 	for _, line := range strings.Split(s, "\n") {
 		n := len([]rune(line))
-		// A pathologically long single line (no wrap opportunity) is hard-split.
+		// A line longer than a whole chunk has to be broken mid-line. Break it on
+		// WORD boundaries: a long prose paragraph (a session-notes section, or a
+		// description that approved proposals kept appending to) is one such line,
+		// and slicing it at an exact rune count splits a word across two messages
+		// — which reads as corrupted text rather than continued text.
 		if n > size {
 			flush()
-			out = append(out, HardSplit(line, size)...)
+			out = append(out, SplitWords(line, size)...)
 			continue
 		}
 		// +1 for the newline that will join this line to the current chunk.
@@ -130,6 +134,49 @@ func ChunkMarkdown(s string, size int) []string {
 		curRunes += n
 	}
 	flush()
+	return out
+}
+
+// SplitWords breaks s into pieces of at most size runes, splitting at whitespace
+// so words stay intact. A single token longer than size (a URL, a run of
+// punctuation) is hard-split as a last resort, since there is no better option.
+//
+// Unlike Truncate this DISCARDS NOTHING — it is for content that must be shown in
+// full across several messages.
+func SplitWords(s string, size int) []string {
+	if size <= 0 {
+		return []string{s}
+	}
+	if len([]rune(s)) <= size {
+		return []string{s}
+	}
+
+	var out []string
+	rest := s
+	for len([]rune(rest)) > size {
+		r := []rune(rest)
+		window := string(r[:size])
+
+		// Break at the last whitespace in the window. Refuse to rewind past the
+		// halfway mark, or a line of mostly-unbreakable text would produce lots of
+		// tiny pieces.
+		cut := strings.LastIndexAny(window, " \t")
+		if cut < size/2 {
+			cut = -1
+		}
+		if cut < 0 {
+			// No usable break: hard-split this piece.
+			out = append(out, window)
+			rest = string(r[size:])
+			continue
+		}
+		out = append(out, strings.TrimRight(string([]rune(window)[:cut]), " \t"))
+		// Skip the whitespace we broke on.
+		rest = strings.TrimLeft(string(r[cut:]), " \t")
+	}
+	if strings.TrimSpace(rest) != "" {
+		out = append(out, rest)
+	}
 	return out
 }
 

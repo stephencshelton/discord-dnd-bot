@@ -167,6 +167,37 @@ func (s *Store) GetWorldEntityByName(ctx context.Context, campaignID uuid.UUID, 
 	return &e, err
 }
 
+// FindWorldEntitiesByName returns every entity in a campaign whose name matches
+// (case-insensitively), across ALL kinds, ordered by kind.
+//
+// The kind+name pair is what's unique, so the same name can legitimately exist as
+// both an NPC and a location ("Eastwatch" the captain, "Eastwatch" the town).
+// This backs a kind-optional lookup: callers show the single hit directly, or ask
+// the user which kind they meant when there's more than one.
+func (s *Store) FindWorldEntitiesByName(ctx context.Context, campaignID uuid.UUID, name string) ([]WorldEntity, error) {
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT id, campaign_id, kind, name, COALESCE(description,''), COALESCE(metadata,'{}'::jsonb), created_at, updated_at
+		 FROM world_entities WHERE campaign_id=$1 AND lower(name)=lower($2) ORDER BY kind`,
+		campaignID, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WorldEntity
+	for rows.Next() {
+		var e WorldEntity
+		var k string
+		var meta []byte
+		if err := rows.Scan(&e.ID, &e.CampaignID, &k, &e.Name, &e.Description, &meta, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		e.Kind = WorldEntityKind(k)
+		e.Metadata = unmarshalMetadata(meta)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // GetWorldEntityByID fetches a single world entity by its primary key.
 func (s *Store) GetWorldEntityByID(ctx context.Context, id uuid.UUID) (*WorldEntity, error) {
 	var e WorldEntity

@@ -245,16 +245,25 @@ func (g *Gateway) handleAutocomplete(e *events.AutocompleteInteractionCreate) {
 	case "campaign":
 		gid, _ := g.resolveGuild(ctx, guildID, userID) // "" -> no suggestions
 		camps, _ := g.store.ListCampaigns(ctx, gid, true)
+		partial := strings.ToLower(data.String("name"))
 		for _, c := range camps {
+			if partial != "" && !strings.Contains(strings.ToLower(c.Name), partial) {
+				continue
+			}
 			if !add(c.Name, c.Name) {
 				break
 			}
 		}
 	case "character":
+		// Character names, for /character delete and /character show.
 		gid, _ := g.resolveGuild(ctx, guildID, userID)
 		if camp, err := g.store.GetActiveCampaign(ctx, gid); err == nil {
 			pcs, _ := g.store.ListPCs(ctx, camp.ID)
+			partial := strings.ToLower(data.String("name"))
 			for _, pc := range pcs {
+				if partial != "" && !strings.Contains(strings.ToLower(pc.Name), partial) {
+					continue
+				}
 				if !add(pc.Name, pc.Name) {
 					break
 				}
@@ -280,17 +289,33 @@ func (g *Gateway) handleAutocomplete(e *events.AutocompleteInteractionCreate) {
 	case "review-session":
 		g.reviewSessionAutocomplete(ctx, guildID, userID, add)
 	case "world":
-		// Suggest existing entry names for the selected kind (used by /world edit).
+		// Suggest existing entry names (used by /world edit, /world delete and
+		// /world show). kind is REQUIRED by edit/delete but OPTIONAL for show, and an
+		// empty kind matches no rows — so fall back to every kind rather than
+		// returning an empty list, and label those suggestions with their kind so a
+		// name reused across kinds is still distinguishable.
 		gid, _ := g.resolveGuild(ctx, guildID, userID)
 		if camp, err := g.store.GetActiveCampaign(ctx, gid); err == nil {
 			kind := db.WorldEntityKind(data.String("kind"))
-			entries, _ := g.store.ListWorldEntities(ctx, camp.ID, kind)
+			var entries []db.WorldEntity
+			labelKind := false
+			if db.ValidWorldKind(kind) {
+				entries, _ = g.store.ListWorldEntities(ctx, camp.ID, kind)
+			} else {
+				entries, _ = g.store.ListAllWorldEntities(ctx, camp.ID)
+				labelKind = true
+			}
 			partial := strings.ToLower(data.String("name"))
 			for _, ent := range entries {
 				if partial != "" && !strings.Contains(strings.ToLower(ent.Name), partial) {
 					continue
 				}
-				if !add(ent.Name, ent.Name) {
+				label := ent.Name
+				if labelKind {
+					label = fmt.Sprintf("%s — %s", ent.Name, entityKindLabel(ent.Kind))
+				}
+				// The VALUE stays the bare name: it's what the handlers look up.
+				if !add(label, ent.Name) {
 					break
 				}
 			}

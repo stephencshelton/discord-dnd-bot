@@ -114,6 +114,61 @@ func TestChunkMarkdownEdgeCases(t *testing.T) {
 	}
 }
 
+// TestChunkMarkdownSplitsLongProseOnWords covers the realistic case: a long PROSE
+// paragraph is a single line, so it must be broken between words. Slicing it at an
+// exact rune count splits a word across two messages, which reads as corrupted
+// text — the same false "it crashed" signal as a mid-word truncation.
+func TestChunkMarkdownSplitsLongProseOnWords(t *testing.T) {
+	para := strings.Repeat("the party pressed deeper into the ruined amphitheater. ", 100)
+	chunks := ChunkMarkdown(para, 300)
+	if len(chunks) < 2 {
+		t.Fatalf("expected several chunks, got %d", len(chunks))
+	}
+	for i, c := range chunks {
+		if n := len([]rune(c)); n > 300 {
+			t.Errorf("chunk %d = %d runes, over the limit", i, n)
+		}
+		// No chunk may start or end mid-word.
+		if strings.HasPrefix(c, " ") || strings.HasSuffix(c, " ") {
+			t.Errorf("chunk %d has ragged whitespace: %q", i, c)
+		}
+	}
+	// Nothing lost: normalizing whitespace must reconstruct the original.
+	got := strings.Join(strings.Fields(strings.Join(chunks, " ")), " ")
+	want := strings.Join(strings.Fields(para), " ")
+	if got != want {
+		t.Error("content was lost or reordered when splitting prose")
+	}
+	// Each boundary must fall between words, i.e. every chunk is whole words.
+	for _, c := range chunks {
+		for _, w := range strings.Fields(c) {
+			if w != "the" && w != "party" && w != "pressed" && w != "deeper" &&
+				w != "into" && w != "ruined" && w != "amphitheater." {
+				t.Errorf("found a split word %q", w)
+			}
+		}
+	}
+}
+
+// TestSplitWordsHardSplitsUnbreakableToken ensures a single token longer than the
+// limit (a URL, say) still gets emitted rather than looping forever.
+func TestSplitWordsHardSplitsUnbreakableToken(t *testing.T) {
+	tok := strings.Repeat("z", 250)
+	got := SplitWords(tok, 100)
+	if strings.Join(got, "") != tok {
+		t.Error("unbreakable token lost content")
+	}
+	for _, p := range got {
+		if len([]rune(p)) > 100 {
+			t.Errorf("piece = %d runes, over the limit", len([]rune(p)))
+		}
+	}
+	// Short input passes through untouched.
+	if got := SplitWords("small", 100); len(got) != 1 || got[0] != "small" {
+		t.Errorf("SplitWords should pass short input through, got %q", got)
+	}
+}
+
 func TestHardSplit(t *testing.T) {
 	if got := HardSplit("abcdefg", 3); strings.Join(got, "") != "abcdefg" || len(got) != 3 {
 		t.Errorf("HardSplit = %q", got)
