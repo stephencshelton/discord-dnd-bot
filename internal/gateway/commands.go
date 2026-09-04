@@ -205,6 +205,14 @@ func allCommandSpecs() []commandSpec {
 					Description: "Re-run transcription/notes for a session",
 					Options: []discord.ApplicationCommandOption{
 						discord.ApplicationCommandOptionString{Name: "session_id", Description: "Session ID from /session list", Required: true},
+						// Re-running only the extraction step is cheap (the transcript and
+						// notes already exist), whereas a full requeue re-transcribes hours
+						// of audio. Worth its own switch so recovering missing
+						// /review-session proposals doesn't cost a whole transcription.
+						discord.ApplicationCommandOptionBool{
+							Name:        "proposals_only",
+							Description: "Only re-derive /review-session proposals (keeps the existing transcript and notes)",
+						},
 					},
 				},
 			},

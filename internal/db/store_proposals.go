@@ -119,10 +119,15 @@ func (s *Store) GetStateProposal(ctx context.Context, id uuid.UUID) (*StatePropo
 
 // ListPendingProposalsForSession returns the pending proposals for a session,
 // oldest first (stable review order).
+//
+// The id tiebreaker matters: a batch is inserted in ONE transaction, and
+// Postgres' now() is the transaction timestamp, so every proposal in a batch
+// shares created_at. Without it the order would be arbitrary and could differ
+// between calls, which breaks "show me the one after this" navigation (Skip).
 func (s *Store) ListPendingProposalsForSession(ctx context.Context, sessionID uuid.UUID) ([]StateProposal, error) {
 	rows, err := s.db.Pool.Query(ctx,
 		`SELECT `+proposalCols+` FROM state_proposals
-		 WHERE session_id=$1 AND status=$2 ORDER BY created_at`, sessionID, ProposalPending)
+		 WHERE session_id=$1 AND status=$2 ORDER BY created_at, id`, sessionID, ProposalPending)
 	if err != nil {
 		return nil, err
 	}
@@ -131,12 +136,13 @@ func (s *Store) ListPendingProposalsForSession(ctx context.Context, sessionID uu
 }
 
 // ListPendingProposalsForCampaign returns the pending proposals for a campaign,
-// oldest first. Used when reviewing without a specific session (e.g. proposals
-// not tied to a particular recording).
+// oldest first (id tiebreaker for a stable order — see
+// ListPendingProposalsForSession). Used when reviewing without a specific
+// session (e.g. proposals not tied to a particular recording).
 func (s *Store) ListPendingProposalsForCampaign(ctx context.Context, campaignID uuid.UUID) ([]StateProposal, error) {
 	rows, err := s.db.Pool.Query(ctx,
 		`SELECT `+proposalCols+` FROM state_proposals
-		 WHERE campaign_id=$1 AND status=$2 ORDER BY created_at`, campaignID, ProposalPending)
+		 WHERE campaign_id=$1 AND status=$2 ORDER BY created_at, id`, campaignID, ProposalPending)
 	if err != nil {
 		return nil, err
 	}

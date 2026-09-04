@@ -65,6 +65,42 @@ func TestChatEmptyChoices(t *testing.T) {
 	}
 }
 
+// TestChatWithResultReportsTruncation covers the silent failure mode behind
+// cut-off session notes and unparseable extraction JSON: hitting max_tokens is
+// NOT an HTTP error, so the caller only learns about it from finish_reason.
+func TestChatWithResultReportsTruncation(t *testing.T) {
+	for _, reason := range []string{"length", "max_tokens"} {
+		c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"cut off mid-sen"},"finish_reason":"` + reason + `"}]}`))
+		})
+		res, err := c.ChatWithResult(context.Background(), "dnd-chat", nil, 10)
+		srv.Close()
+		if err != nil {
+			t.Fatalf("finish_reason=%s: unexpected error %v", reason, err)
+		}
+		if !res.Truncated {
+			t.Errorf("finish_reason=%s should report Truncated", reason)
+		}
+		if res.Content != "cut off mid-sen" {
+			t.Errorf("finish_reason=%s: content = %q", reason, res.Content)
+		}
+	}
+
+	// A normal completion must NOT be flagged (that would trigger pointless
+	// continuation round trips on every call).
+	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"all done"},"finish_reason":"stop"}]}`))
+	})
+	defer srv.Close()
+	res, err := c.ChatWithResult(context.Background(), "dnd-chat", nil, 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Truncated || res.FinishReason != "stop" {
+		t.Errorf("normal completion misreported: %+v", res)
+	}
+}
+
 func TestEmbedSuccess(t *testing.T) {
 	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/embeddings" {

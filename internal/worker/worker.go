@@ -193,7 +193,7 @@ func (w *Worker) process(ctx context.Context, job *queue.Job) {
 	case queue.JobReindexCampaign:
 		err = w.handleReindexCampaign(jobCtx, job.Payload)
 	case queue.JobExtractState:
-		err = w.handleExtractState(jobCtx, job.Payload)
+		err = w.handleExtractState(jobCtx, job.Payload, w.isLastAttempt(job))
 	case queue.JobEmbedCanon:
 		err = w.handleEmbedCanon(jobCtx, job.Payload)
 	default:

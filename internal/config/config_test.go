@@ -112,3 +112,38 @@ func TestLiteLLMModelResolvers(t *testing.T) {
 		}
 	})
 }
+
+// TestLiteLLMTokenBudgets guards the completeness knobs: a 0/negative max_tokens
+// would be sent verbatim and let the provider pick a tiny default, which is how
+// session notes ended up cut off mid-sentence and extraction JSON unparseable.
+func TestLiteLLMTokenBudgets(t *testing.T) {
+	var zero LiteLLMConfig
+	if got := zero.NotesTokens(); got != defaultNotesMaxTokens {
+		t.Errorf("NotesTokens() with unset config = %d, want %d", got, defaultNotesMaxTokens)
+	}
+	if got := zero.StateTokens(); got != defaultStateMaxTokens {
+		t.Errorf("StateTokens() with unset config = %d, want %d", got, defaultStateMaxTokens)
+	}
+
+	neg := LiteLLMConfig{NotesMaxTokens: -1, StateMaxTokens: 0}
+	if got := neg.NotesTokens(); got != defaultNotesMaxTokens {
+		t.Errorf("NotesTokens() with negative config = %d, want %d", got, defaultNotesMaxTokens)
+	}
+	if got := neg.StateTokens(); got != defaultStateMaxTokens {
+		t.Errorf("StateTokens() with zero config = %d, want %d", got, defaultStateMaxTokens)
+	}
+
+	set := LiteLLMConfig{NotesMaxTokens: 1234, StateMaxTokens: 4321}
+	if got := set.NotesTokens(); got != 1234 {
+		t.Errorf("NotesTokens() = %d, want 1234", got)
+	}
+	if got := set.StateTokens(); got != 4321 {
+		t.Errorf("StateTokens() = %d, want 4321", got)
+	}
+
+	// The extraction budget must exceed the notes budget: extraction re-states
+	// every proposal as JSON with evidence quotes, so it is the larger output.
+	if defaultStateMaxTokens <= defaultNotesMaxTokens {
+		t.Errorf("state budget (%d) should exceed notes budget (%d)", defaultStateMaxTokens, defaultNotesMaxTokens)
+	}
+}

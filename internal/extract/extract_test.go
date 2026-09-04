@@ -300,3 +300,69 @@ func TestExtractJSONObject(t *testing.T) {
 		}
 	}
 }
+
+// TestRepairTruncatedJSON covers the salvage path for a reply that hit the
+// model's output token limit mid-JSON.
+func TestRepairTruncatedJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+		ok   bool
+	}{
+		{
+			name: "cut mid-object keeps completed elements",
+			in:   `{"proposals":[{"a":1},{"b":2},{"c":`,
+			want: `{"proposals":[{"a":1},{"b":2}]}`,
+			ok:   true,
+		},
+		{
+			name: "cut inside a string keeps completed elements",
+			in:   `{"proposals":[{"a":1},{"evidence":"they went to the tow`,
+			want: `{"proposals":[{"a":1}]}`,
+			ok:   true,
+		},
+		{
+			name: "nested object completed inside the truncated element",
+			in:   `{"proposals":[{"patch":{"description":"x"},"evidence":"y`,
+			want: `{"proposals":[{"patch":{"description":"x"}}]}`,
+			ok:   true,
+		},
+		{name: "already balanced is not repaired", in: `{"proposals":[]}`, ok: false},
+		{name: "no complete nested value", in: `{"proposals":[{"a":`, ok: false},
+		{name: "no json at all", in: `sorry, I can't`, ok: false},
+	}
+	for _, c := range cases {
+		got, ok := repairTruncatedJSON(c.in)
+		if ok != c.ok {
+			t.Errorf("%s: ok = %v, want %v (got %q)", c.name, ok, c.ok, got)
+			continue
+		}
+		if ok && got != c.want {
+			t.Errorf("%s: = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestParseSalvagesTruncatedOutput is the regression test for the bug that made
+// /review-session look broken after a long session: the extraction reply ran out
+// of output tokens, so the JSON never closed and EVERY proposal was discarded.
+// The complete proposals must survive.
+func TestParseSalvagesTruncatedOutput(t *testing.T) {
+	raw := `{"proposals":[
+      {"action":"create_entity","entity_kind":"npc","entity_name":"Captain Varek",
+       "patch":{"description":"Commander of the Eastwatch guard."},
+       "evidence":"Introduced as the commander when the party arrived.","confidence":0.9},
+      {"action":"create_entity","entity_kind":"location","entity_name":"Eastwatch",
+       "patch":{"description":"A fortified border town."},
+       "evidence":"The party travelled there overland.","confidence":0.8},
+      {"action":"create_entity","entity_kind":"npc","entity_name":"Ayad`
+
+	props := mustParse(t, raw, nil)
+	if len(props) != 2 {
+		t.Fatalf("expected the 2 complete proposals to survive truncation, got %d: %+v", len(props), props)
+	}
+	if props[0].EntityName != "Captain Varek" || props[1].EntityName != "Eastwatch" {
+		t.Errorf("unexpected salvaged proposals: %+v", props)
+	}
+}

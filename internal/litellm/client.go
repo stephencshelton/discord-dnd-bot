@@ -86,7 +86,8 @@ type chatRequest struct {
 
 type chatResponse struct {
 	Choices []struct {
-		Message Message `json:"message"`
+		Message      Message `json:"message"`
+		FinishReason string  `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *usage    `json:"usage,omitempty"`
 	Error *apiError `json:"error,omitempty"`
@@ -97,9 +98,31 @@ type apiError struct {
 	Type    string `json:"type"`
 }
 
+// ChatResult is a chat completion plus why generation stopped. Callers that
+// generate long output (session notes, state-extraction JSON) need this: when
+// the model hits max_tokens the reply is silently CUT MID-SENTENCE, which
+// produced half-written recaps and unparseable JSON. Truncated lets a caller
+// continue the generation instead of shipping a fragment.
+type ChatResult struct {
+	Content string
+	// FinishReason is the provider's stop reason ("stop", "length", ...). Empty
+	// when the provider omits it.
+	FinishReason string
+	// Truncated is true when generation stopped because it ran out of tokens.
+	Truncated bool
+}
+
 // Chat sends a chat completion and returns the assistant's text reply. It powers
-// bot mentions, DM chat, and session-note generation.
+// bot mentions, DM chat, and session-note generation. Output truncation is not
+// visible through this call — use ChatWithResult when completeness matters.
 func (c *Client) Chat(ctx context.Context, model string, msgs []Message, maxTokens int) (string, error) {
+	res, err := c.ChatWithResult(ctx, model, msgs, maxTokens)
+	return res.Content, err
+}
+
+// ChatWithResult is Chat plus the stop reason, so callers can detect and repair
+// a reply that was cut off at max_tokens.
+func (c *Client) ChatWithResult(ctx context.Context, model string, msgs []Message, maxTokens int) (ChatResult, error) {
 	body, err := json.Marshal(chatRequest{
 		Model:       model,
 		Messages:    msgs,
@@ -107,20 +130,32 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, maxToke
 		MaxTokens:   maxTokens,
 	})
 	if err != nil {
-		return "", err
+		return ChatResult{}, err
 	}
 	var out chatResponse
 	if err := c.do(ctx, "chat", http.MethodPost, "/v1/chat/completions", "application/json", bytes.NewReader(body), &out); err != nil {
-		return "", err
+		return ChatResult{}, err
 	}
 	if out.Error != nil {
-		return "", fmt.Errorf("litellm chat error: %s", out.Error.Message)
+		return ChatResult{}, fmt.Errorf("litellm chat error: %s", out.Error.Message)
 	}
 	if len(out.Choices) == 0 {
-		return "", fmt.Errorf("litellm chat: empty response")
+		return ChatResult{}, fmt.Errorf("litellm chat: empty response")
 	}
 	recordTokens("chat", out.Usage)
-	return out.Choices[0].Message.Content, nil
+	reason := out.Choices[0].FinishReason
+	res := ChatResult{
+		Content:      out.Choices[0].Message.Content,
+		FinishReason: reason,
+		// Providers spell the token-limit stop differently: OpenAI/LiteLLM use
+		// "length", Anthropic-style routes surface "max_tokens".
+		Truncated: reason == "length" || reason == "max_tokens",
+	}
+	if res.Truncated {
+		c.log.Warn("model output hit the token limit and was cut off",
+			"model", model, "max_tokens", maxTokens, "finish_reason", reason)
+	}
+	return res, nil
 }
 
 type transcriptionResponse struct {

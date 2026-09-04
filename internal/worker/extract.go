@@ -28,7 +28,12 @@ import (
 // re-running clears the session's prior pending (un-reviewed) proposals and
 // re-derives them, so a reprocess doesn't pile up duplicates, while already
 // approved/rejected proposals are preserved.
-func (w *Worker) handleExtractState(ctx context.Context, raw json.RawMessage) error {
+//
+// lastAttempt is true when the worker will not retry this job again; it gates the
+// user-visible "extraction didn't work" message so an intermittent blip that
+// succeeds on retry stays invisible, while a real dead end is never silent (a
+// silent dead end is indistinguishable from /review-session being broken).
+func (w *Worker) handleExtractState(ctx context.Context, raw json.RawMessage, lastAttempt bool) error {
 	p, err := unmarshal[queue.ExtractStatePayload](raw)
 	if err != nil {
 		return queue.Permanent(fmt.Errorf("decode payload: %w", err))
@@ -85,24 +90,33 @@ func (w *Worker) handleExtractState(ctx context.Context, raw json.RawMessage) er
 	}
 
 	// Ask the model for strict JSON. Use the state route (falls back to chat).
-	rawJSON, err := w.ai.Chat(ctx, w.cfg.LiteLLM.State(), []litellm.Message{
+	// chatComplete (not Chat) because the reply is JSON: if the model runs out of
+	// output tokens the JSON is cut mid-structure and NOTHING parses, which threw
+	// away every proposal from long sessions.
+	rawJSON, err := w.chatComplete(ctx, "extract", w.cfg.LiteLLM.State(), []litellm.Message{
 		{Role: "system", Content: prompts.StateExtractionSystem},
 		{Role: "user", Content: prompts.StateExtractionUser(camp.Name, camp.System, camp.Premise, charLines, entityLines, sess.Notes, sess.Transcript)},
-	}, 3000)
+	}, w.cfg.LiteLLM.StateTokens())
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("extract", "error").Inc()
+		if lastAttempt {
+			w.notifyExtractionFailed(ctx, p, sess)
+		}
 		return fmt.Errorf("state extraction chat: %w", err)
 	}
 
 	// Validate + normalize the model output. A parse failure is PERMANENT for
 	// this job (retrying the same saved transcript yields the same bad output);
-	// it's logged + metered but must not fail the session.
+	// it's logged + metered but must not fail the session. Tell the channel too:
+	// staying silent here is what made a failed extraction look like the whole
+	// /review-session feature was broken.
 	sid := sessionID
 	proposals, err := extract.Parse(rawJSON, camp.ID, &sid, existing, existingChars)
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("extract", "error").Inc()
 		w.log.Warn("state extraction produced unparseable output",
-			"session", sessionID, "err", err)
+			"session", sessionID, "err", err, "raw_chars", len(rawJSON))
+		w.notifyExtractionFailed(ctx, p, sess)
 		return queue.Permanent(fmt.Errorf("parse extraction: %w", err))
 	}
 	metrics.AIRequests.WithLabelValues("extract", "ok").Inc()
@@ -132,14 +146,34 @@ func (w *Worker) handleExtractState(ctx context.Context, raw json.RawMessage) er
 	w.log.Info("state extraction complete",
 		"session", sessionID, "campaign", camp.ID, "proposals", len(proposals))
 
-	// Optionally nudge the notes channel that proposals are ready to review.
-	if p.Notify && len(proposals) > 0 {
+	// Optionally nudge the notes channel. Zero proposals gets a message too:
+	// silence is indistinguishable from a broken feature, and after a long
+	// session "I found nothing" is itself surprising information worth showing.
+	if p.Notify {
 		ch := w.notesChannel(ctx, p.GuildID, sess.VoiceChannelID)
-		w.notify(p.GuildID, ch, fmt.Sprintf(
-			"🧭 I found **%d** proposed update(s) to your campaign world from the last session. A DM can review them with `/review-session` (nothing changes until approved).",
-			len(proposals)))
+		msg := "🧭 I didn't find any campaign-world updates worth proposing from that session. Nothing to review."
+		if len(proposals) > 0 {
+			msg = fmt.Sprintf(
+				"🧭 I found **%d** proposed update(s) to your campaign world from the last session. A DM can review them with `/review-session` (nothing changes until approved).",
+				len(proposals))
+		}
+		w.notify(p.GuildID, ch, msg)
 	}
 	return nil
+}
+
+// notifyExtractionFailed tells the notes channel that the world-state extraction
+// step gave up, so a DM knows there's nothing to review because the step failed
+// — not because /review-session is broken. Best-effort and gated on the job's
+// Notify flag, exactly like the success message.
+func (w *Worker) notifyExtractionFailed(ctx context.Context, p queue.ExtractStatePayload, sess *db.Session) {
+	if !p.Notify {
+		return
+	}
+	ch := w.notesChannel(ctx, p.GuildID, sess.VoiceChannelID)
+	w.notify(p.GuildID, ch,
+		"⚠️ I couldn't work out any campaign-world updates from that session — the extraction step failed, so `/review-session` has nothing to show. "+
+			"Your transcript and notes are saved; a DM can record anything important with `/world add`.")
 }
 
 // criticFilter runs the second-pass "editor" review: it summarizes each

@@ -17,11 +17,11 @@ The implemented command surface includes:
 - `/character add`, `edit`, `list`, and `delete` — `add`/`edit` open a structured fill-in form (name, class, race, level, bio); `add` prefills and re-saves your existing character
 - `/world add`, `edit`, `list`, and `delete` for NPCs, locations, factions, quests, and story hooks — `add` opens a kind-specific form whose structured fields are stored as entity metadata and **adds** to any existing same-named entry (details accumulate, never overwritten); `edit` opens a pre-filled form that **replaces** the entry's fields; `delete` removes an entry (and drops it from `/ask`)
 - `/session start`, `stop`, and `status`
-- `/session list` and `/session requeue` to inspect the active campaign's sessions by status and re-run a failed/lost transcription
+- `/session list` and `/session requeue` to inspect the active campaign's sessions by status and re-run a failed/lost transcription — `/session requeue proposals_only:true` re-derives only the `/review-session` proposals from the saved transcript (no re-transcription)
 - Voice recording with per-speaker tracks, crash-safe PCM checkpointing to object storage, and automatic resume/reaping after a gateway restart
-- Automatic transcription and AI-generated session notes
+- Automatic transcription and AI-generated session notes, posted to the notes channel as readable chat messages (split on Markdown boundaries so Discord word-wraps them) **and** attached as a `session-notes.md` file for archiving
 - **Automatic campaign-state extraction with DM review** — after a session's notes are written, an AI step _proposes_ world-state changes (new/updated NPCs, locations, factions, quests, story hooks, and recorded deeds for existing player characters) that a DM reviews with `/review-session`; nothing becomes canon until explicitly approved, and approving an existing entry **appends** detail rather than overwriting (see [Automatic campaign-state extraction](#automatic-campaign-state-extraction) below)
-- `/review-session` (DM/admin) to approve, reject, or edit AI-proposed world-state changes with buttons — idempotent, no command spam
+- `/review-session` to approve, reject, edit, or skip AI-proposed world-state changes with buttons — idempotent, no command spam
 - `/roll` for dice (e.g. `2d6+3`, `d20`, `4d6kh3`) — free, instant, no AI
 - `/lore` for open-ended worldbuilding *brainstorming* (invents ideas — not your canon)
 - `/recap` for a “previously on” narrative summary from recent completed sessions
@@ -119,6 +119,8 @@ Configuration is loaded from environment variables. The same configuration is us
 | `LITELLM_EMBED_DIM` | No | `1536` | Embedding vector dimensionality; must match the embed model (sizes the pgvector column) |
 | `LITELLM_REQUEST_TIMEOUT` | No | `120s` | AI request timeout |
 | `LITELLM_UPLOAD_TIMEOUT` | No | `300s` | Timeout for multipart audio uploads |
+| `LITELLM_NOTES_MAX_TOKENS` | No | `6000` | Output token budget for session notes. A model that runs out stops **mid-sentence with no error**, so this is a completeness knob — long sessions need room for every section |
+| `LITELLM_STATE_MAX_TOKENS` | No | `12000` | Output token budget for `/review-session` proposal extraction. The reply is JSON, so a truncated one is unparseable rather than merely short |
 | `AUDIO_SILENCE_TRIM` | No | `true` | Drop near-silent frames before upload to cut billed minutes |
 | `AUDIO_SILENCE_RMS_THRESHOLD` | No | `350` | Per-frame RMS (0–32767) treated as silence |
 | `AUDIO_TRANSCRIBE_SEGMENT_MINUTES` | No | `3` | Split each speaker's track into ≤ this many minutes per WAV segment (downmixed to mono) when transcribing, bounding worker and STT memory (`0` = whole track in one request) |
@@ -215,17 +217,26 @@ How it works:
    in the `state_proposals` table. Re-running extraction replaces a session's
    pending proposals (idempotent) while leaving already-approved/rejected ones
    intact.
+   - Long sessions produce long JSON, and a reply that hits the model's output
+     token limit is cut off **without any error**. Two defences keep that from
+     silently discarding a whole session's proposals: the worker asks the model
+     to continue a truncated reply (`LITELLM_STATE_MAX_TOKENS` sizes the budget),
+     and the parser salvages every fully-written proposal from JSON that still
+     ends mid-structure.
 4. **Noteworthiness gating** trims trivia before a DM is bothered: proposals
    below `EXTRACT_MIN_CONFIDENCE` (default `0.4`) are dropped, then — when
    `EXTRACT_CRITIC` is enabled (default) — a second "editor" pass (using the
    recap model) keeps only genuinely significant proposals. The critic fails
    open: an error leaves the confidence-filtered set intact rather than dropping
-   everything.
-5. A DM runs **`/review-session`** (Manage Server permission required) to step
+   everything. The notes channel is told the outcome either way — including
+   "nothing worth proposing" — so a quiet extraction is never mistaken for a
+   broken one.
+5. Anyone in the server can run **`/review-session`** to step
    through pending proposals with **Approve / Reject / Edit / Skip** buttons —
    one message, edited in place, no command spam. Each proposal shows the
    proposed change, the model's explanation, and the supporting **evidence** so
-   the DM understands *why* it was suggested.
+   the DM understands *why* it was suggested, plus its position in the queue
+   ("proposal 3 of 11").
    - **Approve** atomically applies the change and marks the proposal approved.
      It is **idempotent**: clicking Approve twice, or a retried interaction,
      never creates a duplicate entity or double-applies (a case-insensitive
@@ -235,6 +246,8 @@ How it works:
      appends the recorded deed to that PC's notes.
    - **Reject** leaves canon completely untouched.
    - **Edit** opens a modal to tweak the name/description before approving.
+   - **Skip** leaves the proposal pending and moves to the **next** one, wrapping
+     back to the top after the last.
 6. Once approved, the entry is immediately available to `/world`, `/lore`,
    `/recap`, `/prep`, `/ask` (after reindex), and future AI context — exactly
    like a hand-authored entry.

@@ -187,6 +187,41 @@ type LiteLLMConfig struct {
 	// separate from RequestTimeout since audio chunks can take longer than a
 	// chat completion.
 	UploadTimeout time.Duration `envconfig:"LITELLM_UPLOAD_TIMEOUT" default:"300s"`
+
+	// NotesMaxTokens caps session-note generation. This is a COMPLETENESS knob,
+	// not a cost knob: a long (3-4 hour) session's structured notes need room for
+	// every section, and a model that runs out of tokens stops mid-sentence with
+	// no error — the visible symptom is a recap that just cuts off. The worker
+	// also auto-continues a truncated reply, so raising this mainly saves the
+	// extra round trips.
+	NotesMaxTokens int `envconfig:"LITELLM_NOTES_MAX_TOKENS" default:"6000"`
+	// StateMaxTokens caps the post-session state-extraction reply. It must be
+	// generous because the model emits JSON: a cut-off reply isn't merely short,
+	// it's unparseable, which historically threw away EVERY proposal from a long
+	// session (so /review-session had nothing to show).
+	StateMaxTokens int `envconfig:"LITELLM_STATE_MAX_TOKENS" default:"12000"`
+}
+
+// Default token budgets, used when the configured value is unset/non-positive.
+const (
+	defaultNotesMaxTokens = 6000
+	defaultStateMaxTokens = 12000
+)
+
+// NotesTokens returns the session-notes token budget, falling back to the
+// default when unset or non-positive (a 0/negative max_tokens would be sent
+// verbatim and let the provider pick a tiny default).
+func (c LiteLLMConfig) NotesTokens() int { return positiveOr(c.NotesMaxTokens, defaultNotesMaxTokens) }
+
+// StateTokens returns the state-extraction token budget, falling back to the
+// default when unset or non-positive.
+func (c LiteLLMConfig) StateTokens() int { return positiveOr(c.StateMaxTokens, defaultStateMaxTokens) }
+
+func positiveOr(v, fallback int) int {
+	if v > 0 {
+		return v
+	}
+	return fallback
 }
 
 // Notes returns the model for session-note generation, falling back to ChatModel.

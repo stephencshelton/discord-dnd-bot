@@ -167,6 +167,18 @@ config:
     requestTimeout: "120s"
     # Larger timeout for multipart audio uploads to the transcription model.
     uploadTimeout: "300s"
+    # Output token budgets for the two long-output tasks. These are COMPLETENESS
+    # knobs, not cost knobs: a model that runs out of output tokens stops
+    # mid-sentence with no error at all.
+    #   notesMaxTokens — session notes. Too small and the writeup visibly cuts
+    #     off partway through (a 3-4 hour session needs room for every section).
+    #   stateMaxTokens — /review-session proposal extraction. Must be generous
+    #     because the reply is JSON: a truncated reply isn't just short, it's
+    #     unparseable, which discards EVERY proposal from the session.
+    # The worker also auto-continues a truncated reply and salvages the complete
+    # proposals from truncated JSON, so these mainly avoid extra round trips.
+    notesMaxTokens: 6000
+    stateMaxTokens: 12000
 
   # Recording / transcription tuning.
   audio:

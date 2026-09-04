@@ -99,10 +99,10 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 	}
 	sort.Strings(participantNames)
 
-	notes, err := w.ai.Chat(ctx, w.cfg.LiteLLM.Notes(), []litellm.Message{
+	notes, err := w.chatComplete(ctx, "notes", w.cfg.LiteLLM.Notes(), []litellm.Message{
 		{Role: "system", Content: prompts.SessionNotesSystem},
 		{Role: "user", Content: prompts.SessionNotesUser(campName, campSystem, campPremise, sessionDate, participantNames, transcript)},
-	}, 2000)
+	}, w.cfg.LiteLLM.NotesTokens())
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("chat", "error").Inc()
 		// A chat failure is usually transient. Keep the transcript either way so
@@ -340,8 +340,14 @@ func (w *Worker) notesChannel(ctx context.Context, guildID, fallback string) str
 	return fallback
 }
 
-// postNotes sends the notes, chunking to respect Discord's 2000-char limit and
-// attaching the full notes as a Markdown file for convenience.
+// postNotes posts the session notes to a channel.
+//
+// The notes are sent as normal chat messages (split on Markdown boundaries to
+// respect Discord's 2000-char limit) AND attached as a .md file. Inline messages
+// are the readable copy: Discord soft-wraps message text to the client's width,
+// whereas its inline preview of an attached text file does NOT wrap — long
+// paragraphs ran off the side and had to be scrolled. The attachment is kept for
+// copying into a campaign wiki, where unwrapped Markdown is what you want.
 func (w *Worker) postNotes(channelID, campaign, notes string) {
 	if channelID == "" {
 		w.log.Warn("no channel to post session notes")
@@ -354,19 +360,16 @@ func (w *Worker) postNotes(channelID, campaign, notes string) {
 	if err := w.sendMessage(channelID, discord.MessageCreate{Content: header}); err != nil {
 		w.log.Error("post notes header", "err", err)
 	}
-	// Attach full notes as a file (avoids message-length juggling and is nicer
-	// to copy into a campaign wiki).
-	err := w.sendMessage(channelID, discord.MessageCreate{
-		Files: []*discord.File{discord.NewFile("session-notes.md", "", bytes.NewReader([]byte(notes)))},
-	})
-	if err != nil {
-		w.log.Error("attach notes file", "err", err)
-		// Fall back to chunked inline messages.
-		for _, chunk := range chunkString(notes, 1900) {
-			if e := w.sendMessage(channelID, discord.MessageCreate{Content: chunk}); e != nil {
-				w.log.Error("post notes chunk", "err", e)
-			}
+	for _, chunk := range chunkMarkdown(notes, discordMessageLimit) {
+		if err := w.sendMessage(channelID, discord.MessageCreate{Content: chunk}); err != nil {
+			w.log.Error("post notes chunk", "err", err)
 		}
+	}
+	// Attach the full notes as a file too (nicer to archive/copy elsewhere).
+	if err := w.sendMessage(channelID, discord.MessageCreate{
+		Files: []*discord.File{discord.NewFile("session-notes.md", "", bytes.NewReader([]byte(notes)))},
+	}); err != nil {
+		w.log.Error("attach notes file", "err", err)
 	}
 }
 
@@ -387,6 +390,56 @@ func (w *Worker) notify(_ string, channelID, msg string) {
 	if err := w.sendMessage(channelID, discord.MessageCreate{Content: msg}); err != nil {
 		w.log.Error("notify", "err", err)
 	}
+}
+
+// discordMessageLimit is the largest message body we post. Discord's hard limit
+// is 2000 characters; the margin absorbs the newline joins.
+const discordMessageLimit = 1900
+
+// chunkMarkdown splits Markdown into message-sized pieces WITHOUT cutting a line
+// in half, so each posted chunk still renders as valid Markdown (a heading or
+// bullet split mid-line loses its formatting and reads as garbage). Lines are
+// packed greedily; a single line longer than size is hard-split as a last resort.
+func chunkMarkdown(s string, size int) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	if size <= 0 {
+		return []string{s}
+	}
+
+	var out []string
+	var cur strings.Builder
+	curRunes := 0
+	flush := func() {
+		if chunk := strings.TrimRight(cur.String(), "\n"); strings.TrimSpace(chunk) != "" {
+			out = append(out, chunk)
+		}
+		cur.Reset()
+		curRunes = 0
+	}
+	for _, line := range strings.Split(s, "\n") {
+		n := len([]rune(line))
+		// A pathologically long single line (no wrap opportunity) is hard-split.
+		if n > size {
+			flush()
+			out = append(out, chunkString(line, size)...)
+			continue
+		}
+		// +1 for the newline that will join this line to the current chunk.
+		if curRunes > 0 && curRunes+1+n > size {
+			flush()
+		}
+		if curRunes > 0 {
+			cur.WriteByte('\n')
+			curRunes++
+		}
+		cur.WriteString(line)
+		curRunes += n
+	}
+	flush()
+	return out
 }
 
 // chunkString splits s into pieces no longer than size runes.

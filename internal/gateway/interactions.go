@@ -79,6 +79,7 @@ func (ic *ictx) subcommand() string {
 // option reads (disgo flattens options across subcommands).
 func (ic *ictx) optString(name string) string { return ic.data.String(name) }
 func (ic *ictx) optInt(name string) int       { return ic.data.Int(name) }
+func (ic *ictx) optBool(name string) bool     { return ic.data.Bool(name) }
 
 // optChannel returns a selected channel option's ID as a string, or "".
 func (ic *ictx) optChannel(name string) string {

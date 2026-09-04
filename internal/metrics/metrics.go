@@ -123,6 +123,16 @@ var (
 		Name: "discord_dnd_bot_state_proposals_reviewed_total",
 		Help: "Campaign-state proposals reviewed by a DM, by outcome (approved|rejected).",
 	}, []string{"outcome"})
+
+	// AIResponsesTruncated counts model replies that stopped at the token limit
+	// (finish_reason=length) rather than finishing, by task (notes|extract) and
+	// whether a continuation round recovered the full text. A rising "final"
+	// count means the task's max-tokens budget is too small: notes get cut
+	// mid-sentence and extraction JSON arrives unparseable.
+	AIResponsesTruncated = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "discord_dnd_bot_ai_responses_truncated_total",
+		Help: "Model replies cut off at the token limit, by task and resolution (continued|final).",
+	}, []string{"task", "resolution"})
 )
 
 // ComponentError is a small convenience wrapper that increments ComponentErrors.

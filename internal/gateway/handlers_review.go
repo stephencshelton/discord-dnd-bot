@@ -98,7 +98,7 @@ func (g *Gateway) handleReviewSession(ctx context.Context, ic *ictx) error {
 
 	// Show the first proposal, ephemerally, with action buttons. Remaining count
 	// drives the "N more" hint so the DM knows how far they are.
-	embed, components := reviewView(proposals[0], len(proposals))
+	embed, components := reviewView(proposals[0], 0, len(proposals))
 	return ic.e.CreateMessage(discord.MessageCreate{
 		Embeds:     []discord.Embed{embed},
 		Components: components,
@@ -106,9 +106,11 @@ func (g *Gateway) handleReviewSession(ctx context.Context, ic *ictx) error {
 	})
 }
 
-// reviewView renders one proposal as an embed + action buttons. remaining is
-// how many pending proposals are left (including this one), for the footer.
-func reviewView(p db.StateProposal, remaining int) (discord.Embed, []discord.LayoutComponent) {
+// reviewView renders one proposal as an embed + action buttons. idx is the
+// proposal's zero-based position within the pending queue and total how many are
+// pending, so the footer can show "3 of 11" — without it a DM clicking Skip has
+// no way to tell they actually moved.
+func reviewView(p db.StateProposal, idx, total int) (discord.Embed, []discord.LayoutComponent) {
 	title := "🆕 New " + entityKindLabel(p.EntityKind)
 	color := 0x22c55e // green for create
 	if p.Action == db.ActionUpdateEntity {
@@ -136,7 +138,7 @@ func reviewView(p db.StateProposal, remaining int) (discord.Embed, []discord.Lay
 		fields = append(fields, discord.EmbedField{Name: "Details", Value: truncate(extra, 1000)})
 	}
 
-	footer := fmt.Sprintf("Confidence %.0f%% · %d proposal(s) pending · nothing changes until you approve", p.Confidence*100, remaining)
+	footer := fmt.Sprintf("Confidence %.0f%% · proposal %d of %d pending · nothing changes until you approve", p.Confidence*100, idx+1, total)
 	embed := discord.Embed{
 		Title:       title,
 		Description: fmt.Sprintf("Proposed change to **%s**", p.EntityName),
@@ -294,7 +296,11 @@ func (g *Gateway) handleReviewButton(ctx context.Context, e *events.ComponentInt
 		return g.advanceReviewForCampaign(ctx, e, prop.CampaignID, msg)
 
 	case reviewSkip:
-		return g.advanceReviewForCampaign(ctx, e, prop.CampaignID, fmt.Sprintf("⏭️ Skipped **%s** (still pending).", prop.EntityName))
+		// Skip leaves the proposal PENDING, so we must explicitly move to the one
+		// AFTER it — re-rendering "the first pending proposal" would just show the
+		// same card again and look like the button did nothing.
+		return g.advanceReviewAfter(ctx, e, prop.CampaignID, proposalID,
+			fmt.Sprintf("⏭️ Skipped **%s** (still pending).", prop.EntityName))
 
 	default:
 		return fmt.Errorf("unknown review verb %q", verb)
@@ -303,22 +309,60 @@ func (g *Gateway) handleReviewButton(ctx context.Context, e *events.ComponentInt
 
 // advanceReviewForCampaign re-queries the campaign's remaining pending proposals
 // and edits the ephemeral message to show the next one (or a done note),
-// prefixing the given status line.
+// prefixing the given status line. Used after a proposal has been DECIDED
+// (approved/rejected), so it has dropped out of the pending list and the head of
+// that list is genuinely the next thing to review.
 func (g *Gateway) advanceReviewForCampaign(ctx context.Context, e *events.ComponentInteractionCreate, campaignID uuid.UUID, status string) error {
 	proposals, err := g.store.ListPendingProposalsForCampaign(ctx, campaignID)
 	if err != nil {
 		return err
 	}
-	return g.renderAdvance(e, proposals, status)
+	return g.renderAdvance(e, proposals, 0, status)
+}
+
+// advanceReviewAfter shows the pending proposal that FOLLOWS afterID in the
+// stable review order, wrapping around to the first when afterID is last. This
+// is the Skip path: the skipped proposal stays pending, so position — not the
+// pending set — is what changes.
+func (g *Gateway) advanceReviewAfter(ctx context.Context, e *events.ComponentInteractionCreate, campaignID, afterID uuid.UUID, status string) error {
+	proposals, err := g.store.ListPendingProposalsForCampaign(ctx, campaignID)
+	if err != nil {
+		return err
+	}
+	next, wrapped := nextPendingIndex(proposals, afterID)
+	switch {
+	case len(proposals) == 1 && next == 0:
+		status += " It's the only proposal still pending, so here it is again — approve or reject it to clear the queue."
+	case wrapped:
+		status += " That was the last one — back to the top of the queue."
+	}
+	return g.renderAdvance(e, proposals, next, status)
+}
+
+// nextPendingIndex returns the index of the proposal after afterID in ps,
+// wrapping to 0 past the end. wrapped reports whether it wrapped. If afterID
+// isn't in ps (it was decided elsewhere, or vanished), the head is returned —
+// the list has already advanced on its own in that case.
+func nextPendingIndex(ps []db.StateProposal, afterID uuid.UUID) (idx int, wrapped bool) {
+	for i, p := range ps {
+		if p.ID != afterID {
+			continue
+		}
+		if i+1 < len(ps) {
+			return i + 1, false
+		}
+		return 0, len(ps) > 1
+	}
+	return 0, false
 }
 
 // advanceReview is used when we couldn't resolve the campaign (proposal gone);
 // it just clears the message with a status note.
 func (g *Gateway) advanceReview(_ context.Context, e *events.ComponentInteractionCreate, _ uuid.UUID, status string) error {
-	return g.renderAdvance(e, nil, status)
+	return g.renderAdvance(e, nil, 0, status)
 }
 
-func (g *Gateway) renderAdvance(e *events.ComponentInteractionCreate, proposals []db.StateProposal, status string) error {
+func (g *Gateway) renderAdvance(e *events.ComponentInteractionCreate, proposals []db.StateProposal, idx int, status string) error {
 	if len(proposals) == 0 {
 		content := status + "\n\n🎉 All caught up — no more pending proposals."
 		return e.UpdateMessage(discord.MessageUpdate{
@@ -327,7 +371,10 @@ func (g *Gateway) renderAdvance(e *events.ComponentInteractionCreate, proposals 
 			Components: &[]discord.LayoutComponent{},
 		})
 	}
-	embed, components := reviewView(proposals[0], len(proposals))
+	if idx < 0 || idx >= len(proposals) {
+		idx = 0
+	}
+	embed, components := reviewView(proposals[idx], idx, len(proposals))
 	return e.UpdateMessage(discord.MessageUpdate{
 		Content:    &status,
 		Embeds:     &[]discord.Embed{embed},
@@ -433,17 +480,24 @@ func (g *Gateway) handleReviewModalSubmit(ctx context.Context, e *events.ModalSu
 		return
 	}
 
-	// Re-show the (now edited) proposal so the DM can approve it.
+	// Re-show the (now edited) proposal so the DM can approve it, keeping its
+	// position in the pending queue so the footer stays accurate.
 	prop, err := g.store.GetStateProposal(ctx, proposalID)
 	if err != nil {
 		_ = e.CreateMessage(discord.MessageCreate{Content: "Saved your edit. Run `/review-session` to continue.", Flags: discord.MessageFlagEphemeral})
 		return
 	}
-	remaining := 1
-	if n, cerr := g.store.CountPendingProposalsForCampaign(ctx, prop.CampaignID); cerr == nil && n > 0 {
-		remaining = n
+	idx, total := 0, 1
+	if pending, lerr := g.store.ListPendingProposalsForCampaign(ctx, prop.CampaignID); lerr == nil && len(pending) > 0 {
+		total = len(pending)
+		for i, p := range pending {
+			if p.ID == proposalID {
+				idx = i
+				break
+			}
+		}
 	}
-	embed, components := reviewView(*prop, remaining)
+	embed, components := reviewView(*prop, idx, total)
 	_ = e.CreateMessage(discord.MessageCreate{
 		Content:    "✏️ Saved your edit — review it below.",
 		Embeds:     []discord.Embed{embed},

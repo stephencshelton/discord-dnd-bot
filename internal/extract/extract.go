@@ -81,6 +81,9 @@ type entityKey struct {
 // Behavior:
 //   - Tolerates surrounding prose / code fences by slicing to the outer-most
 //     JSON object (some models wrap JSON despite instructions).
+//   - Salvages output that was CUT OFF at the model's token limit by keeping the
+//     proposals that were fully written (see repairTruncatedJSON) — otherwise a
+//     long session's whole extraction is lost to one missing brace.
 //   - Rejects malformed JSON with an error (the caller treats extraction as
 //     best-effort and logs/metrics the failure without failing the session).
 //   - Drops individual proposals that are invalid (unknown action/kind, no
@@ -99,7 +102,14 @@ type entityKey struct {
 func Parse(raw string, campaignID uuid.UUID, sessionID *uuid.UUID, existing []ExistingEntity, characters []ExistingCharacter) ([]db.StateProposal, error) {
 	body, err := extractJSONObject(raw)
 	if err != nil {
-		return nil, err
+		// The most common failure by far is a reply that ran out of output tokens
+		// mid-JSON. Salvage the complete proposals it did contain instead of
+		// throwing away the whole session's extraction.
+		repaired, ok := repairTruncatedJSON(raw)
+		if !ok {
+			return nil, err
+		}
+		body = repaired
 	}
 	var res rawResult
 	dec := json.NewDecoder(strings.NewReader(body))
@@ -306,4 +316,72 @@ func extractJSONObject(s string) (string, error) {
 		}
 	}
 	return "", ErrNoJSON
+}
+
+// repairTruncatedJSON salvages JSON that was cut off mid-generation (the model
+// hit its output token limit), which is otherwise a total loss: extractJSONObject
+// never finds a matching '}', so a long session's ENTIRE proposal list is
+// discarded even though the first N proposals arrived complete and intact.
+//
+// It rewinds to the last point where a nested value finished — i.e. the end of
+// the last fully-written proposal object — then closes the containers that are
+// still open. The result is valid JSON holding every complete element. ok is
+// false when nothing can be salvaged: no JSON at all, no complete nested value
+// yet, or input that was already balanced (nothing to repair).
+func repairTruncatedJSON(s string) (string, bool) {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return "", false
+	}
+
+	var open []byte // stack of currently-open '{' / '[' delimiters
+	var cut int     // index just past the last completed nested value
+	var cutOpen []byte
+	inString, escaped := false, false
+
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			open = append(open, c)
+		case '}', ']':
+			if len(open) == 0 {
+				return "", false // malformed, not merely truncated
+			}
+			open = open[:len(open)-1]
+			if len(open) == 0 {
+				return "", false // the outer object closed: not truncated
+			}
+			// A nested value just completed and is safely quotable as a cut point.
+			cut = i + 1
+			cutOpen = append(cutOpen[:0], open...)
+		}
+	}
+	if len(open) == 0 || cut == 0 {
+		return "", false
+	}
+
+	var b strings.Builder
+	b.WriteString(s[start:cut])
+	for i := len(cutOpen) - 1; i >= 0; i-- {
+		if cutOpen[i] == '{' {
+			b.WriteByte('}')
+		} else {
+			b.WriteByte(']')
+		}
+	}
+	return b.String(), true
 }

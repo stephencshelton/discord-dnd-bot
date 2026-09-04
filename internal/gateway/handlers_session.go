@@ -200,14 +200,23 @@ func (g *Gateway) sessionList(ctx context.Context, ic *ictx, guildID string) err
 	if status == "failed" || status == "processing" {
 		b.WriteString("\nRe-run one with `/session requeue session_id:<id>`.")
 	}
+	if status == "complete" {
+		b.WriteString("\nMissing `/review-session` proposals for one? Re-derive them from its saved transcript with " +
+			"`/session requeue session_id:<id> proposals_only:true` (no re-transcription).")
+	}
 	return ic.reply(b.String(), true)
 }
 
-// sessionRequeue re-enqueues the transcribe+notes job for an existing session,
-// letting anyone recover a recording whose worker job failed or was lost
-// (e.g. a crash before automatic retries were added, or after retries were
-// exhausted). The audio chunks still live in object storage, so reprocessing
-// rebuilds the transcript and notes from scratch.
+// sessionRequeue re-enqueues work for an existing session, letting anyone
+// recover a recording whose worker job failed or was lost (e.g. a crash before
+// automatic retries were added, or after retries were exhausted). The audio
+// chunks still live in object storage, so reprocessing rebuilds the transcript
+// and notes from scratch.
+//
+// With proposals_only it re-runs just the campaign-state extraction step, which
+// is the cheap recovery when the transcript and notes are fine but
+// /review-session has nothing to show (e.g. the extraction step failed). A full
+// requeue would re-transcribe hours of audio to reach the same place.
 func (g *Gateway) sessionRequeue(ctx context.Context, ic *ictx, guildID string) error {
 	log := logging.FromContext(ctx, g.log)
 
@@ -231,6 +240,26 @@ func (g *Gateway) sessionRequeue(ctx context.Context, ic *ictx, guildID string) 
 	// transcribe yet — don't let a requeue race the live recorder.
 	if sess.Status == "recording" {
 		return ic.reply("That session is still recording. Stop it with `/session stop` first.", true)
+	}
+
+	if ic.optBool("proposals_only") {
+		// Extraction needs both a transcript and notes; without them only a full
+		// requeue can help, so say that instead of enqueueing a doomed job.
+		if strings.TrimSpace(sess.Transcript) == "" || strings.TrimSpace(sess.Notes) == "" {
+			return ic.reply("That session has no transcript/notes yet, so there's nothing to derive proposals from. Re-run it without `proposals_only` first.", true)
+		}
+		if err := g.queue.Enqueue(ctx, queue.JobExtractState, queue.ExtractStatePayload{
+			SessionID: sess.ID.String(),
+			GuildID:   guildID,
+			Notify:    true,
+		}); err != nil {
+			return err
+		}
+		metrics.JobsEnqueued.WithLabelValues(string(queue.JobExtractState)).Inc()
+		log.Info("session state-extraction requeued", "session", sess.ID, "user", ic.userID())
+		return ic.reply(fmt.Sprintf(
+			"🧭 Re-deriving world-state proposals for session `%s` from the saved transcript (transcript and notes are untouched). I'll post when they're ready, then run `/review-session`.",
+			sess.ID), true)
 	}
 
 	// Move it back to processing so `/session list` reflects the retry and a

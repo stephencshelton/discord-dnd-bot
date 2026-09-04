@@ -60,6 +60,12 @@ data:
   LITELLM_EMBED_DIM: {{ .Values.config.litellm.embedDim | quote }}
   LITELLM_REQUEST_TIMEOUT: {{ .Values.config.litellm.requestTimeout | quote }}
   LITELLM_UPLOAD_TIMEOUT: {{ .Values.config.litellm.uploadTimeout | quote }}
+  {{- with .Values.config.litellm.notesMaxTokens }}
+  LITELLM_NOTES_MAX_TOKENS: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.litellm.stateMaxTokens }}
+  LITELLM_STATE_MAX_TOKENS: {{ . | quote }}
+  {{- end }}
 
   AUDIO_SILENCE_TRIM: {{ .Values.config.audio.silenceTrim | quote }}
   AUDIO_SILENCE_RMS_THRESHOLD: {{ .Values.config.audio.silenceRMSThreshold | quote }}
