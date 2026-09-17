@@ -64,29 +64,56 @@ func LoreUser(campaignName, system, premise, question string) string {
 	return ctx + "\n\nRequest: " + question
 }
 
-// RecapSystem constrains /recap to the record. It exists because /recap used to
-// run under LoreSystem, which tells the model to be creative and to invent NPCs,
-// locations and plot hooks — the opposite of what a recap is for. The output is
-// rendered as "Previously, on <campaign>..." and read aloud at the table as the
-// canonical account of last session, so anything invented here enters the
-// group's shared memory as something that happened (AGENTS.md §8: no command
-// invents campaign facts that are not in the record).
+// RecapSystem constrains /recap to the record, and to FACTS the players can act
+// on. Two failure modes have hit this command, in opposite directions:
+//
+//  1. It ran under LoreSystem, the creative worldbuilding prompt, which invites
+//     the model to invent NPCs, locations and plot hooks. Output here is read
+//     aloud at the table as the canonical account of last session, so anything
+//     invented enters the group's shared memory as something that happened
+//     (AGENTS.md §8: no command invents campaign facts not in the record).
+//  2. Told merely not to invent, but still cast as a "storyteller" allowed to
+//     "dramatize the telling", it produced atmospheric prose with almost no
+//     usable detail — which is a failed recap even though every sentence was
+//     technically grounded.
+//
+// So the wording below is deliberately blunt about recall over narration, and
+// explicitly bans the flourish vocabulary. A player should finish it knowing who
+// they are dealing with and what is owed, not having been entertained. The tight
+// word bound is part of the mechanism: it forces the budget onto facts rather
+// than framing. PrepSystem is the house style this follows.
 //
 // The length bound lives here, not in RecapUser, so the model is given one
 // number rather than two conflicting ones.
-const RecapSystem = `You are the campaign's storyteller, writing a "Previously, on..." recap.
-Work ONLY from the session notes provided. You may dramatize the telling — pacing, tone, emphasis,
-in-genre voice — but never invent events, names, places, or outcomes that are not in the notes.
-If the notes are sparse, write a shorter recap rather than filling the gaps.
-Keep it under 150 words.`
+const RecapSystem = `You are the campaign's record-keeper, briefing the players before a session.
 
-// RecapUser asks for a short "previously on" recap from prior session notes.
-// The no-invention rule and the length bound live in RecapSystem.
+Your job is RECALL, not storytelling. The players need to remember what is going on so they can
+pick up where they left off. Work ONLY from the session notes provided; never invent events, names,
+places, or outcomes. If the notes are thin, say less.
+
+Open with one short line on where the party is and what they were in the middle of. Then give
+short bullets covering ONLY what still matters going into the next session:
+- unresolved threads and open questions
+- decisions the party made, and what they committed to
+- who they are dealing with and where they stand with them
+- anything owed, promised, threatened, or time-sensitive
+
+Name names and give specifics: "Kessa will open the vault at dawn if they bring the seal" — not
+"an uneasy alliance was struck". Skip anything already resolved. Skip scene-setting, mood,
+atmosphere, and recaps of combat blow-by-blow.
+
+Plain, direct language. No dramatic narration, no flourishes, no rhetorical questions, no
+cliffhanger framing. Under 120 words.`
+
+// RecapUser asks for a pre-session brief from prior session notes. The framing,
+// the no-invention rule and the length bound all live in RecapSystem — asking
+// for a "dramatic" recap here is what previously pulled the output back toward
+// prose even after the system prompt was tightened.
 func RecapUser(campaignName string, priorNotes []string) string {
 	var b strings.Builder
-	b.WriteString("Write a dramatic \"Previously, on ")
+	b.WriteString("Brief the players for the next session of ")
 	b.WriteString(nonEmpty(campaignName, "our campaign"))
-	b.WriteString("...\" recap from these prior session notes, newest last:\n\n")
+	b.WriteString(", from these prior session notes, newest last:\n\n")
 	for i, n := range priorNotes {
 		fmt.Fprintf(&b, "--- Session %d ---\n%s\n\n", i+1, n)
 	}
