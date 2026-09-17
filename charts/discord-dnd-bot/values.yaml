@@ -164,6 +164,11 @@ config:
     #   1024  Amazon Titan Embed Text v2  <-- matches embedModel above
     # Changing this after data exists requires re-embedding (drop rows / re-run).
     embedDim: 1024
+    # Per-request timeout for AI calls. It also sizes how long a deferred
+    # command (/prep, /recap, /lore, /ask) and the @mention chat reply may wait
+    # on the model: that budget is this value plus 30s of slack, so raising this
+    # raises both. Discord allows ~15 minutes to follow up on a deferred
+    # command, so there is room here if a slow model needs it.
     requestTimeout: "120s"
     # Larger timeout for multipart audio uploads to the transcription model.
     uploadTimeout: "300s"

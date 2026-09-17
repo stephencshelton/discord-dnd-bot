@@ -118,7 +118,7 @@ Configuration is loaded from environment variables. The same configuration is us
 | `LITELLM_IMAGE_MODEL` | No | `dnd-image` | LiteLLM image route |
 | `LITELLM_EMBED_MODEL` | No | `dnd-embed` | LiteLLM embeddings route (grounded `/ask` retrieval) |
 | `LITELLM_EMBED_DIM` | No | `1536` | Embedding vector dimensionality; must match the embed model (sizes the pgvector column) |
-| `LITELLM_REQUEST_TIMEOUT` | No | `120s` | AI request timeout |
+| `LITELLM_REQUEST_TIMEOUT` | No | `120s` | AI request timeout. Also sizes how long a deferred command (`/prep`, `/recap`, `/lore`, `/ask`) and the `@mention` chat reply may wait on the model — that budget is this value plus 30s of slack |
 | `LITELLM_UPLOAD_TIMEOUT` | No | `300s` | Timeout for multipart audio uploads |
 | `LITELLM_NOTES_MAX_TOKENS` | No | `6000` | Output token budget for session notes. A model that runs out stops **mid-sentence with no error**, so these are completeness knobs — long sessions need room for every section |
 | `LITELLM_STATE_MAX_TOKENS` | No | `12000` | Budget for `/review-session` proposal extraction. The reply is JSON, so a truncated one is unparseable rather than merely short |

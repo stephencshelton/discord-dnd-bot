@@ -27,9 +27,12 @@ func (g *Gateway) handleLore(ctx context.Context, ic *ictx) error {
 	}
 	prompt := ic.optString("prompt")
 
-	if err := ic.ack(false); err != nil {
+	// ackLong, not ack: the model call can outlast interactionTimeout.
+	ctx, cancel, err := ic.ackLong(ctx, false, g.deferredTimeout())
+	if err != nil {
 		return err
 	}
+	defer cancel()
 	msgs := []litellm.Message{
 		{Role: "system", Content: prompts.LoreSystem},
 		{Role: "user", Content: prompts.LoreUser(camp.Name, camp.System, camp.Premise, prompt)},
@@ -58,9 +61,12 @@ func (g *Gateway) handleRecap(ctx context.Context, ic *ictx) error {
 	if len(notes) == 0 {
 		return ic.reply("No completed sessions yet — record one with `/session start`.", true)
 	}
-	if err := ic.ack(false); err != nil {
+	// ackLong, not ack: the model call can outlast interactionTimeout.
+	ctx, cancel, err := ic.ackLong(ctx, false, g.deferredTimeout())
+	if err != nil {
 		return err
 	}
+	defer cancel()
 	msgs := []litellm.Message{
 		{Role: "system", Content: prompts.LoreSystem},
 		{Role: "user", Content: prompts.RecapUser(camp.Name, notes)},
@@ -99,9 +105,12 @@ func (g *Gateway) handleAsk(ctx context.Context, ic *ictx) error {
 		return ic.reply("I don't have anything indexed for this campaign yet. Record a session with `/session start`, or add NPCs/locations/characters with `/world add` and `/character add`, then try `/ask` again.", true)
 	}
 
-	if err := ic.ack(false); err != nil {
+	// ackLong, not ack: the model call can outlast interactionTimeout.
+	ctx, cancel, err := ic.ackLong(ctx, false, g.deferredTimeout())
+	if err != nil {
 		return err
 	}
+	defer cancel()
 
 	// 1) Embed the question with the same route used to embed notes.
 	qvecs, err := g.ai.Embed(ctx, g.cfg.LiteLLM.EmbedModel, []string{question})
@@ -158,9 +167,12 @@ func (g *Gateway) handlePrep(ctx context.Context, ic *ictx) error {
 		return ic.reply(err.Error(), true)
 	}
 
-	if err := ic.ack(false); err != nil {
+	// ackLong, not ack: the model call can outlast interactionTimeout.
+	ctx, cancel, err := ic.ackLong(ctx, false, g.deferredTimeout())
+	if err != nil {
 		return err
 	}
+	defer cancel()
 
 	// Most recent completed session (for "where we left off").
 	lastNotes, lastDate := "", ""
