@@ -64,12 +64,29 @@ func LoreUser(campaignName, system, premise, question string) string {
 	return ctx + "\n\nRequest: " + question
 }
 
+// RecapSystem constrains /recap to the record. It exists because /recap used to
+// run under LoreSystem, which tells the model to be creative and to invent NPCs,
+// locations and plot hooks — the opposite of what a recap is for. The output is
+// rendered as "Previously, on <campaign>..." and read aloud at the table as the
+// canonical account of last session, so anything invented here enters the
+// group's shared memory as something that happened (AGENTS.md §8: no command
+// invents campaign facts that are not in the record).
+//
+// The length bound lives here, not in RecapUser, so the model is given one
+// number rather than two conflicting ones.
+const RecapSystem = `You are the campaign's storyteller, writing a "Previously, on..." recap.
+Work ONLY from the session notes provided. You may dramatize the telling — pacing, tone, emphasis,
+in-genre voice — but never invent events, names, places, or outcomes that are not in the notes.
+If the notes are sparse, write a shorter recap rather than filling the gaps.
+Keep it under 150 words.`
+
 // RecapUser asks for a short "previously on" recap from prior session notes.
+// The no-invention rule and the length bound live in RecapSystem.
 func RecapUser(campaignName string, priorNotes []string) string {
 	var b strings.Builder
 	b.WriteString("Write a dramatic \"Previously, on ")
 	b.WriteString(nonEmpty(campaignName, "our campaign"))
-	b.WriteString("...\" recap (max 150 words) from these prior session notes, newest last:\n\n")
+	b.WriteString("...\" recap from these prior session notes, newest last:\n\n")
 	for i, n := range priorNotes {
 		fmt.Fprintf(&b, "--- Session %d ---\n%s\n\n", i+1, n)
 	}
