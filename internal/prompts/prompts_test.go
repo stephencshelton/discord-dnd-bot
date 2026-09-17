@@ -85,6 +85,37 @@ func TestRecapUserDefaultName(t *testing.T) {
 	}
 }
 
+// TestRecapSystemForbidsInvention protects the rule that /recap restates the
+// record rather than extending it. /recap previously ran under LoreSystem, which
+// instructs the model to invent NPCs, locations and plot hooks; its output is
+// read aloud at the table as the canonical account of last session, so anything
+// invented there becomes campaign fact (AGENTS.md §8).
+func TestRecapSystemForbidsInvention(t *testing.T) {
+	sys := strings.ToLower(RecapSystem)
+	for _, want := range []string{
+		"only from the session notes",
+		"never invent",
+		"shorter recap", // sparse notes produce less, not filler
+	} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("recap system prompt missing grounding rule mentioning %q", want)
+		}
+	}
+}
+
+// TestRecapLengthBoundStatedOnce guards against the conflicting-instruction bug
+// this replaced: LoreSystem said "under 250 words" while RecapUser said "max 150
+// words", so the model was handed two different limits in one request. The bound
+// belongs in the system prompt only.
+func TestRecapLengthBoundStatedOnce(t *testing.T) {
+	if !strings.Contains(RecapSystem, "150 words") {
+		t.Error("RecapSystem should carry the length bound")
+	}
+	if strings.Contains(RecapUser("Descent", []string{"a note"}), "words") {
+		t.Error("RecapUser should not restate a word limit; it belongs in RecapSystem")
+	}
+}
+
 func TestArtPromptStyleSwitch(t *testing.T) {
 	cases := []struct {
 		name       string

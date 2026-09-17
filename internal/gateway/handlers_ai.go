@@ -68,7 +68,7 @@ func (g *Gateway) handleRecap(ctx context.Context, ic *ictx) error {
 	}
 	defer cancel()
 	msgs := []litellm.Message{
-		{Role: "system", Content: prompts.LoreSystem},
+		{Role: "system", Content: prompts.RecapSystem},
 		{Role: "user", Content: prompts.RecapUser(camp.Name, notes)},
 	}
 	recap, truncated, err := g.chat(ctx, "recap", g.cfg.LiteLLM.Recap(), msgs, g.cfg.LiteLLM.RecapTokens())
