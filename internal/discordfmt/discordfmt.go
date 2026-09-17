@@ -143,38 +143,54 @@ func ChunkMarkdown(s string, size int) []string {
 //
 // Unlike Truncate this DISCARDS NOTHING — it is for content that must be shown in
 // full across several messages.
+// Every index below is a RUNE index into r. Mixing the two kinds of index is
+// what broke this before: the break position came from strings.LastIndexAny (a
+// BYTE offset) and was then used to slice a []rune. On any multibyte input — an
+// em-dash or a curly quote, which AI prose is full of — the byte offset runs
+// ahead of the rune count, so the slice read past the end of the window into the
+// rune slice's spare capacity. Go permits that (s[:n] is legal up to cap), so it
+// did not panic reliably; it emitted NUL runes, dropped input, and returned
+// pieces LONGER than size — which Discord then rejected with 50035, the exact
+// failure this package exists to prevent.
 func SplitWords(s string, size int) []string {
 	if size <= 0 {
 		return []string{s}
 	}
-	if len([]rune(s)) <= size {
+	r := []rune(s)
+	if len(r) <= size {
 		return []string{s}
 	}
 
 	var out []string
-	rest := s
-	for len([]rune(rest)) > size {
-		r := []rune(rest)
-		window := string(r[:size])
-
+	for len(r) > size {
 		// Break at the last whitespace in the window. Refuse to rewind past the
 		// halfway mark, or a line of mostly-unbreakable text would produce lots of
 		// tiny pieces.
-		cut := strings.LastIndexAny(window, " \t")
+		cut := -1
+		for i := size - 1; i >= 0; i-- {
+			if r[i] == ' ' || r[i] == '\t' {
+				cut = i
+				break
+			}
+		}
 		if cut < size/2 {
 			cut = -1
 		}
 		if cut < 0 {
 			// No usable break: hard-split this piece.
-			out = append(out, window)
-			rest = string(r[size:])
+			out = append(out, string(r[:size]))
+			r = r[size:]
 			continue
 		}
-		out = append(out, strings.TrimRight(string([]rune(window)[:cut]), " \t"))
+		out = append(out, strings.TrimRight(string(r[:cut]), " \t"))
 		// Skip the whitespace we broke on.
-		rest = strings.TrimLeft(string(r[cut:]), " \t")
+		skip := cut
+		for skip < len(r) && (r[skip] == ' ' || r[skip] == '\t') {
+			skip++
+		}
+		r = r[skip:]
 	}
-	if strings.TrimSpace(rest) != "" {
+	if rest := string(r); strings.TrimSpace(rest) != "" {
 		out = append(out, rest)
 	}
 	return out

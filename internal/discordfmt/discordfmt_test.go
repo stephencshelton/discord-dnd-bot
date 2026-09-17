@@ -191,3 +191,71 @@ func TestLimitsMatchDiscord(t *testing.T) {
 		t.Errorf("ChunkLimit (%d) must be below MessageLimit (%d)", ChunkLimit, MessageLimit)
 	}
 }
+
+// TestSplitWordsMultibyteHoldsInvariants is the regression test for the byte-vs-rune
+// index confusion in SplitWords. The break position came from strings.LastIndexAny
+// (a BYTE offset) and was used to slice a []rune, so on multibyte input the slice
+// ran past the end of the window into spare capacity: output gained NUL runes, lost
+// input, and exceeded the requested size — which Discord rejects with 50035.
+//
+// Em-dashes are the realistic trigger (AI-written session notes are full of them),
+// so the input here is shaped like a notes paragraph rather than a synthetic string.
+func TestSplitWordsMultibyteHoldsInvariants(t *testing.T) {
+	const size = 200
+	for _, reps := range []int{4, 5, 6, 7, 11, 17, 23, 40} {
+		para := strings.Repeat("the party pressed on — through the mist — toward the keep ", reps)
+		parts := SplitWords(para, size)
+
+		var rejoined strings.Builder
+		for i, p := range parts {
+			if strings.ContainsRune(p, '\x00') {
+				t.Errorf("reps=%d part %d contains NUL runes (read past end of window): %q", reps, i, p)
+			}
+			if n := len([]rune(p)); n > size {
+				t.Errorf("reps=%d part %d is %d runes, over the requested %d", reps, i, n, size)
+			}
+			rejoined.WriteString(p)
+		}
+
+		// SplitWords documents that it DISCARDS NOTHING. Whitespace is the only
+		// thing it may drop (it breaks on it), so compare with spaces removed.
+		strip := func(s string) string { return strings.Join(strings.Fields(s), "") }
+		if got, want := strip(rejoined.String()), strip(para); got != want {
+			t.Errorf("reps=%d: content was lost or altered (%d runes out vs %d in)",
+				reps, len([]rune(got)), len([]rune(want)))
+		}
+	}
+}
+
+// TestChunkMarkdownMultibyteStaysUnderLimit protects the production path: a single
+// long prose line (a session-notes section, or a description that approved proposals
+// kept appending to) goes through ChunkMarkdown -> SplitWords. Every chunk must fit
+// in a Discord message, or the whole reply is rejected and the user sees nothing.
+func TestChunkMarkdownMultibyteStaysUnderLimit(t *testing.T) {
+	para := strings.Repeat("the party pressed on — through the mist — toward the keep ", 60)
+	for _, chunk := range ChunkMarkdown(para, ChunkLimit) {
+		if n := len([]rune(chunk)); n > ChunkLimit {
+			t.Errorf("chunk is %d runes, over ChunkLimit %d", n, ChunkLimit)
+		}
+		if n := len([]rune(chunk)); n > MessageLimit {
+			t.Errorf("chunk is %d runes, over Discord's MessageLimit %d", n, MessageLimit)
+		}
+		if strings.ContainsRune(chunk, '\x00') {
+			t.Errorf("chunk contains NUL runes: %q", chunk)
+		}
+	}
+}
+
+// TestSplitWordsBreaksOnWordBoundaryMultibyte pins the actual point of the helper —
+// words stay intact — for non-ASCII text, not just the ASCII covered elsewhere.
+func TestSplitWordsBreaksOnWordBoundaryMultibyte(t *testing.T) {
+	s := "Sørina të Ravenhollow — archivist of the Ashen Choir — guards the sealed vault beneath Kaer Móran."
+	for _, p := range SplitWords(s, 30) {
+		if strings.HasPrefix(p, " ") || strings.HasSuffix(p, " ") {
+			t.Errorf("piece has stray edge whitespace: %q", p)
+		}
+		if n := len([]rune(p)); n > 30 {
+			t.Errorf("piece is %d runes, over 30: %q", n, p)
+		}
+	}
+}
