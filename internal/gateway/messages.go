@@ -46,7 +46,10 @@ func (g *Gateway) handleMessageCreate(e *events.MessageCreate) {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), interactionTimeout)
+	// A plain message (@mention or DM) has no interaction-response window to
+	// protect, and this path ends in a chat completion, so it gets the same
+	// budget as a deferred command rather than interactionTimeout.
+	ctx, cancel := context.WithTimeout(context.Background(), g.deferredTimeout())
 	defer cancel()
 
 	isDM := e.GuildID == nil

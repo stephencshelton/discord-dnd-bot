@@ -138,10 +138,14 @@ func (g *Gateway) campaignDelete(ctx context.Context, ic *ictx, guildID string) 
 				"Re-run with `confirm` set to the exact campaign name (`%s`) to proceed.", c.Name, c.Name), true)
 	}
 
-	// Purging audio from S3 can take a moment; ack first (ephemeral).
-	if err := ic.ack(true); err != nil {
+	// Purging audio from S3 can take a while — every session's chunks — so ack
+	// first (ephemeral) and work under the purge budget, not interactionTimeout:
+	// stopping partway leaves orphaned objects behind.
+	ctx, cancel, err := ic.ackLong(ctx, true, deferredPurgeTimeout)
+	if err != nil {
 		return err
 	}
+	defer cancel()
 
 	// 1) Purge raw audio chunks from object storage (not covered by DB cascade).
 	prefixes, perr := g.store.ListSessionChunkPrefixes(ctx, c.ID)

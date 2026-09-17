@@ -44,10 +44,13 @@ func (g *Gateway) sessionStart(ctx context.Context, ic *ictx, guildID string) er
 	// Ack immediately (ephemeral) BEFORE any slow work. Joining voice can take
 	// many seconds (DAVE/UDP handshake), which blows Discord's 3s interaction
 	// window and yields "Unknown interaction" (10062) if we reply late. With a
-	// deferred ack we have ~15 minutes to follow up with the real result.
-	if err := ic.ack(true); err != nil {
+	// deferred ack we have ~15 minutes to follow up with the real result, so the
+	// handshake gets a budget that matches it rather than interactionTimeout.
+	ctx, cancel, err := ic.ackLong(ctx, true, deferredVoiceTimeout)
+	if err != nil {
 		return err
 	}
+	defer cancel()
 
 	// Reject if already recording. A non-not-found error means the DB is
 	// unreachable — surface it rather than silently starting a second session.
@@ -103,10 +106,14 @@ func (g *Gateway) sessionStop(ctx context.Context, ic *ictx, guildID string) err
 	log := logging.FromContext(ctx, g.log)
 
 	// Ack immediately (ephemeral) before the slow finalize/flush work so we
-	// never miss Discord's 3s window (see sessionStart).
-	if err := ic.ack(true); err != nil {
+	// never miss Discord's 3s window (see sessionStart). Closing the connection
+	// and flushing the tail chunk spends >10s in fixed waits alone, so it needs
+	// the longer post-defer budget.
+	ctx, cancel, err := ic.ackLong(ctx, true, deferredVoiceTimeout)
+	if err != nil {
 		return err
 	}
+	defer cancel()
 
 	sess, err := g.store.GetActiveSession(ctx, guildID)
 	if errors.Is(err, db.ErrNotFound) {

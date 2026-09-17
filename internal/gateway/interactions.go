@@ -15,8 +15,54 @@ import (
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 )
 
-// interactionTimeout bounds any single interaction handler.
+// interactionTimeout bounds an interaction handler up to the point it answers
+// Discord. It exists to protect Discord's 3-second initial-response window: a
+// handler that can't finish that fast must defer first (see ictx.ack) rather
+// than run past it.
 const interactionTimeout = 15 * time.Second
+
+// Budgets for work that continues AFTER a handler has deferred. Discord allows
+// ~15 minutes to follow up on a deferred interaction, so the 3s window is no
+// longer the constraint; each budget is sized to the slow dependency it waits
+// on, and all stay well inside that window.
+const (
+	// deferredSlack is the headroom an AI handler gets on top of the litellm
+	// client's per-request timeout, covering the DB reads, embedding lookups,
+	// and the final followup edit that bracket the model call.
+	deferredSlack = 30 * time.Second
+
+	// deferredVoiceTimeout bounds /session start and /session stop. Joining a
+	// channel negotiates DAVE and a UDP socket, and stopping spends up to 5s
+	// waiting for the checkpoint loop plus 5s closing the connection before it
+	// flushes the tail chunk to object storage — over 10s of fixed waits before
+	// any real work, which the 15s bound could not cover.
+	deferredVoiceTimeout = 90 * time.Second
+
+	// deferredPurgeTimeout bounds /campaign delete, which lists and deletes the
+	// audio chunks of every session in the campaign (batched 1000 keys per S3
+	// call) before touching the DB. It gets the widest budget because giving up
+	// partway leaves orphaned audio the operator has to clean up by hand.
+	deferredPurgeTimeout = 5 * time.Minute
+)
+
+// deferredTimeout is how long a handler may keep working AFTER it has deferred.
+// Discord allows ~15 minutes to follow up on a deferred interaction, so the 3s
+// window no longer constrains us and the real bound is the AI call itself.
+// Sizing this just above LITELLM_REQUEST_TIMEOUT means a slow model reply is
+// cut off by the litellm client's own timeout — which reports a real error and
+// retries transient failures — instead of by the handler deadline killing the
+// HTTP request mid-flight, which is what made /prep fail at exactly 15s with
+// "context deadline exceeded". Falls back to interactionTimeout when the
+// LiteLLM timeout is unset (zero-value config in tests); deployments always get
+// the envconfig default.
+func (g *Gateway) deferredTimeout() time.Duration {
+	if g.cfg != nil {
+		if d := g.cfg.LiteLLM.RequestTimeout; d > 0 {
+			return d + deferredSlack
+		}
+	}
+	return interactionTimeout
+}
 
 // ictx adapts a disgo slash-command interaction event to the helper-based API
 // the command handlers use. It centralizes replies, deferrals, followups, and
@@ -198,6 +244,20 @@ func (ic *ictx) replyEmbedLong(embed discord.Embed, overflow string, ephemeral b
 // follow up. Used for anything that touches the DB or AI.
 func (ic *ictx) ack(ephemeral bool) error {
 	return ic.e.DeferCreateMessage(ephemeral)
+}
+
+// ackLong defers like ack and additionally returns a context whose deadline is
+// extended to budget, for handlers whose real work (a model call, a voice
+// handshake, an object-storage purge) can outlast interactionTimeout. The
+// caller must defer the returned cancel. The extended context carries the
+// request's logger and correlation ID forward but drops the short deadline,
+// which only guarded the initial-response window the ack has now satisfied.
+func (ic *ictx) ackLong(ctx context.Context, ephemeral bool, budget time.Duration) (context.Context, context.CancelFunc, error) {
+	if err := ic.ack(ephemeral); err != nil {
+		return ctx, func() {}, err
+	}
+	ext, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+	return ext, cancel, nil
 }
 
 // followup edits the deferred response with final text content.
