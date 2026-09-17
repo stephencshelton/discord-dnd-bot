@@ -67,8 +67,8 @@ func TestLoreUserDefaultsAndNoPremise(t *testing.T) {
 
 func TestRecapUser(t *testing.T) {
 	got := RecapUser("Descent", []string{"first note", "second note"})
-	if !strings.Contains(got, `Previously, on Descent...`) {
-		t.Errorf("missing recap header, got:\n%s", got)
+	if !strings.Contains(got, "next session of Descent") {
+		t.Errorf("missing campaign name, got:\n%s", got)
 	}
 	if !strings.Contains(got, "--- Session 1 ---\nfirst note") {
 		t.Errorf("missing session 1, got:\n%s", got)
@@ -80,13 +80,13 @@ func TestRecapUser(t *testing.T) {
 
 func TestRecapUserDefaultName(t *testing.T) {
 	got := RecapUser("", nil)
-	if !strings.Contains(got, "Previously, on our campaign...") {
+	if !strings.Contains(got, "next session of our campaign") {
 		t.Errorf("expected default campaign name, got:\n%s", got)
 	}
 }
 
 // TestRecapSystemForbidsInvention protects the rule that /recap restates the
-// record rather than extending it. /recap previously ran under LoreSystem, which
+// record rather than extending it. /recap once ran under LoreSystem, which
 // instructs the model to invent NPCs, locations and plot hooks; its output is
 // read aloud at the table as the canonical account of last session, so anything
 // invented there becomes campaign fact (AGENTS.md §8).
@@ -95,7 +95,7 @@ func TestRecapSystemForbidsInvention(t *testing.T) {
 	for _, want := range []string{
 		"only from the session notes",
 		"never invent",
-		"shorter recap", // sparse notes produce less, not filler
+		"say less", // thin notes produce less, not filler
 	} {
 		if !strings.Contains(sys, want) {
 			t.Errorf("recap system prompt missing grounding rule mentioning %q", want)
@@ -103,16 +103,64 @@ func TestRecapSystemForbidsInvention(t *testing.T) {
 	}
 }
 
+// TestRecapSystemDemandsDetailNotProse is the regression test for a recap that
+// was grounded but useless: told only not to invent, while still cast as a
+// "storyteller" free to "dramatize the telling", the model returned atmosphere
+// with almost nothing a player could act on. The prompt must ask for concrete
+// recall and must not re-acquire the flourish vocabulary that caused this.
+func TestRecapSystemDemandsDetailNotProse(t *testing.T) {
+	sys := strings.ToLower(RecapSystem)
+
+	// It must positively ask for the things a player needs to act on.
+	for _, want := range []string{
+		"recall, not storytelling",
+		"unresolved",
+		"name names",
+		"specifics",
+		"bullets",
+	} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("recap system prompt should demand concrete detail, missing %q", want)
+		}
+	}
+
+	// And it must not invite the narration that made the output unusable. These
+	// words may appear only as part of an explicit prohibition.
+	for _, banned := range []string{"dramatize", "storyteller,", "evocative", "in-genre"} {
+		if strings.Contains(sys, banned) {
+			t.Errorf("recap system prompt re-acquired flourish instruction %q", banned)
+		}
+	}
+	for _, mustForbid := range []string{"no dramatic narration", "skip scene-setting"} {
+		if !strings.Contains(sys, mustForbid) {
+			t.Errorf("recap system prompt should explicitly forbid prose, missing %q", mustForbid)
+		}
+	}
+}
+
 // TestRecapLengthBoundStatedOnce guards against the conflicting-instruction bug
 // this replaced: LoreSystem said "under 250 words" while RecapUser said "max 150
 // words", so the model was handed two different limits in one request. The bound
-// belongs in the system prompt only.
+// belongs in the system prompt only, and it is tight on purpose — a small budget
+// is what forces the model to spend it on facts rather than framing.
 func TestRecapLengthBoundStatedOnce(t *testing.T) {
-	if !strings.Contains(RecapSystem, "150 words") {
+	if !strings.Contains(RecapSystem, "120 words") {
 		t.Error("RecapSystem should carry the length bound")
 	}
 	if strings.Contains(RecapUser("Descent", []string{"a note"}), "words") {
 		t.Error("RecapUser should not restate a word limit; it belongs in RecapSystem")
+	}
+}
+
+// TestRecapUserStaysNeutral pins the other half of the fix: the user prompt used
+// to ask for a "dramatic" recap, which pulled the output back toward prose even
+// after the system prompt was tightened. Framing belongs in RecapSystem.
+func TestRecapUserStaysNeutral(t *testing.T) {
+	got := strings.ToLower(RecapUser("Descent", []string{"a note"}))
+	for _, banned := range []string{"dramatic", "previously, on"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("RecapUser should not carry narrative framing, found %q in:\n%s", banned, got)
+		}
 	}
 }
 
