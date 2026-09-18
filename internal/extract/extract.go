@@ -122,6 +122,11 @@ func Parse(raw string, campaignID uuid.UUID, sessionID *uuid.UUID, existing []Ex
 	for _, e := range existing {
 		byName[entityKey{e.Kind, strings.ToLower(strings.TrimSpace(e.Name))}] = e
 	}
+	// Set of existing entity ids, for validating a model-supplied existing_entity_id.
+	knownIDs := make(map[uuid.UUID]bool, len(existing))
+	for _, e := range existing {
+		knownIDs[e.ID] = true
+	}
 	// Index existing player characters by case-folded name.
 	byCharName := make(map[string]ExistingCharacter, len(characters))
 	for _, c := range characters {
@@ -136,7 +141,7 @@ func Parse(raw string, campaignID uuid.UUID, sessionID *uuid.UUID, existing []Ex
 		if len(merged) >= maxProposals {
 			break
 		}
-		p, ok := normalize(rp, campaignID, sessionID, byName, byCharName)
+		p, ok := normalize(rp, campaignID, sessionID, byName, knownIDs, byCharName)
 		if !ok {
 			continue
 		}
@@ -158,7 +163,7 @@ func Parse(raw string, campaignID uuid.UUID, sessionID *uuid.UUID, existing []Ex
 
 // normalize validates and canonicalizes a single raw proposal. It returns
 // (proposal, true) if the proposal is usable, or (_, false) to drop it.
-func normalize(rp rawProposal, campaignID uuid.UUID, sessionID *uuid.UUID, byName map[entityKey]ExistingEntity, byCharName map[string]ExistingCharacter) (db.StateProposal, bool) {
+func normalize(rp rawProposal, campaignID uuid.UUID, sessionID *uuid.UUID, byName map[entityKey]ExistingEntity, knownIDs map[uuid.UUID]bool, byCharName map[string]ExistingCharacter) (db.StateProposal, bool) {
 	name := strings.TrimSpace(rp.EntityName)
 	kind := db.WorldEntityKind(strings.ToLower(strings.TrimSpace(rp.EntityKind)))
 	evidence := strings.TrimSpace(rp.Evidence)
@@ -206,14 +211,17 @@ func normalize(rp rawProposal, campaignID uuid.UUID, sessionID *uuid.UUID, byNam
 	// Player-character target: attach recorded deeds/facts to an EXISTING PC.
 	// Extraction never creates a character (needs a Discord owner), so drop the
 	// proposal if it names no known PC. Always an update action.
+	//
+	// EntityID stays nil: state_proposals.entity_id is a foreign key to
+	// world_entities, so a player_characters id there fails the insert and rolls
+	// back the whole batch. The apply path finds the PC by canonical name.
 	if isCharacter {
 		pc, ok := byCharName[strings.ToLower(name)]
 		if !ok {
 			return db.StateProposal{}, false
 		}
 		p.Action = db.ActionUpdateEntity
-		idCopy := pc.ID
-		p.EntityID = &idCopy
+		p.EntityID = nil
 		p.EntityName = pc.Name // canonical casing
 		return p, true
 	}
@@ -222,12 +230,14 @@ func normalize(rp rawProposal, campaignID uuid.UUID, sessionID *uuid.UUID, byNam
 	lookup := entityKey{kind, strings.ToLower(name)}
 	existing, exists := byName[lookup]
 
-	// Also honor an explicit existing_entity_id the model provided.
-	if id, err := uuid.Parse(strings.TrimSpace(rp.ExistingEntityID)); err == nil && id != uuid.Nil {
+	// Also honor an explicit existing_entity_id the model provided, but only if
+	// it is one of the entities the model was shown. A mistyped or invented id
+	// would violate the world_entities foreign key; fall through to name
+	// resolution instead.
+	if id, err := uuid.Parse(strings.TrimSpace(rp.ExistingEntityID)); err == nil && knownIDs[id] {
 		p.Action = db.ActionUpdateEntity
 		idCopy := id
 		p.EntityID = &idCopy
-		// Keep the canonical name from the known entity if we can match the id.
 		return p, true
 	}
 

@@ -139,6 +139,9 @@ func (w *Worker) handleExtractState(ctx context.Context, raw json.RawMessage, la
 	// Replace this session's prior PENDING proposals so a reprocess is idempotent
 	// (approved/rejected ones are preserved by the store method).
 	if err := w.store.ReplacePendingSessionProposals(ctx, camp.ID, sessionID, proposals); err != nil {
+		if lastAttempt {
+			w.notifyExtractionFailed(ctx, p, sess)
+		}
 		return fmt.Errorf("persist proposals: %w", err)
 	}
 	metrics.StateProposalsCreated.Add(float64(len(proposals)))

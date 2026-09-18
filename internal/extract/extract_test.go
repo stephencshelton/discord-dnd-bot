@@ -230,8 +230,10 @@ func TestParseCharacterTargetResolvesToExistingPC(t *testing.T) {
 	if p.EntityKind != db.KindCharacter || p.Action != db.ActionUpdateEntity {
 		t.Errorf("character proposal wrong: kind=%s action=%s", p.EntityKind, p.Action)
 	}
-	if p.EntityID == nil || *p.EntityID != pcID {
-		t.Errorf("character proposal should target the existing PC id %v, got %v", pcID, p.EntityID)
+	// state_proposals.entity_id is a foreign key to world_entities, so a PC id
+	// there fails the insert; the apply path resolves the PC by name instead.
+	if p.EntityID != nil {
+		t.Errorf("character proposal must not carry an entity id (world_entities FK), got %v (pc id %v)", *p.EntityID, pcID)
 	}
 	if p.EntityName != "Ludo" {
 		t.Errorf("character name not canonicalized: %q", p.EntityName)
@@ -247,6 +249,44 @@ func TestParseCharacterTargetDroppedWhenUnknown(t *testing.T) {
 	props := mustParseWithChars(t, raw, nil, []ExistingCharacter{{ID: uuid.New(), Name: "Ludo"}})
 	if len(props) != 0 {
 		t.Fatalf("expected 0 proposals (unknown PC dropped), got %d", len(props))
+	}
+}
+
+// TestParseIgnoresUnknownExistingEntityID ensures a model-supplied
+// existing_entity_id that isn't one of the entities the model was shown is not
+// trusted: storing it would violate the world_entities foreign key and roll back
+// the whole batch. The proposal falls back to name resolution.
+func TestParseIgnoresUnknownExistingEntityID(t *testing.T) {
+	varek := uuid.New()
+	existing := []ExistingEntity{{ID: varek, Kind: db.KindNPC, Name: "Captain Varek"}}
+	bogus := uuid.New()
+	raw := `{"proposals":[
+      {"action":"update_entity","entity_kind":"npc","existing_entity_id":"` + bogus.String() + `","entity_name":"Captain Varek","patch":{"description":"Now a traitor."},"evidence":"He betrayed the party.","confidence":0.9},
+      {"action":"update_entity","entity_kind":"location","existing_entity_id":"` + uuid.New().String() + `","entity_name":"Eastwatch","patch":{"description":"Burned."},"evidence":"Eastwatch burned.","confidence":0.9}
+    ]}`
+	props := mustParse(t, raw, existing)
+	if len(props) != 2 {
+		t.Fatalf("expected 2 proposals, got %d", len(props))
+	}
+	if props[0].Action != db.ActionUpdateEntity || props[0].EntityID == nil || *props[0].EntityID != varek {
+		t.Errorf("unknown id should fall back to the name match %v, got action=%s id=%v", varek, props[0].Action, props[0].EntityID)
+	}
+	if props[1].Action != db.ActionCreateEntity || props[1].EntityID != nil {
+		t.Errorf("unknown id with no name match should become a create with no id, got action=%s id=%v", props[1].Action, props[1].EntityID)
+	}
+}
+
+// TestParseHonorsKnownExistingEntityID keeps a model-supplied id that matches a
+// known entity, even when the model renamed it.
+func TestParseHonorsKnownExistingEntityID(t *testing.T) {
+	id := uuid.New()
+	existing := []ExistingEntity{{ID: id, Kind: db.KindNPC, Name: "Captain Varek"}}
+	raw := `{"proposals":[
+      {"action":"update_entity","entity_kind":"npc","existing_entity_id":"` + id.String() + `","entity_name":"Varek the Betrayer","patch":{"description":"Now a traitor."},"evidence":"He betrayed the party.","confidence":0.9}
+    ]}`
+	props := mustParse(t, raw, existing)
+	if len(props) != 1 || props[0].EntityID == nil || *props[0].EntityID != id {
+		t.Fatalf("known id should be honored, got %+v", props)
 	}
 }
 
