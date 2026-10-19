@@ -202,11 +202,19 @@ func (c *Client) Embed(ctx context.Context, model string, inputs []string) ([][]
 
 // Transcribe uploads audio bytes and returns the transcript text. audioName is
 // used only for the multipart filename (its extension hints at the format).
-func (c *Client) Transcribe(ctx context.Context, model, audioName string, audio io.Reader) (string, error) {
+// prompt is the optional OpenAI `prompt` field — Whisper's initial_prompt — used
+// to steer the spelling of names; empty sends no field, so the request is the
+// same as it was before prompts existed.
+func (c *Client) Transcribe(ctx context.Context, model, audioName, prompt string, audio io.Reader) (string, error) {
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
 	if err := w.WriteField("model", model); err != nil {
 		return "", err
+	}
+	if prompt != "" {
+		if err := w.WriteField("prompt", prompt); err != nil {
+			return "", err
+		}
 	}
 	fw, err := w.CreateFormFile("file", audioName)
 	if err != nil {

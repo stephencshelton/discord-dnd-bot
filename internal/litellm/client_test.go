@@ -166,16 +166,39 @@ func TestTranscribeSuccess(t *testing.T) {
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Errorf("not multipart: %v", err)
 		}
+		if _, ok := r.MultipartForm.Value["prompt"]; ok {
+			t.Error("empty prompt should send no prompt field")
+		}
 		w.Write([]byte(`{"text":"the transcript"}`))
 	})
 	defer srv.Close()
 
-	got, err := c.Transcribe(context.Background(), "voice-transcribe", "a.wav", strings.NewReader("audio-bytes"))
+	got, err := c.Transcribe(context.Background(), "voice-transcribe", "a.wav", "", strings.NewReader("audio-bytes"))
 	if err != nil {
 		t.Fatalf("Transcribe error: %v", err)
 	}
 	if got != "the transcript" {
 		t.Errorf("Transcribe = %q", got)
+	}
+}
+
+// TestTranscribeSendsPrompt protects the name-spelling hint: the vocabulary must
+// reach the STT backend as the OpenAI `prompt` form field, or Whisper falls back
+// to guessing invented names from sound alone.
+func TestTranscribeSendsPrompt(t *testing.T) {
+	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("not multipart: %v", err)
+		}
+		if got := r.FormValue("prompt"); got != "Throk Bloodrend, Zoldanox." {
+			t.Errorf("prompt field = %q", got)
+		}
+		w.Write([]byte(`{"text":"ok"}`))
+	})
+	defer srv.Close()
+
+	if _, err := c.Transcribe(context.Background(), "voice-transcribe", "a.wav", "Throk Bloodrend, Zoldanox.", strings.NewReader("audio")); err != nil {
+		t.Fatalf("Transcribe error: %v", err)
 	}
 }
 
