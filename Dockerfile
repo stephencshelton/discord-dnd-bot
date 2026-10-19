@@ -12,7 +12,7 @@
 #   docker build --build-arg SERVICE=worker  -t discord-dnd-bot-worker  .
 
 # ---- build stage ----
-FROM golang:1.26-bookworm AS build
+FROM golang:1.27-bookworm AS build
 
 # libopus is required to compile/link gopus.
 RUN apt-get update \
