@@ -56,13 +56,22 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 		}
 	}
 
+	// Load the campaign and its canonical names BEFORE transcribing, so the same
+	// roster steers Whisper's spelling and then corrects the notes.
+	camp, cerr := w.store.GetCampaign(ctx, sess.CampaignID)
+	campName, campSystem, campPremise := "", "", ""
+	if cerr == nil {
+		campName, campSystem, campPremise = camp.Name, camp.System, camp.Premise
+	}
+	roster := w.loadRoster(ctx, sess.CampaignID, names)
+
 	// Reassemble + transcribe the recording from the per-user PCM checkpoint
 	// chunks the gateway wrote (sessions/<guild>/<session>/chunks/<userID>/
 	// chunk-NNNNNN.pcm). To keep worker memory bounded regardless of session
 	// length or speaker count, this STREAMS each speaker's chunks through a
 	// bounded segment buffer — it never holds a whole track (let alone all
 	// tracks) in RAM, which is what OOM-killed the worker.
-	transcript, hadAudio, err := w.transcribeSession(ctx, sess, names)
+	transcript, hadAudio, err := w.transcribeSession(ctx, sess, names, roster.vocabulary)
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("transcribe", "error").Inc()
 		// Transcription/storage failures are usually transient — only tell the
@@ -85,12 +94,6 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 	metrics.AIRequests.WithLabelValues("transcribe", "ok").Inc()
 
 	// 3) Summarize the transcript into structured session notes.
-	camp, cerr := w.store.GetCampaign(ctx, sess.CampaignID)
-	campName, campSystem, campPremise := "", "", ""
-	if cerr == nil {
-		campName, campSystem, campPremise = camp.Name, camp.System, camp.Premise
-	}
-
 	// Gather concrete session metadata so the notes know *when* the session
 	// happened and *who* was in the call, rather than inferring it.
 	sessionDate := sess.StartedAt.UTC().Format("Monday, 2 January 2006 15:04 MST")
@@ -102,7 +105,7 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 
 	notes, err := w.chatComplete(ctx, "notes", w.cfg.LiteLLM.Notes(), []litellm.Message{
 		{Role: "system", Content: prompts.SessionNotesSystem},
-		{Role: "user", Content: prompts.SessionNotesUser(campName, campSystem, campPremise, sessionDate, participantNames, transcript)},
+		{Role: "user", Content: prompts.SessionNotesUser(campName, campSystem, campPremise, sessionDate, participantNames, roster.characters, roster.entities, transcript)},
 	}, w.cfg.LiteLLM.NotesTokens())
 	if err != nil {
 		metrics.AIRequests.WithLabelValues("chat", "error").Inc()
@@ -168,8 +171,10 @@ func (w *Worker) handleTranscribeSession(ctx context.Context, raw json.RawMessag
 // transcribe -> discard) whenever it fills a <= cfg.Audio.TranscribeSegmentMinutes
 // window, keeping only a few seconds of overlap between flushes. Peak memory is
 // therefore ~one segment (~11.5 MB/min of PCM) regardless of session length or
-// speaker count. hadAudio is false only when no chunks exist at all.
-func (w *Worker) transcribeSession(ctx context.Context, sess *db.Session, names map[string]string) (transcript string, hadAudio bool, err error) {
+// speaker count. hadAudio is false only when no chunks exist at all. vocabulary
+// is the STT spelling hint sent with every segment (see
+// prompts.TranscriptionVocabulary); "" sends none.
+func (w *Worker) transcribeSession(ctx context.Context, sess *db.Session, names map[string]string, vocabulary string) (transcript string, hadAudio bool, err error) {
 	prefix := sess.ChunkPrefix
 	if prefix == "" {
 		prefix = fmt.Sprintf("sessions/%s/%s/chunks", sess.GuildID, sess.ID)
@@ -211,7 +216,7 @@ func (w *Worker) transcribeSession(ctx context.Context, sess *db.Session, names 
 
 	var b strings.Builder
 	for _, uid := range userIDs {
-		text, terr := w.transcribeUserTrack(ctx, sess, byUser[uid], segSamples, overlapSamples)
+		text, terr := w.transcribeUserTrack(ctx, sess, byUser[uid], segSamples, overlapSamples, vocabulary)
 		if terr != nil {
 			return "", true, fmt.Errorf("transcribe track %s: %w", uid, terr)
 		}
@@ -244,7 +249,7 @@ func (w *Worker) transcribeSession(ctx context.Context, sess *db.Session, names 
 // segment as soon as the buffer fills, so at most ~one segment plus one chunk of
 // PCM is resident at any moment. segSamples <= 0 disables segmenting (buffer the
 // whole track — only safe for short sessions).
-func (w *Worker) transcribeUserTrack(ctx context.Context, sess *db.Session, keys []string, segSamples, overlapSamples int) (string, error) {
+func (w *Worker) transcribeUserTrack(ctx context.Context, sess *db.Session, keys []string, segSamples, overlapSamples int, vocabulary string) (string, error) {
 	// Keys are zero-padded, so lexical order == chronological order.
 	sort.Strings(keys)
 
@@ -266,7 +271,7 @@ func (w *Worker) transcribeUserTrack(ctx context.Context, sess *db.Session, keys
 		if err := audio.WriteWAV(&wav, mono, audio.SampleRate, 1); err != nil {
 			return fmt.Errorf("encode wav segment: %w", err)
 		}
-		text, err := w.transcribeAI.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", &wav)
+		text, err := w.transcribeAI.Transcribe(ctx, w.cfg.LiteLLM.TranscribeModel, "session.wav", vocabulary, &wav)
 		wav.Reset() // release the WAV bytes promptly
 		if err != nil {
 			return err

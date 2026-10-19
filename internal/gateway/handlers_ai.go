@@ -6,10 +6,12 @@ import (
 	"strings"
 
 	"github.com/disgoorg/disgo/discord"
+	"github.com/google/uuid"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
 	"github.com/stephencshelton/discord-dnd-bot/internal/discordfmt"
 	"github.com/stephencshelton/discord-dnd-bot/internal/litellm"
+	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
 	"github.com/stephencshelton/discord-dnd-bot/internal/metrics"
 	"github.com/stephencshelton/discord-dnd-bot/internal/prompts"
 	"github.com/stephencshelton/discord-dnd-bot/internal/queue"
@@ -33,9 +35,10 @@ func (g *Gateway) handleLore(ctx context.Context, ic *ictx) error {
 		return err
 	}
 	defer cancel()
+	characters, knownEntities := g.nameRoster(ctx, camp.ID)
 	msgs := []litellm.Message{
 		{Role: "system", Content: prompts.LoreSystem},
-		{Role: "user", Content: prompts.LoreUser(camp.Name, camp.System, camp.Premise, prompt)},
+		{Role: "user", Content: prompts.LoreUser(camp.Name, camp.System, camp.Premise, prompt, characters, knownEntities)},
 	}
 	answer, truncated, err := g.chat(ctx, "lore", g.cfg.LiteLLM.Lore(), msgs, g.cfg.LiteLLM.LoreTokens())
 	if err != nil {
@@ -67,9 +70,10 @@ func (g *Gateway) handleRecap(ctx context.Context, ic *ictx) error {
 		return err
 	}
 	defer cancel()
+	characters, knownEntities := g.nameRoster(ctx, camp.ID)
 	msgs := []litellm.Message{
 		{Role: "system", Content: prompts.RecapSystem},
-		{Role: "user", Content: prompts.RecapUser(camp.Name, notes)},
+		{Role: "user", Content: prompts.RecapUser(camp.Name, notes, characters, knownEntities)},
 	}
 	recap, truncated, err := g.chat(ctx, "recap", g.cfg.LiteLLM.Recap(), msgs, g.cfg.LiteLLM.RecapTokens())
 	if err != nil {
@@ -139,9 +143,10 @@ func (g *Gateway) handleAsk(ctx context.Context, ic *ictx) error {
 	}
 
 	// 3) Ask the chat model, constrained to the retrieved excerpts.
+	characters, knownEntities := g.nameRoster(ctx, camp.ID)
 	msgs := []litellm.Message{
 		{Role: "system", Content: prompts.AskSystem},
-		{Role: "user", Content: prompts.AskUser(camp.Name, question, passages)},
+		{Role: "user", Content: prompts.AskUser(camp.Name, question, passages, characters, knownEntities)},
 	}
 	answer, truncated, err := g.chat(ctx, "ask", g.cfg.LiteLLM.Ask(), msgs, g.cfg.LiteLLM.AskTokens())
 	if err != nil {
@@ -238,6 +243,32 @@ func (g *Gateway) handlePrep(ctx context.Context, ic *ictx) error {
 		Color:       0x0ea5e9,
 	}
 	return ic.followupEmbed(e)
+}
+
+// nameRoster loads the campaign's canonical names for prompts that read session
+// records, so a name the transcript misheard ("Brock" for Throk) is corrected on
+// the way out. It is best-effort: a failed lookup costs name accuracy, not the
+// reply, so it is logged and the command carries on. Call it after deferring —
+// it is two queries, and the 3-second initial-response window is not theirs to
+// spend. No player names are given: the gateway has no transcript to map
+// speakers in, and the notes it reads have already been attributed.
+func (g *Gateway) nameRoster(ctx context.Context, campaignID uuid.UUID) (characters, knownEntities []string) {
+	log := logging.FromContext(ctx, g.log)
+	if pcs, err := g.store.ListPCs(ctx, campaignID); err != nil {
+		log.Warn("load player characters for name roster", "campaign", campaignID, "err", err)
+	} else {
+		for _, pc := range pcs {
+			characters = append(characters, pc.RosterLine(""))
+		}
+	}
+	if entities, err := g.store.ListAllWorldEntities(ctx, campaignID); err != nil {
+		log.Warn("load world entities for name roster", "campaign", campaignID, "err", err)
+	} else {
+		for _, e := range entities {
+			knownEntities = append(knownEntities, e.RosterLine())
+		}
+	}
+	return characters, knownEntities
 }
 
 // entityPrepLine renders a world entity as a compact "Name — description (meta)"
