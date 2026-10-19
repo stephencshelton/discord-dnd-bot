@@ -182,6 +182,14 @@ config:
     # thought. Background (worker) tasks additionally auto-continue a truncated
     # reply, so for those these mainly avoid extra round trips.
     #
+    # THINKING COUNTS AGAINST THESE. Sonnet 5.5 and Opus 5.5 think before every
+    # reply (it cannot be turned off) and those tokens come out of max_tokens
+    # without being shown. The interactive budgets below are therefore the
+    # visible size PLUS ~3000 tokens of thinking headroom (thinkingHeadroomTokens
+    # in internal/config). Sized for a 2000-token /prep that thought for ~1300
+    # tokens and cut off after ~750 visible ones. Raising them also lengthens the
+    # worst-case reply time, which must stay inside requestTimeout above.
+    #
     #   notesMaxTokens  session notes. A 3-4 hour session needs room for every
     #                   section; too small and the writeup visibly cuts off.
     #   stateMaxTokens  /review-session proposal extraction. Must be generous:
@@ -191,18 +199,19 @@ config:
     #                   Truncation here fails open, silently keeping everything.
     #   loreMaxTokens   /lore   — message surface (overflow splits across msgs).
     #   askMaxTokens    /ask    — message surface (overflow splits across msgs).
-    #   recapMaxTokens  /recap  — embed description.
-    #   prepMaxTokens   /prep   — embed description; five sections, the longest
-    #                   of the interactive replies.
+    #   recapMaxTokens  /recap  — embed description (overflow continues in
+    #                   follow-up messages).
+    #   prepMaxTokens   /prep   — embed description plus follow-ups; five
+    #                   sections, the longest of the interactive replies.
     #   chatMaxTokens   conversational @mention / DM reply — message surface.
     notesMaxTokens: 6000
     stateMaxTokens: 12000
-    criticMaxTokens: 1000
-    loreMaxTokens: 1200
-    askMaxTokens: 1200
-    recapMaxTokens: 1200
-    prepMaxTokens: 2000
-    chatMaxTokens: 800
+    criticMaxTokens: 4000
+    loreMaxTokens: 4200
+    askMaxTokens: 4200
+    recapMaxTokens: 4200
+    prepMaxTokens: 5400
+    chatMaxTokens: 3800
 
   # Recording / transcription tuning.
   audio:

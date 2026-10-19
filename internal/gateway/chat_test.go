@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -50,5 +51,39 @@ func TestTruncateForDiscordFitsMessageLimit(t *testing.T) {
 	const short = "A brief answer."
 	if truncateForDiscord(short) != short || truncateForEmbed(short) != short {
 		t.Error("short content should not be modified")
+	}
+}
+
+// TestEmbedReplyKeepsTailAndMarker is the regression test for a /prep that was
+// silently incomplete: the reply was cut at the embed limit AFTER the "cut off"
+// marker had been appended, so the marker was thrown away with the tail. A long
+// reply must keep every line (embed + overflow), the marker must survive at the
+// true end, and a short reply must stay entirely in the embed.
+func TestEmbedReplyKeepsTailAndMarker(t *testing.T) {
+	var lines []string
+	for i := 0; i < 120; i++ {
+		lines = append(lines, fmt.Sprintf("- open thread %03d: the party still has to deal with this", i))
+	}
+	long := strings.Join(lines, "\n")
+
+	desc, overflow := embedReply(long, true)
+	if n := len([]rune(desc)); n > discordfmt.EmbedDescriptionLimit {
+		t.Errorf("description = %d runes, want <= %d", n, discordfmt.EmbedDescriptionLimit)
+	}
+	if overflow == "" {
+		t.Fatal("a reply longer than one embed must continue in overflow, not be cut")
+	}
+	all := desc + "\n" + overflow
+	for _, l := range []string{lines[0], lines[len(lines)/2], lines[len(lines)-1]} {
+		if !strings.Contains(all, l) {
+			t.Errorf("line lost across the split: %q", l)
+		}
+	}
+	if !strings.HasSuffix(strings.TrimSpace(overflow), "(cut off — the reply hit its length limit)_") {
+		t.Errorf("truncation marker must end the overflow, got tail %q", overflow[max(0, len(overflow)-80):])
+	}
+
+	if d, o := embedReply("A brief answer.", false); d != "A brief answer." || o != "" {
+		t.Errorf("short reply = (%q, %q), want it whole in the embed", d, o)
 	}
 }

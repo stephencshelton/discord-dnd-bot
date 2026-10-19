@@ -3,6 +3,8 @@ package config
 import (
 	"reflect"
 	"testing"
+
+	"github.com/kelseyhightower/envconfig"
 )
 
 func TestDiscordConfigAllowedGuildIDs(t *testing.T) {
@@ -205,5 +207,51 @@ func TestLiteLLMTokenBudgets(t *testing.T) {
 	// single-answer interactive commands.
 	if defaultPrepMaxTokens <= defaultChatMaxTokens {
 		t.Errorf("prep budget (%d) should exceed the plain chat budget (%d)", defaultPrepMaxTokens, defaultChatMaxTokens)
+	}
+}
+
+// TestInteractiveBudgetsLeaveRoomToThink pins the fix for /prep cutting off
+// halfway: current models think on every request and that thinking is billed
+// against max_tokens, so a budget sized only for the visible reply runs out
+// before the reply is written. Every interactive budget must cover its visible
+// size plus the thinking headroom.
+func TestInteractiveBudgetsLeaveRoomToThink(t *testing.T) {
+	for name, tc := range map[string]struct{ budget, visible int }{
+		"Prep":   {defaultPrepMaxTokens, 2 * embedReplyTokens},
+		"Recap":  {defaultRecapMaxTokens, embedReplyTokens},
+		"Lore":   {defaultLoreMaxTokens, messageReplyTokens},
+		"Ask":    {defaultAskMaxTokens, messageReplyTokens},
+		"Chat":   {defaultChatMaxTokens, chatReplyTokens},
+		"Critic": {defaultCriticMaxTokens, criticReplyTokens},
+	} {
+		if tc.budget < tc.visible+thinkingHeadroomTokens {
+			t.Errorf("%s budget %d leaves less than %d tokens to think beyond its %d visible",
+				name, tc.budget, thinkingHeadroomTokens, tc.visible)
+		}
+	}
+}
+
+// TestTokenBudgetTagsMatchDefaults guards the two places a default lives: the
+// envconfig tag is what a deployment with the variable unset actually gets,
+// and the constant is the resolver's fallback. If they drift, raising one
+// silently leaves the other at the old, too-small value.
+func TestTokenBudgetTagsMatchDefaults(t *testing.T) {
+	var c LiteLLMConfig
+	if err := envconfig.Process("", &c); err != nil {
+		t.Fatalf("process defaults: %v", err)
+	}
+	for name, tc := range map[string]struct{ tag, def int }{
+		"Notes":  {c.NotesMaxTokens, defaultNotesMaxTokens},
+		"State":  {c.StateMaxTokens, defaultStateMaxTokens},
+		"Critic": {c.CriticMaxTokens, defaultCriticMaxTokens},
+		"Lore":   {c.LoreMaxTokens, defaultLoreMaxTokens},
+		"Ask":    {c.AskMaxTokens, defaultAskMaxTokens},
+		"Recap":  {c.RecapMaxTokens, defaultRecapMaxTokens},
+		"Prep":   {c.PrepMaxTokens, defaultPrepMaxTokens},
+		"Chat":   {c.ChatMaxTokens, defaultChatMaxTokens},
+	} {
+		if tc.tag != tc.def {
+			t.Errorf("%s: envconfig default %d != resolver default %d", name, tc.tag, tc.def)
+		}
 	}
 }

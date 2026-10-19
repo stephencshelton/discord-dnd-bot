@@ -195,7 +195,9 @@ type LiteLLMConfig struct {
 	// budget that's too small silently produces a reply that looks like a broken
 	// generation. Each default is sized to the Discord surface the reply is
 	// rendered into (a 2000-char message or a 4096-char embed), with headroom so
-	// the model finishes its thought rather than being cut off.
+	// the model finishes its thought rather than being cut off — PLUS room for the
+	// model's thinking, which current models always do and which is billed
+	// against the same budget (see thinkingHeadroomTokens).
 	//
 	// NotesMaxTokens caps session-note generation. A long (3-4 hour) session's
 	// structured notes need room for every section. The worker also auto-continues
@@ -210,34 +212,70 @@ type LiteLLMConfig struct {
 	// of the candidate indices worth keeping). Truncation here fails open — every
 	// candidate survives — so a small budget silently disables the filtering
 	// rather than erroring.
-	CriticMaxTokens int `envconfig:"LITELLM_CRITIC_MAX_TOKENS" default:"1000"`
+	CriticMaxTokens int `envconfig:"LITELLM_CRITIC_MAX_TOKENS" default:"4000"`
 	// LoreMaxTokens caps /lore. Rendered as a message; overflow is split across
 	// follow-up messages, so this bounds total length rather than one message.
-	LoreMaxTokens int `envconfig:"LITELLM_LORE_MAX_TOKENS" default:"1200"`
+	LoreMaxTokens int `envconfig:"LITELLM_LORE_MAX_TOKENS" default:"4200"`
 	// AskMaxTokens caps grounded /ask answers. Rendered as a message (overflow
 	// split across follow-ups).
-	AskMaxTokens int `envconfig:"LITELLM_ASK_MAX_TOKENS" default:"1200"`
+	AskMaxTokens int `envconfig:"LITELLM_ASK_MAX_TOKENS" default:"4200"`
 	// RecapMaxTokens caps /recap. Rendered in an embed description (4096 chars).
-	RecapMaxTokens int `envconfig:"LITELLM_RECAP_MAX_TOKENS" default:"1200"`
-	// PrepMaxTokens caps /prep. Rendered in an embed description; a prep sheet has
-	// five sections and is the longest of the interactive replies.
-	PrepMaxTokens int `envconfig:"LITELLM_PREP_MAX_TOKENS" default:"2000"`
+	RecapMaxTokens int `envconfig:"LITELLM_RECAP_MAX_TOKENS" default:"4200"`
+	// PrepMaxTokens caps /prep. Rendered in an embed description, continued in
+	// follow-up messages; a prep sheet has five sections and is the longest of the
+	// interactive replies, so it is sized for two embeds' worth of text.
+	PrepMaxTokens int `envconfig:"LITELLM_PREP_MAX_TOKENS" default:"5400"`
 	// ChatMaxTokens caps the conversational @mention / DM reply. Rendered as a
 	// message.
-	ChatMaxTokens int `envconfig:"LITELLM_CHAT_MAX_TOKENS" default:"800"`
+	ChatMaxTokens int `envconfig:"LITELLM_CHAT_MAX_TOKENS" default:"3800"`
 }
 
+// Building blocks for the default budgets. These are derivations, not knobs:
+// the knobs are the *MaxTokens fields above.
+const (
+	// thinkingHeadroomTokens is room for the model to think before it answers.
+	// Claude Sonnet 5.5 and Opus 5.5 think on every request, thinking cannot be
+	// turned off on either, and thinking tokens count against max_tokens without
+	// appearing in the reply. A /prep at Sonnet 5.5's default effort spent about
+	// 1,300 tokens thinking, wrote about 750 tokens of visible text, and hit the
+	// old 2,000-token budget halfway through its second section. 3,000 is a bit
+	// over twice that observation. Measured once, not profiled: if the
+	// truncation warning keeps firing, its reasoning_tokens field says by how
+	// much to grow it.
+	thinkingHeadroomTokens = 3000
+	// embedReplyTokens fills a 4096-character embed description at ~3.5
+	// characters per token.
+	embedReplyTokens = 1200
+	// messageReplyTokens is the visible length the message-surface replies were
+	// sized to before thinking: about two 2000-character messages (overflow is
+	// split across follow-ups, so this bounds total length, not one message).
+	messageReplyTokens = 1200
+	// chatReplyTokens is the visible size of a conversational reply, which is
+	// meant to be shorter than a command answer.
+	chatReplyTokens = 800
+	// criticReplyTokens is the critic's visible JSON index list.
+	criticReplyTokens = 1000
+)
+
 // Default per-task token budgets, used when the configured value is unset or
-// non-positive.
+// non-positive. Interactive defaults are visible size + thinkingHeadroomTokens.
+// The largest (prep, 5,400) has to finish inside LITELLM_REQUEST_TIMEOUT
+// (default 120s), which requires at least ~45 output tokens per second over the
+// whole budget; that is an estimate, and a model rarely uses the full ceiling.
+//
+// Notes and state extraction are left as they were: they run in the worker,
+// which auto-continues a truncated reply, so thinking costs an extra round trip
+// there rather than a cut-off answer, and a larger single reply would risk the
+// same request timeout.
 const (
 	defaultNotesMaxTokens  = 6000
 	defaultStateMaxTokens  = 12000
-	defaultCriticMaxTokens = 1000
-	defaultLoreMaxTokens   = 1200
-	defaultAskMaxTokens    = 1200
-	defaultRecapMaxTokens  = 1200
-	defaultPrepMaxTokens   = 2000
-	defaultChatMaxTokens   = 800
+	defaultCriticMaxTokens = criticReplyTokens + thinkingHeadroomTokens
+	defaultLoreMaxTokens   = messageReplyTokens + thinkingHeadroomTokens
+	defaultAskMaxTokens    = messageReplyTokens + thinkingHeadroomTokens
+	defaultRecapMaxTokens  = embedReplyTokens + thinkingHeadroomTokens
+	defaultPrepMaxTokens   = 2*embedReplyTokens + thinkingHeadroomTokens
+	defaultChatMaxTokens   = chatReplyTokens + thinkingHeadroomTokens
 )
 
 // Token-budget resolvers. Each falls back to its default when unset or
