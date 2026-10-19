@@ -122,12 +122,12 @@ Configuration is loaded from environment variables. The same configuration is us
 | `LITELLM_UPLOAD_TIMEOUT` | No | `300s` | Timeout for multipart audio uploads |
 | `LITELLM_NOTES_MAX_TOKENS` | No | `6000` | Output token budget for session notes. A model that runs out stops **mid-sentence with no error**, so these are completeness knobs — long sessions need room for every section |
 | `LITELLM_STATE_MAX_TOKENS` | No | `12000` | Budget for `/review-session` proposal extraction. The reply is JSON, so a truncated one is unparseable rather than merely short |
-| `LITELLM_CRITIC_MAX_TOKENS` | No | `1000` | Budget for the extraction critic pass. Truncation here fails open (keeps everything), silently disabling the filtering |
-| `LITELLM_LORE_MAX_TOKENS` | No | `1200` | Budget for `/lore` (message surface; overflow continues into follow-up messages) |
-| `LITELLM_ASK_MAX_TOKENS` | No | `1200` | Budget for `/ask` (message surface; overflow continues into follow-up messages) |
-| `LITELLM_RECAP_MAX_TOKENS` | No | `1200` | Budget for `/recap` (embed description, 4096 chars) |
-| `LITELLM_PREP_MAX_TOKENS` | No | `2000` | Budget for `/prep` (embed description; five sections, the longest interactive reply) |
-| `LITELLM_CHAT_MAX_TOKENS` | No | `800` | Budget for the conversational @mention / DM reply |
+| `LITELLM_CRITIC_MAX_TOKENS` | No | `4000` | Budget for the extraction critic pass, including thinking. Truncation here fails open (keeps everything), silently disabling the filtering |
+| `LITELLM_LORE_MAX_TOKENS` | No | `4200` | Budget for `/lore`, including thinking (message surface; overflow continues into follow-up messages) |
+| `LITELLM_ASK_MAX_TOKENS` | No | `4200` | Budget for `/ask`, including thinking (message surface; overflow continues into follow-up messages) |
+| `LITELLM_RECAP_MAX_TOKENS` | No | `4200` | Budget for `/recap`, including thinking (embed description, 4096 chars, overflow continues into follow-up messages) |
+| `LITELLM_PREP_MAX_TOKENS` | No | `5400` | Budget for `/prep`, including thinking (embed description plus follow-up messages; five sections, the longest interactive reply). The largest interactive budget, so the one most likely to brush `LITELLM_REQUEST_TIMEOUT` on a slow route |
+| `LITELLM_CHAT_MAX_TOKENS` | No | `3800` | Budget for the conversational @mention / DM reply, including thinking |
 | `AUDIO_SILENCE_TRIM` | No | `true` | Drop near-silent frames before upload to cut billed minutes |
 | `AUDIO_SILENCE_RMS_THRESHOLD` | No | `350` | Per-frame RMS (0–32767) treated as silence |
 | `AUDIO_TRANSCRIBE_SEGMENT_MINUTES` | No | `3` | Split each speaker's track into ≤ this many minutes per WAV segment (downmixed to mono) when transcribing, bounding worker and STT memory (`0` = whole track in one request) |
@@ -147,6 +147,16 @@ or a 4096-character embed). These are **completeness** knobs, not cost knobs:
 hitting the token limit is not an error — the provider returns success with the
 text chopped mid-sentence — so an undersized budget reads as a broken bot. A
 non-positive value falls back to the default rather than being sent verbatim.
+
+**Thinking counts against these budgets.** Current Claude models (Sonnet 5.5,
+Opus 5.5) think before every reply, cannot have thinking turned off, and bill
+those tokens against `max_tokens` without showing them. So the interactive
+defaults are the visible size for their surface **plus ~3,000 tokens to think**.
+A budget copied from an older, non-thinking model setup is the usual cause of a
+reply that stops after a few hundred words; the truncation warning in the logs
+reports `completion_tokens` and `reasoning_tokens` so you can see which half ran
+out.
+
 Defence in depth around this:
 
 - background tasks (notes, extraction, critic) **auto-continue** a truncated

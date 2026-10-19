@@ -69,6 +69,12 @@ type usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// CompletionTokensDetails breaks out reasoning (thinking) tokens, which
+	// count toward CompletionTokens and max_tokens but never appear in the
+	// reply. Absent when the provider doesn't report it.
+	CompletionTokensDetails *struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details,omitempty"`
 }
 
 // Message is a single chat message.
@@ -113,6 +119,13 @@ type ChatResult struct {
 	FinishReason string
 	// Truncated is true when generation stopped because it ran out of tokens.
 	Truncated bool
+	// CompletionTokens and ReasoningTokens are the provider's usage counts, 0
+	// when not reported. On a truncated reply they say WHY it ran out: a
+	// thinking model can spend most of max_tokens reasoning before it writes a
+	// word, so "hit the limit after 700 visible tokens" is only diagnosable
+	// when the reasoning share is logged.
+	CompletionTokens int
+	ReasoningTokens  int
 }
 
 // Chat sends a chat completion and returns the assistant's reply together with
@@ -148,9 +161,16 @@ func (c *Client) Chat(ctx context.Context, model string, msgs []Message, maxToke
 		// "length", Anthropic-style routes surface "max_tokens".
 		Truncated: reason == "length" || reason == "max_tokens",
 	}
+	if u := out.Usage; u != nil {
+		res.CompletionTokens = u.CompletionTokens
+		if u.CompletionTokensDetails != nil {
+			res.ReasoningTokens = u.CompletionTokensDetails.ReasoningTokens
+		}
+	}
 	if res.Truncated {
 		c.log.Warn("model output hit the token limit and was cut off",
-			"model", model, "max_tokens", maxTokens, "finish_reason", reason)
+			"model", model, "max_tokens", maxTokens, "finish_reason", reason,
+			"completion_tokens", res.CompletionTokens, "reasoning_tokens", res.ReasoningTokens)
 	}
 	return res, nil
 }

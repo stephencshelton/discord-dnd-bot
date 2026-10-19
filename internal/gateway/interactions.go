@@ -310,6 +310,22 @@ func (ic *ictx) followupEmbed(embed discord.Embed) error {
 	return err
 }
 
+// followupEmbedLong edits the deferred response with an embed and posts any
+// overflow as follow-up messages: the deferred-response counterpart of
+// replyEmbedLong. AI replies rendered as embeds (/prep, /recap) used to be cut
+// at the 4096-character description limit, which threw away the end of the
+// reply AND the "cut off" marker appended there, so an incomplete prep sheet
+// looked complete. These paths ack non-ephemerally, so the overflow is public.
+func (ic *ictx) followupEmbedLong(embed discord.Embed, overflow string) error {
+	if err := ic.followupEmbed(embed); err != nil {
+		return err
+	}
+	if strings.TrimSpace(overflow) == "" {
+		return nil
+	}
+	return ic.sendFollowups(boundChunks(discordfmt.ChunkMarkdown(overflow, discordfmt.ChunkLimit)), false)
+}
+
 // replyError reports a generic error to the user; details are logged by the
 // caller. It tries to edit an existing deferred response, else sends fresh.
 func (ic *ictx) replyError() {

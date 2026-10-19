@@ -79,12 +79,13 @@ func (g *Gateway) handleRecap(ctx context.Context, ic *ictx) error {
 	if err != nil {
 		return err
 	}
+	desc, overflow := embedReply(recap, truncated)
 	e := discord.Embed{
 		Title:       "Previously, on " + camp.Name + "...",
-		Description: truncateForEmbed(markTruncated(recap, truncated)),
+		Description: desc,
 		Color:       0x8b5cf6,
 	}
-	return ic.followupEmbed(e)
+	return ic.followupEmbedLong(e, overflow)
 }
 
 // handleAsk answers a question grounded in the campaign's session notes using
@@ -237,12 +238,13 @@ func (g *Gateway) handlePrep(ctx context.Context, ic *ictx) error {
 		return err
 	}
 
+	desc, overflow := embedReply(briefing, truncated)
 	e := discord.Embed{
 		Title:       "🗺️ Session prep — " + camp.Name,
-		Description: truncateForEmbed(markTruncated(briefing, truncated)),
+		Description: desc,
 		Color:       0x0ea5e9,
 	}
-	return ic.followupEmbed(e)
+	return ic.followupEmbedLong(e, overflow)
 }
 
 // nameRoster loads the campaign's canonical names for prompts that read session
@@ -404,6 +406,14 @@ func markTruncated(s string, truncated bool) string {
 // follow-up messages instead of discarding the remainder.
 func truncateForDiscord(s string) string {
 	return discordfmt.Truncate(s, discordfmt.MessageLimit)
+}
+
+// embedReply splits an AI reply into an embed description and the overflow that
+// continues in follow-up messages. The truncation marker is added BEFORE the
+// split, so it lands at the true end of the reply — in the overflow when there
+// is one — instead of being cut away with the tail.
+func embedReply(reply string, truncated bool) (desc, overflow string) {
+	return splitForShow(markTruncated(reply, truncated), discordfmt.EmbedDescriptionLimit)
 }
 
 // truncateForEmbed trims content to Discord's embed-description limit, breaking
