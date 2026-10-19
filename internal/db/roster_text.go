@@ -15,7 +15,7 @@ import (
 const rosterDescRunes = 160
 
 // RosterLine renders a PC for a name roster: "Throk Bloodrend — Lv 15 Orc
-// Barbarian, played by xCptAmerica". player is the Discord name that labels the
+// Barbarian, played by PlayerOne". player is the Discord name that labels the
 // player's lines in a transcript; pass "" where there is no transcript to map
 // (or the player wasn't in the call) and the clause is omitted.
 func (p PlayerCharacter) RosterLine(player string) string {

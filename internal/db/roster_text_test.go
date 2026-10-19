@@ -15,11 +15,11 @@ func TestPCRosterLine(t *testing.T) {
 		player string
 		want   string
 	}{
-		{PlayerCharacter{Name: "Throk Bloodrend", Race: "Orc", Class: "Barbarian", Level: 15}, "xCptAmerica",
-			"Throk Bloodrend — Lv 15 Orc Barbarian, played by xCptAmerica"},
+		{PlayerCharacter{Name: "Throk Bloodrend", Race: "Orc", Class: "Barbarian", Level: 15}, "PlayerOne",
+			"Throk Bloodrend — Lv 15 Orc Barbarian, played by PlayerOne"},
 		{PlayerCharacter{Name: "Chak", Race: "Goblin", Class: "Rogue", Level: 14}, "", "Chak — Lv 14 Goblin Rogue"},
 		{PlayerCharacter{Name: "Throb"}, "", "Throb"},
-		{PlayerCharacter{Name: "Throb"}, "Woodithebear540", "Throb — played by Woodithebear540"},
+		{PlayerCharacter{Name: "Throb"}, "PlayerTwo", "Throb — played by PlayerTwo"},
 	} {
 		if got := tc.pc.RosterLine(tc.player); got != tc.want {
 			t.Errorf("RosterLine = %q, want %q", got, tc.want)

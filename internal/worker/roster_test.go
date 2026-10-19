@@ -15,10 +15,10 @@ func TestBuildRosterMapsPlayersToCharacters(t *testing.T) {
 		{Name: "Throk Bloodrend", Race: "Orc", Class: "Barbarian", Level: 15, DiscordUserID: "u1"},
 		{Name: "Chak", Race: "Goblin", Class: "Rogue", Level: 14, DiscordUserID: "u-absent"},
 	}
-	r := buildRoster(pcs, nil, map[string]string{"u1": "xCptAmerica"})
+	r := buildRoster(pcs, nil, map[string]string{"u1": "PlayerOne"})
 
 	want := []string{
-		"Throk Bloodrend — Lv 15 Orc Barbarian, played by xCptAmerica",
+		"Throk Bloodrend — Lv 15 Orc Barbarian, played by PlayerOne",
 		"Chak — Lv 14 Goblin Rogue", // player not in the call: no speaker to map
 	}
 	if len(r.characters) != len(want) {
