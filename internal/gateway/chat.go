@@ -34,7 +34,8 @@ func (g *Gateway) chat(ctx context.Context, task, model string, msgs []litellm.M
 	if res.Truncated {
 		metrics.AIResponsesTruncated.WithLabelValues(task, "final").Inc()
 		logging.FromContext(ctx, g.log).Warn("model reply hit the token limit; answer is incomplete",
-			"task", task, "model", model, "max_tokens", maxTokens)
+			"task", task, "model", model, "max_tokens", maxTokens,
+			"completion_tokens", res.CompletionTokens, "reasoning_tokens", res.ReasoningTokens)
 	}
 	return res.Content, res.Truncated, nil
 }

@@ -105,6 +105,35 @@ func TestChatReportsTruncation(t *testing.T) {
 	}
 }
 
+// TestChatReportsReasoningTokens protects the diagnosis of a thinking model that
+// runs out of budget: the reasoning share of completion_tokens must reach the
+// result (and so the truncation log), or a reply cut off after a few hundred
+// visible words looks like a budget that was simply too small for the text.
+func TestChatReportsReasoningTokens(t *testing.T) {
+	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"## Where we left"},"finish_reason":"length"}],
+			"usage":{"prompt_tokens":9000,"completion_tokens":2000,"total_tokens":11000,
+			"completion_tokens_details":{"reasoning_tokens":1300}}}`))
+	})
+	defer srv.Close()
+	res, err := c.Chat(context.Background(), "dnd-recap", nil, 2000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.CompletionTokens != 2000 || res.ReasoningTokens != 1300 {
+		t.Errorf("usage = completion %d / reasoning %d, want 2000 / 1300", res.CompletionTokens, res.ReasoningTokens)
+	}
+
+	// A provider that omits the details block reports zero reasoning, not a crash.
+	c2, srv2 := newTestClient(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"completion_tokens":5}}`))
+	})
+	defer srv2.Close()
+	if res, err := c2.Chat(context.Background(), "dnd-chat", nil, 10); err != nil || res.CompletionTokens != 5 || res.ReasoningTokens != 0 {
+		t.Errorf("no-details usage = %+v, err %v", res, err)
+	}
+}
+
 func TestEmbedSuccess(t *testing.T) {
 	c, srv := newTestClient(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/embeddings" {
