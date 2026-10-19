@@ -6,19 +6,39 @@ package prompts
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // SessionNotesSystem instructs the model to act as a fantasy scribe.
+//
+// The name rules exist because speech-to-text mangles invented names: without a
+// roster to correct against, one session's notes called the PC Throk "Brock"
+// and Chak "Choc" throughout, which then flowed into /recap, /ask, and the
+// state proposals built from these notes. The "fits the same role" condition is
+// what stops a sound-alike match from merging two different characters.
 const SessionNotesSystem = `You are an expert tabletop RPG scribe.
 You turn raw, messy voice-session transcripts into clear, evocative session notes.
 Write in past tense. Be faithful to what happened; never invent major events.
-Prefer the players' character names over real names when they are clear from context.`
+Prefer the players' character names over real names when they are clear from context.
+
+Names: the transcript comes from speech-to-text and often misspells or mishears names. When the
+prompt lists the campaign's player characters and known people, places and factions, those
+spellings are correct — always use them.
+- If a name in the transcript sounds like a listed name and fits the same role (e.g. "Tessa"
+  where the roster has a rogue named "Kessa"), it IS the listed one: write the listed spelling.
+- Speaker labels are Discord names. Use "played by" in the roster to tell which character a
+  speaker is playing, and refer to the character, not the player.
+- Do not merge two different characters on spelling alone, and do not credit a listed character
+  with anything the transcript does not show. A name with no plausible match is someone new —
+  keep it as heard.`
 
 // SessionNotesUser builds the user prompt for summarizing a transcript. It
 // includes concrete session metadata — when the session occurred and who was in
 // the voice call — so the model can attribute events accurately instead of
-// guessing player identities from the transcript.
-func SessionNotesUser(campaignName, system, premise, sessionDate string, participants []string, transcript string) string {
+// guessing player identities from the transcript. characters and knownEntities
+// are the campaign's canonical spellings (see SessionNotesSystem for how the
+// model uses them); either may be empty for a new campaign.
+func SessionNotesUser(campaignName, system, premise, sessionDate string, participants, characters, knownEntities []string, transcript string) string {
 	var b strings.Builder
 	b.WriteString("Campaign: ")
 	b.WriteString(nonEmpty(campaignName, "Untitled Campaign"))
@@ -36,6 +56,20 @@ func SessionNotesUser(campaignName, system, premise, sessionDate string, partici
 		b.WriteString("\nParticipants (Discord voice call): ")
 		b.WriteString(strings.Join(participants, ", "))
 	}
+	writeRoster := func(title string, items []string) {
+		if len(items) == 0 {
+			return
+		}
+		b.WriteString("\n\n")
+		b.WriteString(title)
+		b.WriteString(":")
+		for _, it := range items {
+			b.WriteString("\n- ")
+			b.WriteString(it)
+		}
+	}
+	writeRoster("Player characters (correct spellings)", characters)
+	writeRoster("Known people, places and factions (correct spellings)", knownEntities)
 	b.WriteString("\n\nProduce Markdown session notes with EXACTLY these sections:\n")
 	b.WriteString("## Recap (2-4 sentences)\n")
 	b.WriteString("## Key Events (bullet list, chronological)\n")
@@ -46,6 +80,50 @@ func SessionNotesUser(campaignName, system, premise, sessionDate string, partici
 	b.WriteString("\nTranscript follows between the markers.\n<<<TRANSCRIPT\n")
 	b.WriteString(transcript)
 	b.WriteString("\nTRANSCRIPT>>>")
+	return b.String()
+}
+
+// transcriptionVocabMaxRunes bounds the speech-to-text vocabulary hint. Whisper
+// conditions on at most 224 prompt tokens, and faster-whisper silently keeps
+// only the TAIL of a longer prompt — which would drop the player characters we
+// put first. Invented fantasy names tokenize badly (~2 characters per token for
+// "Zoldanox" or "Oufroeku"), so 224 tokens is roughly 450 characters; 400 leaves
+// margin for the separators.
+const transcriptionVocabMaxRunes = 400
+
+// TranscriptionVocabulary builds the `prompt` sent with each speech-to-text
+// request: a comma-separated list of the campaign's proper nouns, which is the
+// form OpenAI documents for steering Whisper's spelling of unusual words. It is
+// the upstream half of the name fix — a name Whisper spells right never needs
+// correcting by the notes model. names should be ordered most important first
+// (player characters, then NPCs, places, factions); duplicates are dropped and
+// whole names that would overflow the bound are left out rather than cut. It
+// returns "" when there is nothing to hint, so the request carries no prompt.
+func TranscriptionVocabulary(names []string) string {
+	seen := map[string]bool{}
+	var b strings.Builder
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		key := strings.ToLower(n)
+		if n == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		sep := ""
+		if b.Len() > 0 {
+			sep = ", "
+		}
+		// +1 for the closing period.
+		if utf8.RuneCountInString(b.String())+utf8.RuneCountInString(sep+n)+1 > transcriptionVocabMaxRunes {
+			continue // a shorter later name may still fit
+		}
+		b.WriteString(sep)
+		b.WriteString(n)
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	b.WriteString(".")
 	return b.String()
 }
 

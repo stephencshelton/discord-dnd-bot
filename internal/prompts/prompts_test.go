@@ -1,13 +1,16 @@
 package prompts
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSessionNotesUser(t *testing.T) {
 	got := SessionNotesUser("Rise of the Runelords", "Pathfinder", "goblins attack",
-		"Monday, 1 January 2024 19:00 UTC", []string{"Alice", "Bob"}, "we fought goblins")
+		"Monday, 1 January 2024 19:00 UTC", []string{"Alice", "Bob"},
+		[]string{"Kessa — Lv 3 Elf Rogue, played by Alice"}, []string{"[npc] Ameiko — innkeeper"}, "we fought goblins")
 
 	for _, want := range []string{
 		"Campaign: Rise of the Runelords",
@@ -15,6 +18,8 @@ func TestSessionNotesUser(t *testing.T) {
 		"Premise: goblins attack",
 		"Session date: Monday, 1 January 2024 19:00 UTC",
 		"Participants (Discord voice call): Alice, Bob",
+		"Player characters (correct spellings):\n- Kessa — Lv 3 Elf Rogue, played by Alice",
+		"Known people, places and factions (correct spellings):\n- [npc] Ameiko — innkeeper",
 		"## Recap",
 		"## Key Events",
 		"## Open Threads / Cliffhangers",
@@ -29,7 +34,7 @@ func TestSessionNotesUser(t *testing.T) {
 }
 
 func TestSessionNotesUserDefaults(t *testing.T) {
-	got := SessionNotesUser("", "  ", "", "", nil, "transcript")
+	got := SessionNotesUser("", "  ", "", "", nil, nil, nil, "transcript")
 	if !strings.Contains(got, "Campaign: Untitled Campaign") {
 		t.Errorf("expected default campaign name, got:\n%s", got)
 	}
@@ -44,6 +49,55 @@ func TestSessionNotesUserDefaults(t *testing.T) {
 	}
 	if strings.Contains(got, "Participants") {
 		t.Errorf("empty participants should be omitted, got:\n%s", got)
+	}
+	if strings.Contains(got, "correct spellings") {
+		t.Errorf("empty rosters should be omitted, got:\n%s", got)
+	}
+}
+
+// TestSessionNotesSystemCorrectsNames pins the rule that makes the roster
+// useful: without it the model treats the list as background and keeps the
+// transcript's misheard spellings ("Brock" for Throk).
+func TestSessionNotesSystemCorrectsNames(t *testing.T) {
+	for _, want := range []string{"speech-to-text", "always use them", "played by", "Do not merge"} {
+		if !strings.Contains(SessionNotesSystem, want) {
+			t.Errorf("SessionNotesSystem missing %q", want)
+		}
+	}
+}
+
+// TestTranscriptionVocabulary covers the Whisper spelling hint: order kept,
+// duplicates dropped case-insensitively, blanks skipped, empty input sends no
+// prompt at all.
+func TestTranscriptionVocabulary(t *testing.T) {
+	got := TranscriptionVocabulary([]string{"Throk Bloodrend", " Chak ", "", "chak", "Zoldanox"})
+	if want := "Throk Bloodrend, Chak, Zoldanox."; got != want {
+		t.Errorf("TranscriptionVocabulary = %q, want %q", got, want)
+	}
+	if got := TranscriptionVocabulary(nil); got != "" {
+		t.Errorf("empty input = %q, want no prompt", got)
+	}
+}
+
+// TestTranscriptionVocabularyBound protects the PC names at the front of the
+// hint: faster-whisper keeps only the TAIL of an over-long prompt, so the list
+// must fit the window itself, dropping whole names from the end.
+func TestTranscriptionVocabularyBound(t *testing.T) {
+	names := []string{"Throk Bloodrend"}
+	for i := 0; i < 200; i++ {
+		names = append(names, fmt.Sprintf("Npcname%03d", i))
+	}
+	got := TranscriptionVocabulary(names)
+	if n := utf8.RuneCountInString(got); n > transcriptionVocabMaxRunes {
+		t.Errorf("vocabulary is %d runes, bound is %d", n, transcriptionVocabMaxRunes)
+	}
+	if !strings.HasPrefix(got, "Throk Bloodrend, ") || !strings.HasSuffix(got, ".") {
+		t.Errorf("vocabulary = %q", got)
+	}
+	for _, part := range strings.Split(strings.TrimSuffix(got, "."), ", ") {
+		if part != "Throk Bloodrend" && len(part) != len("Npcname000") {
+			t.Errorf("name was cut mid-word: %q", part)
+		}
 	}
 }
 
