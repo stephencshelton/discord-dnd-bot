@@ -100,7 +100,8 @@ func (g *Gateway) handleMessageCreate(e *events.MessageCreate) {
 	userMsg := content
 	if guildID != "" {
 		if camp, err := g.store.GetActiveCampaign(ctx, guildID); err == nil {
-			userMsg = prompts.LoreUser(camp.Name, camp.System, camp.Premise, content)
+			characters, knownEntities := g.nameRoster(ctx, camp.ID)
+			userMsg = prompts.LoreUser(camp.Name, camp.System, camp.Premise, content, characters, knownEntities)
 		}
 	}
 

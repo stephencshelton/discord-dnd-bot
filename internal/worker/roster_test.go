@@ -1,9 +1,7 @@
 package worker
 
 import (
-	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
 )
@@ -33,17 +31,6 @@ func TestBuildRosterMapsPlayersToCharacters(t *testing.T) {
 	}
 }
 
-// TestPCNotesLineSparse covers a PC created with only a name: the line must not
-// carry dangling separators like "Lv 0" or an empty "—".
-func TestPCNotesLineSparse(t *testing.T) {
-	if got := pcNotesLine(db.PlayerCharacter{Name: "Throb"}, ""); got != "Throb" {
-		t.Errorf("bare PC = %q", got)
-	}
-	if got := pcNotesLine(db.PlayerCharacter{Name: "Throb"}, "Woodithebear540"); got != "Throb — played by Woodithebear540" {
-		t.Errorf("PC with player only = %q", got)
-	}
-}
-
 // TestBuildRosterVocabularyOrder protects what reaches Whisper's small prompt
 // window: PC names first, then NPCs before factions and locations, and no quest
 // or hook titles, which are not proper nouns and would crowd out real names.
@@ -63,22 +50,5 @@ func TestBuildRosterVocabularyOrder(t *testing.T) {
 	}
 	if len(r.entities) != len(entities) {
 		t.Errorf("notes glossary should list every entity kind, got %q", r.entities)
-	}
-}
-
-// TestEntityNotesLineBoundsDescription keeps a long canon description from
-// bloating the notes prompt: only an identifying excerpt is sent.
-func TestEntityNotesLineBoundsDescription(t *testing.T) {
-	e := db.WorldEntity{Kind: db.KindNPC, Name: "Zoldanox", Description: strings.Repeat("fungus dragon lore ", 50)}
-	got := entityNotesLine(e)
-	prefix := "[npc] Zoldanox — "
-	if !strings.HasPrefix(got, prefix) {
-		t.Fatalf("line = %q", got)
-	}
-	if n := utf8.RuneCountInString(strings.TrimPrefix(got, prefix)); n > notesEntityDescRunes {
-		t.Errorf("description excerpt is %d runes, bound is %d", n, notesEntityDescRunes)
-	}
-	if got := entityNotesLine(db.WorldEntity{Kind: db.KindLocation, Name: "Shevaroth"}); got != "[location] Shevaroth" {
-		t.Errorf("no-description line = %q", got)
 	}
 }

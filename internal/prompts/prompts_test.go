@@ -59,9 +59,56 @@ func TestSessionNotesUserDefaults(t *testing.T) {
 // useful: without it the model treats the list as background and keeps the
 // transcript's misheard spellings ("Brock" for Throk).
 func TestSessionNotesSystemCorrectsNames(t *testing.T) {
-	for _, want := range []string{"speech-to-text", "always use them", "played by", "Do not merge"} {
-		if !strings.Contains(SessionNotesSystem, want) {
-			t.Errorf("SessionNotesSystem missing %q", want)
+	if !strings.Contains(SessionNotesSystem, "played by") {
+		t.Error("SessionNotesSystem must map speaker labels to characters")
+	}
+}
+
+// TestRecordReadersCorrectNames is the inventory guard: every prompt that reads
+// session notes or transcripts must carry the name rule, or that command keeps
+// repeating misheard names from old records. A new record-reading prompt
+// belongs in this table.
+func TestRecordReadersCorrectNames(t *testing.T) {
+	for name, sys := range map[string]string{
+		"SessionNotesSystem":    SessionNotesSystem,
+		"RecapSystem":           RecapSystem,
+		"AskSystem":             AskSystem,
+		"PrepSystem":            PrepSystem,
+		"StateExtractionSystem": StateExtractionSystem,
+	} {
+		if !strings.Contains(sys, nameRule) {
+			t.Errorf("%s is missing the name-correction rule", name)
+		}
+	}
+	// Where the roster is reference rather than content, it must not become a
+	// list of names to mention.
+	for name, sys := range map[string]string{"RecapSystem": RecapSystem, "AskSystem": AskSystem} {
+		if !strings.Contains(sys, rosterSpellingOnly) {
+			t.Errorf("%s should limit the roster to spelling", name)
+		}
+	}
+	if !strings.Contains(LoreSystem, "exact spellings") {
+		t.Error("LoreSystem should keep worldbuilding consistent with listed names")
+	}
+}
+
+// TestUserPromptsRenderRoster checks the lists the name rule refers to actually
+// reach each record-reading prompt that is handed them.
+func TestUserPromptsRenderRoster(t *testing.T) {
+	pcs := []string{"Throk Bloodrend — Lv 15 Orc Barbarian"}
+	ents := []string{"[npc] Zoldanox — fungus dragon"}
+	for name, got := range map[string]string{
+		"RecapUser": RecapUser("Spore Wars", []string{"Brock hit the dragon"}, pcs, ents),
+		"AskUser":   AskUser("Spore Wars", "What did Throk do?", []string{"[Session record] Brock hit it"}, pcs, ents),
+		"LoreUser":  LoreUser("Spore Wars", "PF2e", "", "Describe Zoldanox's lair", pcs, ents),
+	} {
+		for _, want := range []string{
+			"Player characters (correct spellings):\n- Throk Bloodrend — Lv 15 Orc Barbarian",
+			"Known people, places and factions (correct spellings):\n- [npc] Zoldanox — fungus dragon",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("%s missing %q in:\n%s", name, want, got)
+			}
 		}
 	}
 }
@@ -102,7 +149,7 @@ func TestTranscriptionVocabularyBound(t *testing.T) {
 }
 
 func TestLoreUser(t *testing.T) {
-	got := LoreUser("Waterdeep", "5e", "heist in progress", "Who guards the vault?")
+	got := LoreUser("Waterdeep", "5e", "heist in progress", "Who guards the vault?", nil, nil)
 	want := "Campaign: Waterdeep | System: 5e | Premise: heist in progress\n\nRequest: Who guards the vault?"
 	if got != want {
 		t.Errorf("LoreUser = %q, want %q", got, want)
@@ -110,7 +157,7 @@ func TestLoreUser(t *testing.T) {
 }
 
 func TestLoreUserDefaultsAndNoPremise(t *testing.T) {
-	got := LoreUser("", "", "", "Anything?")
+	got := LoreUser("", "", "", "Anything?", nil, nil)
 	if strings.Contains(got, "Premise:") {
 		t.Errorf("empty premise should be omitted, got %q", got)
 	}
@@ -120,7 +167,7 @@ func TestLoreUserDefaultsAndNoPremise(t *testing.T) {
 }
 
 func TestRecapUser(t *testing.T) {
-	got := RecapUser("Descent", []string{"first note", "second note"})
+	got := RecapUser("Descent", []string{"first note", "second note"}, nil, nil)
 	if !strings.Contains(got, "next session of Descent") {
 		t.Errorf("missing campaign name, got:\n%s", got)
 	}
@@ -133,7 +180,7 @@ func TestRecapUser(t *testing.T) {
 }
 
 func TestRecapUserDefaultName(t *testing.T) {
-	got := RecapUser("", nil)
+	got := RecapUser("", nil, nil, nil)
 	if !strings.Contains(got, "next session of our campaign") {
 		t.Errorf("expected default campaign name, got:\n%s", got)
 	}
@@ -201,7 +248,7 @@ func TestRecapLengthBoundStatedOnce(t *testing.T) {
 	if !strings.Contains(RecapSystem, "120 words") {
 		t.Error("RecapSystem should carry the length bound")
 	}
-	if strings.Contains(RecapUser("Descent", []string{"a note"}), "words") {
+	if strings.Contains(RecapUser("Descent", []string{"a note"}, nil, nil), "words") {
 		t.Error("RecapUser should not restate a word limit; it belongs in RecapSystem")
 	}
 }
@@ -210,7 +257,7 @@ func TestRecapLengthBoundStatedOnce(t *testing.T) {
 // to ask for a "dramatic" recap, which pulled the output back toward prose even
 // after the system prompt was tightened. Framing belongs in RecapSystem.
 func TestRecapUserStaysNeutral(t *testing.T) {
-	got := strings.ToLower(RecapUser("Descent", []string{"a note"}))
+	got := strings.ToLower(RecapUser("Descent", []string{"a note"}, nil, nil))
 	for _, banned := range []string{"dramatic", "previously, on"} {
 		if strings.Contains(got, banned) {
 			t.Errorf("RecapUser should not carry narrative framing, found %q in:\n%s", banned, got)

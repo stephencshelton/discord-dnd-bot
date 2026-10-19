@@ -2,23 +2,13 @@ package worker
 
 import (
 	"context"
-	"fmt"
-	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/stephencshelton/discord-dnd-bot/internal/db"
-	"github.com/stephencshelton/discord-dnd-bot/internal/discordfmt"
 	"github.com/stephencshelton/discord-dnd-bot/internal/logging"
 	"github.com/stephencshelton/discord-dnd-bot/internal/prompts"
 )
-
-// notesEntityDescRunes bounds each entity's description in the session-notes
-// glossary. The glossary is there to identify WHO a name is ("fungus dragon
-// whose lair is in Shevaroth"), not to restate canon. One clause is enough for
-// the notes model to match a misheard name by role, and it keeps a campaign
-// with a hundred entities to a few thousand tokens beside the transcript.
-const notesEntityDescRunes = 160
 
 // vocabularyKinds are the world-entity kinds whose names are spoken aloud at the
 // table, in the order they are hinted to speech-to-text. Quests and hooks are
@@ -58,11 +48,11 @@ func buildRoster(pcs []db.PlayerCharacter, entities []db.WorldEntity, names map[
 	var r campaignRoster
 	var vocab []string
 	for _, pc := range pcs {
-		r.characters = append(r.characters, pcNotesLine(pc, names[pc.DiscordUserID]))
+		r.characters = append(r.characters, pc.RosterLine(names[pc.DiscordUserID]))
 		vocab = append(vocab, pc.Name)
 	}
 	for _, e := range entities {
-		r.entities = append(r.entities, entityNotesLine(e))
+		r.entities = append(r.entities, e.RosterLine())
 	}
 	for _, kind := range vocabularyKinds {
 		for _, e := range entities {
@@ -73,40 +63,4 @@ func buildRoster(pcs []db.PlayerCharacter, entities []db.WorldEntity, names map[
 	}
 	r.vocabulary = prompts.TranscriptionVocabulary(vocab)
 	return r
-}
-
-// pcNotesLine renders a PC as "Throk Bloodrend — Lv 15 Orc Barbarian, played by
-// xCptAmerica". player is the speaker label from this session's call; it is
-// empty when that player was not in the call, and the clause is then omitted.
-func pcNotesLine(pc db.PlayerCharacter, player string) string {
-	var desc []string
-	if pc.Level > 0 {
-		desc = append(desc, fmt.Sprintf("Lv %d", pc.Level))
-	}
-	if s := strings.TrimSpace(strings.TrimSpace(pc.Race) + " " + strings.TrimSpace(pc.Class)); s != "" {
-		desc = append(desc, s)
-	}
-	line := pc.Name
-	if len(desc) > 0 {
-		line += " — " + strings.Join(desc, " ")
-	}
-	if player != "" {
-		if len(desc) > 0 {
-			line += ","
-		} else {
-			line += " —"
-		}
-		line += " played by " + player
-	}
-	return line
-}
-
-// entityNotesLine renders a world entity as "[npc] Zoldanox — <short
-// description>" for the session-notes glossary.
-func entityNotesLine(e db.WorldEntity) string {
-	line := fmt.Sprintf("[%s] %s", e.Kind, e.Name)
-	if d := strings.Join(strings.Fields(e.Description), " "); d != "" {
-		line += " — " + discordfmt.Truncate(d, notesEntityDescRunes)
-	}
-	return line
 }
